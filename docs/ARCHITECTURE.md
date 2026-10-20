@@ -125,3 +125,74 @@ Implemented with `ed25519-dalek` 2. The stored format is the 32-byte RFC 8032 se
   * Warnings give counts for empty fields and attachments.
 * Reports contain only hashed provenance ids (or `target:<n>` when a fetch failed before identification), allowlisted category codes, statuses, error codes, counts and constant warning codes. They never contain values, titles, raw ids, field ids, stderr or arguments.
 * The JSON field shape (`id/type/purpose/label/value/section`, `urls[].href`, `vault.id`) comes from the `op` item JSON format as understood at M1. The official reference pages do not specify it. **It has not been verified against real `op` output**, because accessing real data was not authorized.
+
+## Browser demo (M2)
+
+Status: **synthetic demo, development-only key handling, not production.**
+
+### Layers
+
+```
+Angular (apps/web)  ── JSON views / masked slots ──▶  keymesh-wasm (wasm-bindgen)  ──▶  keymesh core (no "native" feature)
+        │                                                     │
+        └── IndexedDB: encrypted envelope bytes only ◀── seal() ┘
+```
+
+* `crates/keymesh-wasm/src/bridge.rs` contains all of the bridge logic and is unit-tested natively. `lib.rs` is a thin `wasm-bindgen` adapter.
+* The core's filesystem, `op` process runner and CLI stay behind the `native` feature and are not part of the browser build. The 1Password importer stays native-only, and no HTTP endpoint runs `op`.
+* On `wasm32-unknown-unknown`, randomness comes from `crypto.getRandomValues` (via `getrandom`'s `js` backend), and wall-clock time from `Date.now()` (via `js-sys`), because `std::time::SystemTime` panics there.
+
+### Data crossing into JavaScript
+
+* `list` returns summaries: id, kind, title, a non-secret subtitle (username, service, issuer, etc.) and tags.
+* `get` returns an item view with non-secret fields plus *slots* for secret fields: password, recovery codes, secret, wallet secrets, note body, notes, concealed custom fields, and the TOTP setup secret.
+* A slot's plaintext crosses only through `reveal(id, slot)`, used by the Reveal and Copy buttons. Revealed text is rendered as text content, never as an attribute, and is hidden again after 30 seconds or on lock.
+* Ed25519 seeds are never revealable. Only the public key, in hex and as an OpenSSH line, is exposed, and there is no signing API.
+* Generated passwords, random secrets and Ed25519 keys can be created and stored entirely inside WASM. Password preview, and the Generate button in the login form, return the value to the UI on purpose.
+* Errors use the core's messages, which contain no secret values. Item-input parse errors are reported generically, because serde messages can quote input.
+
+### Key providers (DEVELOPMENT ONLY)
+
+| Mode | Key | Reload | Notes |
+|---|---|---|---|
+| `ephemeral` | random, generated in WASM | lost; the stored ciphertext becomes inaccessible, and the UI says so | no recovery exists |
+| `synthetic-fixture` | SHA-256 of a **public** label | reopens | anyone can decrypt; only for demos and tests |
+
+The key is never exported to JavaScript and never appears in the URL, storage, console or error messages. There is no key-entry or recovery product flow.
+
+### Persistence and concurrency
+
+* IndexedDB database `keymesh-demo`, store `vault`, key `primary` holds `{bytes, vaultId, kekId, revision}`. `bytes` is the same `keymesh.vault` v1 envelope as on native.
+* No local/session storage or cookies are used.
+* A mutation runs in WASM, then `seal()` produces revision N+1, then a single readwrite IndexedDB transaction performs `compareAndPut(expected = N)`. The session's revision advances only after that write succeeds (`commit`).
+* A write by a stale tab is rejected and nothing is written.
+* After any failed persist the tab is marked *stale*: editing is blocked until it reloads from storage, which drops any unsaved in-memory change.
+* A `BroadcastChannel` message lets other tabs show the stale notice before they try to write. The compare-and-swap protects data even without that message, and E2E covers both paths.
+* Mutations within a tab are serialized through a promise queue.
+
+### Lock
+
+* `lock()` drops the decrypted `Vault` (items and data key) inside WASM and frees the session handle. It also clears list, search and selection state, and bumps an epoch.
+* Every vault operation then fails with "vault is locked", in both the core session and the service.
+* Async work that started before the lock checks the epoch and discards its result, so a mutation queued just before a lock is rejected. E2E covers this.
+* The development key provider stays in WASM memory so the demo can unlock again. That is a test-provider transition, not app identity.
+
+### Backup and restore
+
+* Backup downloads the stored envelope bytes exactly as stored, after checking they match the session's revision. They are ciphertext only, and E2E checks them for planted markers.
+* Restore first checks the file size (64 MiB maximum), then decrypts the file with the current demo key, or the fixture key if no session exists. Only on success does it replace the stored record. Truncated, garbage, unknown-version and wrong-key files are rejected, and the existing vault stays byte-identical.
+
+### Browser hardening
+
+* A CSP meta tag and server header allow `default-src 'self'` and `script-src 'self' 'wasm-unsafe-eval'`. Styles allow `'unsafe-inline'` for Angular component styles. Critical-CSS inlining is disabled, so no inline event handler is needed.
+* There are no third-party origins, analytics or remote fonts (system font stack only). E2E asserts that only same-origin requests are made.
+* `scripts/serve.mjs` (production build) binds to 127.0.0.1 and sends `nosniff`, `no-referrer`, COOP and `frame-ancestors 'none'`.
+
+### Limitations
+
+* JavaScript and WASM cannot guarantee zeroization. Strings passed to the UI (revealed values, form inputs, previews) and the clipboard are outside the core's control. WASM linear memory is not reliably cleared on lock.
+* Offline startup is deferred: there is no service worker, so loading the app needs its origin.
+* QR or camera TOTP import is not implemented.
+* No passphrase generator yet.
+* The browser and CLI vault files are separate, and moving data between them is not implemented.
+* Native limitations still apply: a single writer per file with no file lock (natively), and whole-file rollback cannot be detected.

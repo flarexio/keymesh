@@ -279,11 +279,27 @@ pub struct Item {
     pub data: ItemData,
 }
 
+/// Current Unix time in seconds (0 if the clock is before the epoch).
+///
+/// `std::time::SystemTime::now()` panics on `wasm32-unknown-unknown`, so the
+/// browser build reads the JavaScript clock instead.
 pub fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let ms = js_sys::Date::now();
+        if ms.is_finite() && ms > 0.0 {
+            (ms / 1000.0) as u64
+        } else {
+            0
+        }
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 }
 
 impl Item {

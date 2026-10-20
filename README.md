@@ -1,10 +1,10 @@
 # keymesh
 
-Local-first encrypted vault core in Rust. An Angular UI is planned for later.
+Local-first encrypted vault core in Rust, with an Angular browser demo running the same core compiled to WebAssembly.
 
-> **Status: M1 foundation — NOT production ready.** The only key providers are synthetic/demo ones. Real unlock, recovery, Keymesh's own authentication and the UI don't exist yet. Use synthetic data only.
+> **Status: M2 synthetic demo — NOT production ready.** The only key providers are synthetic/demo ones, development-only. Real unlock, recovery and Keymesh's own authentication don't exist yet. Use synthetic data only.
 
-## Capability matrix (M1)
+## Capability matrix (M1 core + M2 browser slice)
 
 | Area | State | Notes |
 |---|---|---|
@@ -19,24 +19,44 @@ Local-first encrypted vault core in Rust. An Angular UI is planned for later.
 | RFC 6238 TOTP (SHA1/256/512, 6/8 digits), Base32 and `otpauth://totp` import | ✅ | HOTP and custom modes rejected |
 | TOTP QR decode | ⏳ deferred | Future UI adapter |
 | Import from 1Password via `op` CLI (explicit item or `op://` ref) | ✅ (fixtures only) | Tested only with a fake `op` and synthetic fixtures; not yet run against a real account |
-| WASM build of core (`--no-default-features`) | ✅ compiles | Not yet exercised in a browser |
-| Production unlock / recovery | ❌ not started | |
-| Keymesh login (mnemonic, image keycards), wallet/identity/KMS, NATS, blockchain | ❌ deferred | Out of M1 scope |
-| Angular UI, sync | ❌ deferred | |
+| WASM bridge (`crates/keymesh-wasm`, wasm-bindgen 0.2.129) | ✅ runs in browser | Validation, encryption, generators, Ed25519 and TOTP execute in headless Chromium (Playwright E2E) |
+| Angular 22 app (`apps/web`): list/search/filter/create/edit/delete all 7 item types | ✅ | Per-type forms; secrets masked, explicit reveal/copy; responsive; accessible labels; "synthetic demo" banner |
+| Browser generators → encrypted items | ✅ | Password, random secret, Ed25519 generated inside WASM and stored directly; passphrase still pending |
+| Browser TOTP: live code + remaining time, otpauth URI / Base32 entry | ✅ | Clock injectable (E2E uses Playwright's clock); QR/camera scanning ❌ not implemented |
+| IndexedDB persistence of the encrypted envelope only | ✅ | No plaintext, key or search index stored; E2E checks that planted markers are absent |
+| Browser lock / demo unlock | ✅ | Lock drops the decrypted vault in WASM, bumps an epoch so work started earlier is discarded; unlock is a demo-key transition, not identity |
+| Encrypted backup download / verified restore | ✅ | Restore must decrypt with the current demo key before anything is written; size limit 64 MiB |
+| Cross-tab writes | ✅ rejected | Compare-and-swap on the stored revision plus a BroadcastChannel stale notice; stale tabs must reload |
+| Offline startup (service worker / PWA) | ⏳ deferred | No service worker; the app needs its origin to load |
+| 1Password import in the browser | ❌ by design | Native CLI only; no endpoint runs `op`; the browser shows CLI instructions |
+| Production unlock / recovery | ❌ not started | Lost ephemeral demo key ⇒ demo ciphertext is unrecoverable |
+| Keymesh login (mnemonic, image keycards), wallet/identity/KMS, NATS, blockchain | ❌ deferred | Out of scope |
+| Sync between devices; CLI ↔ browser vault transfer | ❌ deferred | |
 
-## Known limitations (accepted for M1)
+## Known limitations
 
 - **Demo key provider only:** the CLI key comes from `KEYMESH_DEMO_KEY`. Real unlock and recovery aren't designed yet.
 - **Single writer:** `save` refuses when the file changed since it was loaded, but there is no file lock. Two writers racing during the save can still conflict.
 - **Whole-file rollback** to an older valid vault file can't be detected without external state.
 - **Size limit:** vault files are limited to 64 MiB for both reading and writing. A save that would exceed it is refused and leaves the old file intact.
+- **Browser key handling (M2):** the demo key provider lives in WASM memory only.
+  - With the *ephemeral* key, a reload loses the key, and the stored demo ciphertext becomes permanently inaccessible.
+  - The *synthetic fixture* key is public: anyone can decrypt data stored under it.
+- **Browser memory:** JavaScript and WASM cannot guarantee zeroization. Revealed or copied values, form inputs and the clipboard are outside Keymesh's control. Lock removes decrypted vault state in WASM, but the browser may still retain copies.
 
 ## Build and test
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo clippy -p keymesh-wasm --target wasm32-unknown-unknown -- -D warnings
+```
+
+Browser demo: see [`apps/web/README.md`](apps/web/README.md). In short:
+
+```sh
+cd apps/web && npm ci && npm run build:wasm && npm run build && npm start   # http://127.0.0.1:4310
 ```
 
 ## Synthetic demo (CLI harness)
@@ -81,5 +101,8 @@ The importer:
 ```
 src/             crypto, model, generate, ed25519, totp, vault, storage, import/{op,process}, bin/keymesh
 tests/           op_import.rs (fake runner + fake executable), cli.rs (binary smoke tests), fixtures/
-docs/            ARCHITECTURE.md (formats, key hierarchy, decisions, limitations)
+crates/keymesh-wasm/  wasm-bindgen browser bridge (logic in bridge.rs, natively unit-tested)
+apps/web/        Angular 22 demo app, Vitest unit tests, Playwright E2E (e2e/)
+scripts/         build-wasm.sh (cargo wasm32 build + wasm-bindgen into apps/web)
+docs/            ARCHITECTURE.md (formats, key hierarchy, browser demo, decisions, limitations)
 ```

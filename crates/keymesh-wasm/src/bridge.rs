@@ -1,0 +1,1183 @@
+//! Platform-neutral bridge logic. Everything here is plain Rust so it is
+//! unit-tested natively; `lib.rs` only adapts it to `wasm-bindgen`.
+//!
+//! Secrets stay inside this module's memory. Item *views* sent to the UI
+//! contain non-secret fields plus a list of masked secret slots; plaintext of
+//! a slot crosses the boundary only through an explicit [`Session::reveal`].
+//! Ed25519 private seeds are never revealed and there is no signing API.
+
+use keymesh::crypto::{EphemeralKeyProvider, Key256, KeyProvider};
+use keymesh::ed25519::Ed25519KeyPair;
+use keymesh::generate::{
+    generate_password, generate_secret, PasswordPolicy, PasswordProfile, SecretEncoding,
+};
+use keymesh::model::{
+    Contact, CryptoWalletRecord, CustomField, Ed25519KeyRecord, FieldKind, Item, ItemData, ItemId,
+    ItemKind, LabeledValue, Login, SecretCredential, SecretFormat, SecretOrigin, SecureNote,
+    TotpRecord,
+};
+use keymesh::rng::OsRandom;
+use keymesh::secret::SecretString;
+use keymesh::totp::{code_now, parse_base32_secret, parse_otpauth_uri, FixedClock, TotpConfig};
+use keymesh::vault::{read_header, Vault};
+use keymesh::{Error, Result};
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+/// Same bound as native storage: the browser refuses larger envelopes.
+pub const MAX_ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Development-only key providers
+// ---------------------------------------------------------------------------
+
+/// **DEVELOPMENT ONLY.** Key providers for the browser demo. The key lives in
+/// WASM memory only and is never exported to JavaScript.
+pub enum DemoKey {
+    /// Random per page session; lost on reload (the stored vault then cannot
+    /// be decrypted again).
+    Ephemeral(EphemeralKeyProvider),
+    /// Publicly known synthetic fixture key, so a demo vault can be reopened
+    /// after a reload and in tests. Anyone can decrypt data under this key.
+    Fixture(FixtureKeyProvider),
+}
+
+impl DemoKey {
+    pub const EPHEMERAL_ID: &'static str = "browser-ephemeral-demo-v1";
+
+    pub fn ephemeral() -> Result<Self> {
+        Ok(Self::Ephemeral(EphemeralKeyProvider::generate(
+            Self::EPHEMERAL_ID,
+            &mut OsRandom,
+        )?))
+    }
+    pub fn fixture() -> Self {
+        Self::Fixture(FixtureKeyProvider::new())
+    }
+    pub fn provider(&self) -> &dyn KeyProvider {
+        match self {
+            Self::Ephemeral(p) => p,
+            Self::Fixture(p) => p,
+        }
+    }
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Self::Ephemeral(_) => "ephemeral",
+            Self::Fixture(_) => "synthetic-fixture",
+        }
+    }
+}
+
+/// PUBLIC synthetic fixture key: SHA-256 of a published label. Not a secret.
+pub struct FixtureKeyProvider {
+    key: Key256,
+}
+
+impl FixtureKeyProvider {
+    pub const KEY_ID: &'static str = "synthetic-fixture-v1";
+    pub const LABEL: &'static [u8] = b"keymesh synthetic fixture key v1 - PUBLIC, NOT SECRET";
+
+    fn new() -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            key: Key256::from_bytes(Sha256::digest(Self::LABEL).into()),
+        }
+    }
+}
+
+impl KeyProvider for FixtureKeyProvider {
+    fn key_id(&self) -> &str {
+        Self::KEY_ID
+    }
+    fn key_encryption_key(&self) -> Result<Key256> {
+        Ok(self.key.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inputs from the UI
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabeledInput {
+    pub label: Option<String>,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomFieldInput {
+    pub label: String,
+    #[serde(default)]
+    pub concealed: bool,
+    /// New value. On update, `None` with `existing` keeps that field's value.
+    pub value: Option<String>,
+    /// Index of the existing custom field this row edits (update only).
+    pub existing: Option<usize>,
+}
+
+/// Secret-ish optional fields use "keep / clear / set" semantics on update:
+/// `None` = keep (create: absent), `Some("")` = clear, `Some(v)` = set.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DataInput {
+    Login {
+        username: Option<String>,
+        password: Option<String>,
+        #[serde(default)]
+        urls: Vec<String>,
+        totp_item: Option<String>,
+        recovery_codes: Option<Vec<String>>,
+    },
+    Secret {
+        secret: Option<String>,
+        username: Option<String>,
+        service: Option<String>,
+    },
+    Contact {
+        full_name: Option<String>,
+        organization: Option<String>,
+        #[serde(default)]
+        emails: Vec<LabeledInput>,
+        #[serde(default)]
+        phones: Vec<LabeledInput>,
+        #[serde(default)]
+        addresses: Vec<LabeledInput>,
+        #[serde(default)]
+        websites: Vec<LabeledInput>,
+    },
+    CryptoWallet {
+        wallet_software: Option<String>,
+        network: Option<String>,
+        #[serde(default)]
+        addresses: Vec<LabeledInput>,
+        recovery_phrase: Option<String>,
+        wallet_password: Option<String>,
+        private_key: Option<String>,
+        derivation_path: Option<String>,
+    },
+    SecureNote {
+        body: Option<String>,
+    },
+    /// Update only: TOTP secrets are set via [`Session::create_totp`].
+    Totp {
+        issuer: Option<String>,
+        account_name: Option<String>,
+    },
+    /// Update only: keys are generated via [`Session::generate_ed25519`].
+    Ed25519Key {
+        comment: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemInput {
+    pub title: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub custom_fields: Vec<CustomFieldInput>,
+    pub data: DataInput,
+}
+
+fn text(s: Option<String>) -> Option<String> {
+    s.filter(|v| !v.is_empty())
+}
+
+/// keep / clear / set for secrets.
+fn secret_update(new: Option<String>, old: Option<&SecretString>) -> Option<SecretString> {
+    match new {
+        None => old.cloned(),
+        Some(v) if v.is_empty() => None,
+        Some(v) => Some(SecretString::new(v)),
+    }
+}
+
+fn labeled(v: Vec<LabeledInput>) -> Vec<LabeledValue> {
+    v.into_iter()
+        .filter(|l| !l.value.is_empty())
+        .map(|l| LabeledValue {
+            label: text(l.label),
+            value: l.value,
+        })
+        .collect()
+}
+
+fn parse_id(s: &str) -> Result<ItemId> {
+    s.parse()
+}
+
+// ---------------------------------------------------------------------------
+// Views to the UI (no secret values)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct Summary {
+    pub id: String,
+    pub kind: &'static str,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SecretSlot {
+    /// Opaque key for [`Session::reveal`].
+    pub key: String,
+    pub label: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CustomView {
+    pub index: usize,
+    pub label: String,
+    pub section: Option<String>,
+    pub concealed: bool,
+    /// Present only for non-concealed fields.
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ItemView {
+    pub id: String,
+    pub kind: &'static str,
+    pub rev: u64,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub imported: bool,
+    /// Non-secret, kind-specific data.
+    pub data: serde_json::Value,
+    pub secrets: Vec<SecretSlot>,
+    pub custom_fields: Vec<CustomView>,
+}
+
+fn is_concealed(k: FieldKind) -> bool {
+    matches!(
+        k,
+        FieldKind::Concealed | FieldKind::Otp | FieldKind::Unsupported
+    )
+}
+
+fn slot(key: &str, label: &str) -> SecretSlot {
+    SecretSlot {
+        key: key.into(),
+        label: label.into(),
+    }
+}
+
+fn subtitle(i: &Item) -> Option<String> {
+    match &i.data {
+        ItemData::Login(l) => l.username.clone().or_else(|| l.urls.first().cloned()),
+        ItemData::Secret(s) => s.service.clone().or_else(|| s.username.clone()),
+        ItemData::Contact(c) => c
+            .organization
+            .clone()
+            .or_else(|| c.emails.first().map(|e| e.value.clone())),
+        ItemData::CryptoWallet(w) => w.network.clone(),
+        ItemData::Totp(t) => t.issuer.clone().or_else(|| t.account_name.clone()),
+        ItemData::Ed25519Key(k) => k.comment.clone(),
+        ItemData::SecureNote(_) => None,
+    }
+}
+
+fn matches(i: &Item, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let hit = |s: &str| s.to_lowercase().contains(q);
+    let lv = |v: &[LabeledValue]| v.iter().any(|x| hit(&x.value));
+    hit(&i.title)
+        || i.tags.iter().any(|t| hit(t))
+        || match &i.data {
+            ItemData::Login(l) => {
+                l.username.as_deref().is_some_and(hit) || l.urls.iter().any(|u| hit(u))
+            }
+            ItemData::Secret(s) => {
+                s.service.as_deref().is_some_and(hit) || s.username.as_deref().is_some_and(hit)
+            }
+            ItemData::Contact(c) => {
+                c.full_name.as_deref().is_some_and(hit)
+                    || c.organization.as_deref().is_some_and(hit)
+                    || lv(&c.emails)
+                    || lv(&c.phones)
+                    || lv(&c.websites)
+            }
+            ItemData::CryptoWallet(w) => {
+                w.network.as_deref().is_some_and(hit)
+                    || w.wallet_software.as_deref().is_some_and(hit)
+                    || lv(&w.addresses)
+            }
+            ItemData::Totp(t) => {
+                t.issuer.as_deref().is_some_and(hit) || t.account_name.as_deref().is_some_and(hit)
+            }
+            ItemData::Ed25519Key(k) => k.comment.as_deref().is_some_and(hit),
+            ItemData::SecureNote(_) => false,
+        }
+}
+
+fn kind_from(s: &str) -> Option<ItemKind> {
+    Some(match s {
+        "login" => ItemKind::Login,
+        "secret" => ItemKind::Secret,
+        "contact" => ItemKind::Contact,
+        "crypto_wallet" => ItemKind::CryptoWallet,
+        "ed25519_key" => ItemKind::Ed25519Key,
+        "totp" => ItemKind::Totp,
+        "secure_note" => ItemKind::SecureNote,
+        _ => return None,
+    })
+}
+
+fn view(i: &Item) -> Result<ItemView> {
+    use serde_json::json;
+    let lvj = |v: &[LabeledValue]| {
+        v.iter()
+            .map(|x| json!({"label": x.label, "value": x.value}))
+            .collect::<Vec<_>>()
+    };
+    let mut secrets = Vec::new();
+    if i.notes.is_some() {
+        secrets.push(slot("notes", "Notes"));
+    }
+    let data = match &i.data {
+        ItemData::Login(l) => {
+            if l.password.is_some() {
+                secrets.push(slot("password", "Password"));
+            }
+            for n in 0..l.recovery_codes.len() {
+                secrets.push(slot(
+                    &format!("recovery_code:{n}"),
+                    &format!("Recovery code {}", n + 1),
+                ));
+            }
+            json!({"username": l.username, "urls": l.urls,
+                   "totp_item": l.totp_item.as_ref().map(|t| t.to_string()),
+                   "recovery_code_count": l.recovery_codes.len()})
+        }
+        ItemData::Secret(s) => {
+            secrets.push(slot("secret", "Secret"));
+            let format = match s.format {
+                SecretFormat::Text => "text",
+                SecretFormat::Encoded(SecretEncoding::Hex) => "hex",
+                SecretFormat::Encoded(SecretEncoding::Base64Url) => "base64url",
+                SecretFormat::Encoded(SecretEncoding::Base32) => "base32",
+                SecretFormat::OpaquePrivateKey => "opaque_private_key",
+            };
+            let origin = match s.origin {
+                SecretOrigin::Generated => "generated",
+                SecretOrigin::Manual => "manual",
+                SecretOrigin::Imported => "imported",
+            };
+            json!({"username": s.username, "service": s.service,
+                   "format": format, "origin": origin})
+        }
+        ItemData::Contact(c) => json!({
+            "full_name": c.full_name, "organization": c.organization,
+            "emails": lvj(&c.emails), "phones": lvj(&c.phones),
+            "addresses": lvj(&c.addresses), "websites": lvj(&c.websites)}),
+        ItemData::CryptoWallet(w) => {
+            if w.recovery_phrase.is_some() {
+                secrets.push(slot("recovery_phrase", "Recovery phrase"));
+            }
+            if w.wallet_password.is_some() {
+                secrets.push(slot("wallet_password", "Wallet password"));
+            }
+            if w.private_key.is_some() {
+                secrets.push(slot("private_key", "Private key"));
+            }
+            json!({"wallet_software": w.wallet_software, "network": w.network,
+                   "addresses": lvj(&w.addresses), "derivation_path": w.derivation_path})
+        }
+        ItemData::Totp(t) => {
+            secrets.push(slot("totp_secret", "Setup secret (Base32)"));
+            json!({"issuer": t.issuer, "account_name": t.account_name,
+                   "algorithm": t.config.algorithm.as_str(), "digits": t.config.digits,
+                   "period": t.config.period})
+        }
+        ItemData::Ed25519Key(k) => json!({
+            "comment": k.comment,
+            "public_key_hex": k.key.public_key_hex,
+            "openssh": k.key.openssh_public_key(k.comment.as_deref())?}),
+        ItemData::SecureNote(_) => {
+            secrets.push(slot("body", "Note"));
+            json!({})
+        }
+    };
+    let custom_fields = i
+        .custom_fields
+        .iter()
+        .enumerate()
+        .map(|(n, f)| {
+            let concealed = is_concealed(f.kind);
+            if concealed {
+                secrets.push(slot(&format!("custom:{n}"), &f.label));
+            }
+            CustomView {
+                index: n,
+                label: f.label.clone(),
+                section: f.section.clone(),
+                concealed,
+                value: (!concealed).then(|| f.value.expose().to_owned()),
+            }
+        })
+        .collect();
+    Ok(ItemView {
+        id: i.id.to_string(),
+        kind: i.kind().as_str(),
+        rev: i.rev,
+        title: i.title.clone(),
+        tags: i.tags.clone(),
+        created_at: i.created_at,
+        updated_at: i.updated_at,
+        imported: i.source.is_some(),
+        data,
+        secrets,
+        custom_fields,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct EnvelopeInfo {
+    pub vault_id: String,
+    pub kek_id: String,
+    pub revision: u64,
+}
+
+pub fn inspect_envelope(bytes: &[u8]) -> Result<EnvelopeInfo> {
+    check_size(bytes)?;
+    let h = read_header(bytes)?;
+    Ok(EnvelopeInfo {
+        vault_id: h.vault_id,
+        kek_id: h.kek_id,
+        revision: h.revision,
+    })
+}
+
+fn check_size(bytes: &[u8]) -> Result<()> {
+    if bytes.len() > MAX_ENVELOPE_BYTES {
+        return Err(Error::Format("vault exceeds the maximum size".into()));
+    }
+    Ok(())
+}
+
+fn locked() -> Error {
+    Error::Validation("vault is locked".into())
+}
+
+/// An unlocked vault plus the key provider used to seal it. `lock` drops the
+/// decrypted vault (items and data key); every later call fails.
+pub struct Session {
+    vault: Option<Vault>,
+    /// Revision produced by the last [`Session::seal`], awaiting commit.
+    pending: Option<u64>,
+}
+
+impl Session {
+    pub fn create(key: &DemoKey) -> Result<Self> {
+        Ok(Self {
+            vault: Some(Vault::create(key.provider(), &mut OsRandom)?),
+            pending: None,
+        })
+    }
+
+    /// Decrypt an envelope. Fails closed on wrong key, corruption, unknown
+    /// format or oversize input.
+    pub fn open(bytes: &[u8], key: &DemoKey) -> Result<Self> {
+        check_size(bytes)?;
+        Ok(Self {
+            vault: Some(Vault::decrypt(bytes, key.provider())?),
+            pending: None,
+        })
+    }
+
+    pub fn lock(&mut self) {
+        self.vault = None;
+        self.pending = None;
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.vault.is_none()
+    }
+
+    fn v(&self) -> Result<&Vault> {
+        self.vault.as_ref().ok_or_else(locked)
+    }
+
+    fn vm(&mut self) -> Result<&mut Vault> {
+        self.vault.as_mut().ok_or_else(locked)
+    }
+
+    pub fn vault_id(&self) -> Result<String> {
+        Ok(self.v()?.vault_id().to_owned())
+    }
+
+    pub fn revision(&self) -> Result<u64> {
+        Ok(self.v()?.revision())
+    }
+
+    pub fn list(&self, query: &str, kind: &str) -> Result<Vec<Summary>> {
+        let q = query.trim().to_lowercase();
+        let k = if kind.is_empty() {
+            None
+        } else {
+            Some(kind_from(kind).ok_or_else(|| Error::Validation("unknown kind".into()))?)
+        };
+        let mut out: Vec<Summary> = self
+            .v()?
+            .items()
+            .filter(|i| k.map_or(true, |k| i.kind() == k) && matches(i, &q))
+            .map(|i| Summary {
+                id: i.id.to_string(),
+                kind: i.kind().as_str(),
+                title: i.title.clone(),
+                subtitle: subtitle(i),
+                tags: i.tags.clone(),
+            })
+            .collect();
+        out.sort_by_key(|s| s.title.to_lowercase());
+        Ok(out)
+    }
+
+    pub fn get(&self, id: &str) -> Result<ItemView> {
+        view(self.v()?.get(&parse_id(id)?)?)
+    }
+
+    /// Plaintext of one secret slot. Ed25519 seeds are not revealable.
+    pub fn reveal(&self, id: &str, key: &str) -> Result<Zeroizing<String>> {
+        let item = self.v()?.get(&parse_id(id)?)?;
+        let none = || Error::Validation("no such secret field".into());
+        let s =
+            |o: &Option<SecretString>| o.as_ref().map(|v| v.expose().to_owned()).ok_or_else(none);
+        let out = match (key, &item.data) {
+            ("notes", _) => s(&item.notes)?,
+            ("password", ItemData::Login(l)) => s(&l.password)?,
+            ("secret", ItemData::Secret(c)) => c.secret.expose().to_owned(),
+            ("recovery_phrase", ItemData::CryptoWallet(w)) => s(&w.recovery_phrase)?,
+            ("wallet_password", ItemData::CryptoWallet(w)) => s(&w.wallet_password)?,
+            ("private_key", ItemData::CryptoWallet(w)) => s(&w.private_key)?,
+            ("body", ItemData::SecureNote(n)) => n.body.expose().to_owned(),
+            ("totp_secret", ItemData::Totp(t)) => {
+                data_encoding::BASE32_NOPAD.encode(t.config.secret.expose())
+            }
+            (k, ItemData::Login(l)) if k.starts_with("recovery_code:") => {
+                let n: usize = k["recovery_code:".len()..].parse().map_err(|_| none())?;
+                l.recovery_codes
+                    .get(n)
+                    .ok_or_else(none)?
+                    .expose()
+                    .to_owned()
+            }
+            (k, _) if k.starts_with("custom:") => {
+                let n: usize = k["custom:".len()..].parse().map_err(|_| none())?;
+                item.custom_fields
+                    .get(n)
+                    .ok_or_else(none)?
+                    .value
+                    .expose()
+                    .to_owned()
+            }
+            _ => return Err(none()),
+        };
+        Ok(Zeroizing::new(out))
+    }
+
+    fn custom(input: Vec<CustomFieldInput>, old: &[CustomField]) -> Result<Vec<CustomField>> {
+        input
+            .into_iter()
+            .map(|c| {
+                let value = match (c.value, c.existing) {
+                    (Some(v), _) => SecretString::new(v),
+                    (None, Some(n)) => old
+                        .get(n)
+                        .ok_or_else(|| Error::Validation("unknown existing field".into()))?
+                        .value
+                        .clone(),
+                    (None, None) => {
+                        return Err(Error::Validation("custom field needs a value".into()))
+                    }
+                };
+                Ok(CustomField {
+                    section: None,
+                    label: c.label,
+                    kind: if c.concealed {
+                        FieldKind::Concealed
+                    } else {
+                        FieldKind::Text
+                    },
+                    source_type: None,
+                    value,
+                })
+            })
+            .collect()
+    }
+
+    /// Build item data from input, merging with `old` on update.
+    fn data(input: DataInput, old: Option<&ItemData>) -> Result<ItemData> {
+        let wrong = || Error::Validation("item kind cannot change".into());
+        Ok(match input {
+            DataInput::Login {
+                username,
+                password,
+                urls,
+                totp_item,
+                recovery_codes,
+            } => {
+                let o = match old {
+                    Some(ItemData::Login(l)) => Some(l),
+                    Some(_) => return Err(wrong()),
+                    None => None,
+                };
+                ItemData::Login(Login {
+                    username: text(username),
+                    password: secret_update(password, o.and_then(|l| l.password.as_ref())),
+                    urls: urls.into_iter().filter(|u| !u.is_empty()).collect(),
+                    totp_item: text(totp_item).map(|t| parse_id(&t)).transpose()?,
+                    recovery_codes: match recovery_codes {
+                        Some(v) => v
+                            .into_iter()
+                            .filter(|c| !c.is_empty())
+                            .map(SecretString::new)
+                            .collect(),
+                        None => o.map(|l| l.recovery_codes.clone()).unwrap_or_default(),
+                    },
+                })
+            }
+            DataInput::Secret {
+                secret,
+                username,
+                service,
+            } => {
+                let o = match old {
+                    Some(ItemData::Secret(s)) => Some(s),
+                    Some(_) => return Err(wrong()),
+                    None => None,
+                };
+                let (secret, format, origin) = match (secret.filter(|s| !s.is_empty()), o) {
+                    (Some(v), _) => (
+                        SecretString::new(v),
+                        SecretFormat::Text,
+                        SecretOrigin::Manual,
+                    ),
+                    (None, Some(o)) => (o.secret.clone(), o.format, o.origin),
+                    (None, None) => return Err(Error::Validation("secret is required".into())),
+                };
+                ItemData::Secret(SecretCredential {
+                    secret,
+                    format,
+                    origin,
+                    username: text(username),
+                    service: text(service),
+                    expires_at: o.and_then(|o| o.expires_at),
+                })
+            }
+            DataInput::Contact {
+                full_name,
+                organization,
+                emails,
+                phones,
+                addresses,
+                websites,
+            } => {
+                if matches!(old, Some(d) if !matches!(d, ItemData::Contact(_))) {
+                    return Err(wrong());
+                }
+                ItemData::Contact(Contact {
+                    full_name: text(full_name),
+                    organization: text(organization),
+                    emails: labeled(emails),
+                    phones: labeled(phones),
+                    addresses: labeled(addresses),
+                    websites: labeled(websites),
+                })
+            }
+            DataInput::CryptoWallet {
+                wallet_software,
+                network,
+                addresses,
+                recovery_phrase,
+                wallet_password,
+                private_key,
+                derivation_path,
+            } => {
+                let o = match old {
+                    Some(ItemData::CryptoWallet(w)) => Some(w),
+                    Some(_) => return Err(wrong()),
+                    None => None,
+                };
+                ItemData::CryptoWallet(CryptoWalletRecord {
+                    wallet_software: text(wallet_software),
+                    network: text(network),
+                    addresses: labeled(addresses),
+                    recovery_phrase: secret_update(
+                        recovery_phrase,
+                        o.and_then(|w| w.recovery_phrase.as_ref()),
+                    ),
+                    wallet_password: secret_update(
+                        wallet_password,
+                        o.and_then(|w| w.wallet_password.as_ref()),
+                    ),
+                    private_key: secret_update(private_key, o.and_then(|w| w.private_key.as_ref())),
+                    derivation_path: text(derivation_path),
+                })
+            }
+            DataInput::SecureNote { body } => {
+                let o = match old {
+                    Some(ItemData::SecureNote(n)) => Some(n),
+                    Some(_) => return Err(wrong()),
+                    None => None,
+                };
+                ItemData::SecureNote(SecureNote {
+                    body: match (body, o) {
+                        (Some(b), _) => SecretString::new(b),
+                        (None, Some(o)) => o.body.clone(),
+                        (None, None) => SecretString::new(""),
+                    },
+                })
+            }
+            DataInput::Totp {
+                issuer,
+                account_name,
+            } => match old {
+                Some(ItemData::Totp(t)) => ItemData::Totp(TotpRecord {
+                    config: t.config.clone(),
+                    issuer: text(issuer),
+                    account_name: text(account_name),
+                }),
+                Some(_) => return Err(wrong()),
+                None => {
+                    return Err(Error::Validation(
+                        "create TOTP items with create_totp".into(),
+                    ))
+                }
+            },
+            DataInput::Ed25519Key { comment } => match old {
+                Some(ItemData::Ed25519Key(k)) => ItemData::Ed25519Key(Ed25519KeyRecord {
+                    key: k.key.clone(),
+                    comment: text(comment),
+                }),
+                Some(_) => return Err(wrong()),
+                None => {
+                    return Err(Error::Validation(
+                        "generate Ed25519 keys with generate_ed25519".into(),
+                    ))
+                }
+            },
+        })
+    }
+
+    fn new_item(&mut self, title: String, data: ItemData) -> Result<Item> {
+        let _ = self.v()?;
+        Item::new(title, data, &mut OsRandom)
+    }
+
+    pub fn create_item(&mut self, input: ItemInput) -> Result<String> {
+        let data = Self::data(input.data, None)?;
+        let mut item = self.new_item(input.title, data)?;
+        item.tags = input.tags.into_iter().filter(|t| !t.is_empty()).collect();
+        item.notes = text(input.notes).map(SecretString::new);
+        item.custom_fields = Self::custom(input.custom_fields, &[])?;
+        Ok(self.vm()?.insert(item)?.to_string())
+    }
+
+    pub fn update_item(&mut self, id: &str, input: ItemInput) -> Result<()> {
+        let id = parse_id(id)?;
+        let old = self.v()?.get(&id)?.clone();
+        let data = Self::data(input.data, Some(&old.data))?;
+        let custom = Self::custom(input.custom_fields, &old.custom_fields)?;
+        let notes = secret_update(input.notes, old.notes.as_ref());
+        let tags: Vec<String> = input.tags.into_iter().filter(|t| !t.is_empty()).collect();
+        self.vm()?.update(&id, |it| {
+            it.title = input.title;
+            it.tags = tags;
+            it.notes = notes;
+            it.custom_fields = custom;
+            it.data = data;
+        })
+    }
+
+    pub fn delete_item(&mut self, id: &str) -> Result<()> {
+        self.vm()?.remove(&parse_id(id)?).map(|_| ())
+    }
+
+    /// TOTP from an `otpauth://totp/...` URI or a Base32 secret.
+    pub fn create_totp(
+        &mut self,
+        title: &str,
+        input: &str,
+        issuer: &str,
+        account: &str,
+    ) -> Result<String> {
+        let input = input.trim();
+        let rec = if input.to_ascii_lowercase().starts_with("otpauth://") {
+            let p = parse_otpauth_uri(input)?;
+            TotpRecord {
+                config: p.config,
+                issuer: text(Some(issuer.into())).or(p.issuer),
+                account_name: text(Some(account.into())).or(p.account_name),
+            }
+        } else {
+            TotpRecord {
+                config: TotpConfig::with_defaults(parse_base32_secret(input)?)?,
+                issuer: text(Some(issuer.into())),
+                account_name: text(Some(account.into())),
+            }
+        };
+        let item = self.new_item(title.into(), ItemData::Totp(rec))?;
+        Ok(self.vm()?.insert(item)?.to_string())
+    }
+
+    /// Code at `unix_time` (the caller's injected clock).
+    pub fn totp_code(&self, id: &str, unix_time: u64) -> Result<(String, u32)> {
+        let item = self.v()?.get(&parse_id(id)?)?;
+        let ItemData::Totp(t) = &item.data else {
+            return Err(Error::Validation("not a TOTP item".into()));
+        };
+        let c = code_now(&t.config, &FixedClock(unix_time))?;
+        Ok((c.code, c.seconds_remaining))
+    }
+
+    /// New Ed25519 key generated and stored inside the vault. Only the public
+    /// key is ever visible.
+    pub fn generate_ed25519(&mut self, title: &str, comment: &str) -> Result<String> {
+        let rec = Ed25519KeyRecord {
+            key: Ed25519KeyPair::generate(&mut OsRandom)?,
+            comment: text(Some(comment.into())),
+        };
+        let item = self.new_item(title.into(), ItemData::Ed25519Key(rec))?;
+        Ok(self.vm()?.insert(item)?.to_string())
+    }
+
+    /// Random secret generated and stored without leaving WASM memory.
+    pub fn generate_secret_item(
+        &mut self,
+        title: &str,
+        n_bytes: usize,
+        encoding: &str,
+        service: &str,
+    ) -> Result<String> {
+        let enc = parse_encoding(encoding)?;
+        let secret = generate_secret(n_bytes, enc, &mut OsRandom)?;
+        let data = ItemData::Secret(SecretCredential {
+            secret,
+            format: SecretFormat::Encoded(enc),
+            origin: SecretOrigin::Generated,
+            username: None,
+            service: text(Some(service.into())),
+            expires_at: None,
+        });
+        let item = self.new_item(title.into(), data)?;
+        Ok(self.vm()?.insert(item)?.to_string())
+    }
+
+    /// Password generated and stored as a Secret item without leaving WASM.
+    pub fn generate_password_item(
+        &mut self,
+        title: &str,
+        profile: &str,
+        service: &str,
+    ) -> Result<String> {
+        let pw = generate_password(
+            &PasswordPolicy::profile(parse_profile(profile)?),
+            &mut OsRandom,
+        )?;
+        let data = ItemData::Secret(SecretCredential {
+            secret: pw,
+            format: SecretFormat::Text,
+            origin: SecretOrigin::Generated,
+            username: None,
+            service: text(Some(service.into())),
+            expires_at: None,
+        });
+        let item = self.new_item(title.into(), data)?;
+        Ok(self.vm()?.insert(item)?.to_string())
+    }
+
+    /// Seal the next revision without changing the session. The caller
+    /// persists the bytes and then calls [`Session::commit`].
+    pub fn seal(&mut self, key: &DemoKey) -> Result<(Vec<u8>, u64)> {
+        let (bytes, rev) = self.v()?.seal_next(key.provider(), &mut OsRandom)?;
+        self.pending = Some(rev);
+        Ok((bytes, rev))
+    }
+
+    /// Record that `revision` (from the last [`Session::seal`]) was written.
+    pub fn commit(&mut self, revision: u64) -> Result<()> {
+        match self.pending.take() {
+            Some(r) if r == revision => self.vm()?.mark_persisted(revision),
+            _ => Err(Error::Integrity("no matching sealed revision".into())),
+        }
+    }
+}
+
+pub fn parse_profile(p: &str) -> Result<PasswordProfile> {
+    match p {
+        "default" | "" => Ok(PasswordProfile::Default),
+        "strong" => Ok(PasswordProfile::Strong),
+        _ => Err(Error::Policy("unknown password profile".into())),
+    }
+}
+
+pub fn parse_encoding(e: &str) -> Result<SecretEncoding> {
+    match e {
+        "hex" | "" => Ok(SecretEncoding::Hex),
+        "base64url" => Ok(SecretEncoding::Base64Url),
+        "base32" => Ok(SecretEncoding::Base32),
+        _ => Err(Error::Policy("unknown encoding".into())),
+    }
+}
+
+pub fn gen_password(profile: &str, length: usize, alphabet: &str) -> Result<SecretString> {
+    let pol = if alphabet.is_empty() {
+        PasswordPolicy::profile(parse_profile(profile)?)
+    } else {
+        PasswordPolicy::allowlist(length, alphabet)?
+    };
+    generate_password(&pol, &mut OsRandom)
+}
+
+pub fn gen_secret(n_bytes: usize, encoding: &str) -> Result<SecretString> {
+    generate_secret(n_bytes, parse_encoding(encoding)?, &mut OsRandom)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(j: serde_json::Value) -> ItemInput {
+        serde_json::from_value(j).unwrap()
+    }
+
+    fn session() -> (DemoKey, Session) {
+        let k = DemoKey::fixture();
+        let s = Session::create(&k).unwrap();
+        (k, s)
+    }
+
+    fn persist(s: &mut Session, k: &DemoKey) -> Vec<u8> {
+        let (b, r) = s.seal(k).unwrap();
+        s.commit(r).unwrap();
+        b
+    }
+
+    #[test]
+    fn create_every_kind_and_round_trip() {
+        let (k, mut s) = session();
+        let login = s
+            .create_item(input(serde_json::json!({
+                "title": "SYNTH-TITLE Login", "tags": ["t"], "notes": "SYNTH-NOTE",
+                "custom_fields": [{"label": "pin", "concealed": true, "value": "SYNTH-PIN"},
+                                  {"label": "plan", "value": "basic"}],
+                "data": {"kind": "login", "username": "u", "password": "SYNTH-PW",
+                         "urls": ["https://SYNTH-URL.example.test"], "recovery_codes": ["RC1"]}})))
+            .unwrap();
+        s.create_item(input(
+            serde_json::json!({"title": "S", "data": {"kind": "secret", "secret": "SYNTH-SECRET"}}),
+        ))
+        .unwrap();
+        s.create_item(input(serde_json::json!({"title": "C", "data": {"kind": "contact", "full_name": "Ada",
+            "emails": [{"label": "w", "value": "a@example.test"}, {"label": null, "value": "b@example.test"}],
+            "phones": [{"label": null, "value": "+1 555 0100"}]}}))).unwrap();
+        s.create_item(input(
+            serde_json::json!({"title": "W", "data": {"kind": "crypto_wallet", "network": "testnet",
+            "addresses": [{"label": null, "value": "addr1"}], "recovery_phrase": "SYNTH-WORDS"}}),
+        ))
+        .unwrap();
+        s.create_item(input(serde_json::json!({"title": "N", "data": {"kind": "secure_note", "body": "SYNTH-BODY"}}))).unwrap();
+        let totp = s
+            .create_totp(
+                "T",
+                "otpauth://totp/Ex:u?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Ex&digits=8",
+                "",
+                "",
+            )
+            .unwrap();
+        let ed = s.generate_ed25519("K", "c").unwrap();
+        s.generate_secret_item("G", 32, "hex", "svc").unwrap();
+        s.generate_password_item("P", "strong", "").unwrap();
+        assert_eq!(s.list("", "").unwrap().len(), 9);
+
+        let bytes = persist(&mut s, &k);
+        let raw = String::from_utf8(bytes.clone()).unwrap();
+        for m in ["SYNTH", "GEZDGNBV", "example.test", "Ada"] {
+            assert!(!raw.contains(m), "{m} in envelope");
+        }
+        let s2 = Session::open(&bytes, &k).unwrap();
+        assert_eq!(s2.list("", "").unwrap().len(), 9);
+        assert_eq!(&*s2.reveal(&login, "password").unwrap(), "SYNTH-PW");
+        assert_eq!(&*s2.reveal(&login, "custom:0").unwrap(), "SYNTH-PIN");
+        assert_eq!(&*s2.reveal(&login, "recovery_code:0").unwrap(), "RC1");
+        assert_eq!(s2.totp_code(&totp, 59).unwrap(), ("94287082".into(), 1));
+        // Views never contain secret values.
+        let v = serde_json::to_string(&s2.get(&login).unwrap()).unwrap();
+        assert!(!v.contains("SYNTH-PW") && !v.contains("SYNTH-PIN") && !v.contains("SYNTH-NOTE"));
+        assert!(v.contains("basic"), "non-concealed custom value visible");
+        let ev = serde_json::to_string(&s2.get(&ed).unwrap()).unwrap();
+        assert!(ev.contains("ssh-ed25519 "));
+        assert!(s2.reveal(&ed, "seed").is_err(), "no seed reveal");
+    }
+
+    #[test]
+    fn update_keep_clear_set_semantics() {
+        let (_k, mut s) = session();
+        let id = s
+            .create_item(input(serde_json::json!({"title": "L", "notes": "N1",
+                "custom_fields": [{"label": "pin", "concealed": true, "value": "P1"}],
+                "data": {"kind": "login", "password": "PW1"}})))
+            .unwrap();
+        // Keep password and custom value, clear notes, rename.
+        s.update_item(
+            &id,
+            input(serde_json::json!({"title": "L2", "notes": "",
+            "custom_fields": [{"label": "pin2", "concealed": true, "value": null, "existing": 0}],
+            "data": {"kind": "login", "username": "u"}})),
+        )
+        .unwrap();
+        assert_eq!(&*s.reveal(&id, "password").unwrap(), "PW1");
+        assert_eq!(&*s.reveal(&id, "custom:0").unwrap(), "P1");
+        assert!(s.reveal(&id, "notes").is_err());
+        let v = s.get(&id).unwrap();
+        assert_eq!(v.title, "L2");
+        assert_eq!(v.rev, 2);
+        // Kind cannot change; validation errors leave the item untouched.
+        assert!(s
+            .update_item(
+                &id,
+                input(
+                    serde_json::json!({"title": "x", "data": {"kind": "secure_note", "body": "b"}})
+                )
+            )
+            .is_err());
+        assert!(s
+            .update_item(
+                &id,
+                input(serde_json::json!({"title": "", "data": {"kind": "login"}}))
+            )
+            .is_err());
+        assert_eq!(s.get(&id).unwrap().title, "L2");
+    }
+
+    #[test]
+    fn search_and_filter() {
+        let (_k, mut s) = session();
+        s.create_item(input(serde_json::json!({"title": "Alpha", "data": {"kind": "login", "username": "zed", "urls": ["https://bank.example.test"]}}))).unwrap();
+        s.create_item(input(serde_json::json!({"title": "Beta", "data": {"kind": "secure_note", "body": "bank secret"}}))).unwrap();
+        assert_eq!(
+            s.list("BANK", "").unwrap().len(),
+            1,
+            "url hit; note bodies not searched"
+        );
+        assert_eq!(s.list("zed", "").unwrap().len(), 1);
+        assert_eq!(s.list("", "secure_note").unwrap().len(), 1);
+        assert!(s.list("", "bogus").is_err());
+    }
+
+    #[test]
+    fn locked_session_rejects_everything() {
+        let (k, mut s) = session();
+        let id = s
+            .create_item(input(
+                serde_json::json!({"title": "A", "data": {"kind": "secure_note", "body": "b"}}),
+            ))
+            .unwrap();
+        s.lock();
+        assert!(s.is_locked());
+        assert!(s.list("", "").is_err());
+        assert!(s.get(&id).is_err());
+        assert!(s.reveal(&id, "body").is_err());
+        assert!(s
+            .create_item(input(
+                serde_json::json!({"title": "B", "data": {"kind": "secure_note", "body": "b"}})
+            ))
+            .is_err());
+        assert!(s.delete_item(&id).is_err());
+        assert!(s.generate_ed25519("k", "").is_err());
+        assert!(s.generate_secret_item("g", 32, "hex", "").is_err());
+        assert!(s
+            .create_totp("t", "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", "", "")
+            .is_err());
+        assert!(s.totp_code(&id, 0).is_err());
+        assert!(s.seal(&k).is_err());
+        assert!(s.commit(1).is_err());
+    }
+
+    #[test]
+    fn seal_commit_protocol() {
+        let (k, mut s) = session();
+        let (_b, r) = s.seal(&k).unwrap();
+        assert_eq!(r, 1);
+        assert!(s.commit(2).is_err());
+        assert!(
+            s.commit(1).is_err(),
+            "pending consumed by the failed commit"
+        );
+        let (_b, r) = s.seal(&k).unwrap();
+        s.commit(r).unwrap();
+        assert_eq!(s.revision().unwrap(), 1);
+        let (_b, r) = s.seal(&k).unwrap();
+        assert_eq!(r, 2);
+    }
+
+    #[test]
+    fn wrong_key_corrupt_unknown_and_oversize_fail() {
+        let (k, mut s) = session();
+        s.create_item(input(
+            serde_json::json!({"title": "A", "data": {"kind": "secure_note", "body": "b"}}),
+        ))
+        .unwrap();
+        let bytes = persist(&mut s, &k);
+        let other = DemoKey::ephemeral().unwrap();
+        assert!(Session::open(&bytes, &other).is_err());
+        assert!(Session::open(&bytes[..bytes.len() / 2], &k).is_err());
+        assert!(Session::open(b"{\"format\":\"x\"}", &k).is_err());
+        assert!(Session::open(&vec![b' '; MAX_ENVELOPE_BYTES + 1], &k).is_err());
+        let info = inspect_envelope(&bytes).unwrap();
+        assert_eq!(info.revision, 1);
+        assert_eq!(info.kek_id, FixtureKeyProvider::KEY_ID);
+    }
+
+    #[test]
+    fn fixture_key_is_stable_and_ephemeral_differs() {
+        let (k, mut s) = session();
+        let bytes = persist(&mut s, &k);
+        // A fresh fixture provider (e.g. after reload) opens it.
+        assert!(Session::open(&bytes, &DemoKey::fixture()).is_ok());
+        let e = DemoKey::ephemeral().unwrap();
+        let mut se = Session::create(&e).unwrap();
+        let eb = persist(&mut se, &e);
+        assert!(Session::open(&eb, &DemoKey::ephemeral().unwrap()).is_err());
+        assert!(Session::open(&eb, &e).is_ok());
+    }
+
+    #[test]
+    fn generators() {
+        assert_eq!(
+            gen_password("default", 0, "")
+                .unwrap()
+                .expose()
+                .chars()
+                .count(),
+            24
+        );
+        assert_eq!(
+            gen_password("strong", 0, "")
+                .unwrap()
+                .expose()
+                .chars()
+                .count(),
+            32
+        );
+        assert!(gen_password("x", 0, "").is_err());
+        assert!(gen_password("", 4, "ab").is_err());
+        assert_eq!(gen_secret(32, "hex").unwrap().len(), 64);
+        assert!(gen_secret(32, "rot13").is_err());
+    }
+}

@@ -244,14 +244,20 @@ impl Vault {
         Ok(bytes)
     }
 
-    #[cfg(feature = "native")]
-    pub(crate) fn mark_persisted(&mut self, revision: u64) {
+    /// For storage adapters: record that the bytes from [`Vault::seal_next`]
+    /// for `revision` were durably written. Only the next revision is accepted.
+    pub fn mark_persisted(&mut self, revision: u64) -> Result<()> {
+        if revision != self.loaded_revision + 1 {
+            return Err(Error::Integrity("unexpected persisted revision".into()));
+        }
         self.loaded_revision = revision;
+        Ok(())
     }
 
     /// Encrypt to revision `self.revision() + 1` without mutating the vault.
-    /// Every item and the manifest get fresh nonces.
-    pub(crate) fn seal_next(
+    /// Every item and the manifest get fresh nonces. Storage adapters write
+    /// the bytes, then call [`Vault::mark_persisted`].
+    pub fn seal_next(
         &self,
         provider: &dyn KeyProvider,
         rng: &mut dyn RandomSource,
