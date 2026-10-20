@@ -30,7 +30,8 @@ npm run e2e            # Playwright, headless Chromium, real WASM, no request in
 `e2e/vault.spec.ts` holds the M2 vault and security regressions. `e2e/preferences.spec.ts` covers language and appearance:
 - both locales × all three theme preferences under a controlled OS scheme, live OS changes, and reload;
 - unsaved input, TOTP codes and keys preserved across switches, with unchanged vault bytes;
-- keyboard use, narrow viewports (320–390 px), corrupt or blocked preference storage, and CSP.
+- keyboard use, narrow viewports (320–390 px), corrupt or blocked preference storage, and CSP;
+- real pointer clicks on all seven New-item menu options (empty and one-item list, 1280×860/600/460, mobile) with clipping and hit-test checks, and ≥44px touch targets for the preference controls under touch emulation.
 
 Screenshots: `KEYMESH_SCREENSHOT_DIR=/abs/dir npm run e2e` writes desktop screenshots for each locale × theme and mobile screenshots to that directory. `KEYMESH_SCREENSHOT=/abs/path.png` sets the M2 flow screenshot. Without these variables, screenshots go to the git-ignored `test-results/`. Keep screenshots out of the repository.
 

@@ -546,3 +546,141 @@ test('CSP stays strict: no inline scripts, no violations, reduced motion respect
   await expect(page.getByTestId('start-vault')).toBeVisible();
   expect(violations).toEqual([]);
 });
+
+// --- M3 review 1 -----------------------------------------------------------------
+
+const KINDS = ['login', 'secret', 'contact', 'crypto_wallet', 'ed25519_key', 'totp', 'secure_note'] as const;
+
+/**
+ * Every New-item option must be reachable by a real pointer click: no
+ * programmatic scrolling first (a user cannot scroll an overflow:hidden
+ * pane), no ancestor clipping, centre hit-tests to the option, then a mouse
+ * click at those coordinates.
+ */
+async function clickEveryNewItemKind(page: Page, where: string) {
+  for (const kind of KINDS) {
+    await page.getByTestId('new-item').click();
+    const option = page.locator(`[role=menuitem][data-kind=${kind}]`);
+    await expect(option).toBeVisible();
+    const vp = page.viewportSize()!;
+    const measure = () =>
+      option.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        const menu = (el.closest('[role=menu]') as HTMLElement).getBoundingClientRect();
+        const clippedBy: string[] = [];
+        // A position:fixed menu escapes overflow clipping unless an ancestor
+        // becomes its containing block (transform, filter, contain, …).
+        const fixed = getComputedStyle(el.closest('[role=menu]')!).position === 'fixed';
+        const containing = (cs: CSSStyleDeclaration) =>
+          cs.transform !== 'none' || cs.filter !== 'none' || cs.perspective !== 'none' ||
+          cs.backdropFilter !== 'none' || /paint|layout|strict|content/.test(cs.contain) ||
+          /transform|filter/.test(cs.willChange);
+        let escaped = fixed;
+        for (let a = el.parentElement; a; a = a.parentElement) {
+          const cs = getComputedStyle(a);
+          if (a.getAttribute('role') === 'menu') continue; // the menu's own scroll
+          if (escaped && containing(cs)) escaped = false;
+          if (escaped) continue;
+          if (cs.overflowX === 'visible' && cs.overflowY === 'visible') continue;
+          const c = a.getBoundingClientRect();
+          if (r.top < c.top - 0.5 || r.bottom > c.bottom + 0.5 || r.left < c.left - 0.5 || r.right > c.right + 0.5) {
+            clippedBy.push(String(a.className || a.tagName));
+          }
+        }
+        return {
+          x: r.x + r.width / 2,
+          y: r.y + r.height / 2,
+          bottom: r.bottom,
+          clippedBy,
+          menuCenter: { x: menu.x + menu.width / 2, y: menu.y + menu.height / 2 },
+          inMenuView: r.top >= menu.top - 0.5 && r.bottom <= menu.bottom + 0.5,
+        };
+      });
+    let state = await measure();
+    // A short viewport caps the menu height; scroll the menu itself with the wheel, like a user.
+    for (let i = 0; i < 10 && !state.inMenuView; i++) {
+      await page.mouse.move(state.menuCenter.x, state.menuCenter.y);
+      await page.mouse.wheel(0, 120);
+      await expect(page.locator('[role=menu]')).toHaveCount(1);
+      state = await measure();
+    }
+    expect(state.inMenuView, `${where}: ${kind} not reachable inside the menu`).toBe(true);
+    expect(state.clippedBy, `${where}: ${kind} clipped by ancestors`).toEqual([]);
+    expect(state.bottom, `${where}: ${kind} below viewport`).toBeLessThanOrEqual(vp.height);
+    const hit = await page.evaluate(
+      ({ x, y, k }) => !!document.elementFromPoint(x, y)?.closest(`[role=menuitem][data-kind="${k}"]`),
+      { x: state.x, y: state.y, k: kind },
+    );
+    expect(hit, `${where}: ${kind} option is not hit-testable`).toBe(true);
+    await page.mouse.click(state.x, state.y);
+    await expect(page.locator(`form.item-form .form-head .kind-tile[data-kind=${kind}]`)).toBeVisible();
+    await expect(page.locator('[role=menu]')).toHaveCount(0);
+    await page.locator('form.item-form .form-actions button[type=button]').click();
+  }
+}
+
+test('desktop New-item menu: every kind is clickable with an empty and a one-item list, at several heights', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1280, height: 860 });
+  await page.goto('/');
+  await startFixtureVault(page);
+  for (const height of [860, 600, 460]) {
+    await page.setViewportSize({ width: 1280, height });
+    await clickEveryNewItemKind(page, `empty ${height}`);
+  }
+  await newItem(page, 'login');
+  await page.locator('form [name=title]').fill('Synthetic Mail');
+  await submit(page, 'Synthetic Mail');
+  for (const height of [860, 600, 460]) {
+    await page.setViewportSize({ width: 1280, height });
+    await clickEveryNewItemKind(page, `one item ${height}`);
+  }
+  await page.setViewportSize({ width: 1280, height: 600 });
+  await page.getByTestId('new-item').click();
+  await expect(page.locator('[role=menu]')).toBeVisible();
+  await page.screenshot({ path: shotPath(testInfo, 'keymesh-en-new-item-menu-1280x600.png') });
+  await page.keyboard.press('Escape');
+  // Independent pane scrolling still works with the menu change.
+  await page.setViewportSize({ width: 1280, height: 860 });
+  await expect(page.locator('main')).toHaveCSS('overflow', 'hidden');
+  await expect(page.locator('.list-pane .item-list')).toHaveCSS('overflow-y', 'auto');
+  await expect(page.locator('.detail-pane')).toHaveCSS('overflow-y', 'auto');
+});
+
+test('mobile New-item menu: every kind is clickable by touch-size pointer', async ({ browser }) => {
+  const ctx = await browser.newContext({ hasTouch: true, isMobile: true, viewport: { width: 360, height: 640 } });
+  const page = await ctx.newPage();
+  await page.goto('/');
+  await startFixtureVault(page);
+  await clickEveryNewItemKind(page, 'mobile empty');
+  await ctx.close();
+});
+
+for (const locale of ['zh-TW', 'en'] as const) {
+  test(`${locale}: preference controls are ≥44px touch targets on coarse pointers`, async ({ browser }, testInfo) => {
+    for (const width of [320, 390]) {
+      const ctx = await browser.newContext({ locale, hasTouch: true, isMobile: true, viewport: { width, height: 760 } });
+      const page = await ctx.newPage();
+      await page.goto('/');
+      await expect(page.getByTestId('start-vault')).toBeVisible();
+      expect(await page.evaluate(() => matchMedia('(pointer: coarse)').matches)).toBe(true);
+      const check = async (where: string) => {
+        const targets = page.locator('[data-testid=language-switch] button, [data-testid=theme-switch] button');
+        await expect(targets).toHaveCount(5);
+        for (const t of await targets.all()) {
+          const box = (await t.boundingBox())!;
+          const name = (await t.getAttribute('aria-label')) ?? (await t.innerText());
+          expect(box.height, `${where} ${width}px ${name} height`).toBeGreaterThanOrEqual(44);
+          expect(box.width, `${where} ${width}px ${name} width`).toBeGreaterThanOrEqual(44);
+        }
+        await noHorizontalOverflow(page, `${where} ${width}px`);
+      };
+      await check('start');
+      await startFixtureVault(page);
+      await check('unlocked');
+      if (width === 320) await page.screenshot({ path: shotPath(testInfo, `keymesh-touch-prefs-${locale}-320.png`) });
+      const lock = (await page.getByTestId('lock').boundingBox())!;
+      expect(lock.height).toBeGreaterThanOrEqual(44);
+      await ctx.close();
+    }
+  });
+}
