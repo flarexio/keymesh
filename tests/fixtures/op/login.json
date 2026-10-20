@@ -1,0 +1,27 @@
+{
+  "id": "synthloginitem0000000000a1",
+  "title": "Synthetic Example Login",
+  "version": 4,
+  "vault": { "id": "synthvault000000000000000v1", "name": "Synthetic Vault" },
+  "category": "LOGIN",
+  "last_edited_by": "SYNTHETICUSER",
+  "created_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-01-02T00:00:00Z",
+  "additional_information": "synthetic-user@example.test",
+  "tags": ["synthetic", "fixture"],
+  "urls": [
+    { "label": "website", "primary": true, "href": "https://login.example.test/" },
+    { "label": "bad", "href": "not a url" }
+  ],
+  "sections": [ { "id": "add more" }, { "id": "sec1", "label": "Security" } ],
+  "fields": [
+    { "id": "username", "type": "STRING", "purpose": "USERNAME", "label": "username", "value": "synthetic-user@example.test", "reference": "op://Synthetic Vault/Synthetic Example Login/username" },
+    { "id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": "SYNTH-PASSWORD-Zq9!", "entropy": 99.5, "reference": "op://Synthetic Vault/Synthetic Example Login/password", "password_details": { "entropy": 99, "generated": true, "strength": "FANTASTIC" } },
+    { "id": "notesPlain", "type": "STRING", "purpose": "NOTES", "label": "notesPlain", "value": "SYNTH-NOTE-login notes" },
+    { "id": "TOTP_synthetic1", "section": { "id": "sec1", "label": "Security" }, "type": "OTP", "label": "one-time password", "value": "otpauth://totp/Example:synthetic-user%40example.test?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Example", "totp": "999999" },
+    { "id": "pin1", "section": { "id": "sec1", "label": "Security" }, "type": "CONCEALED", "label": "backup pin", "value": "SYNTH-PIN-4321" },
+    { "id": "menu1", "section": { "id": "sec1", "label": "Security" }, "type": "MENU", "label": "plan", "value": "basic" },
+    { "id": "empty1", "section": { "id": "sec1", "label": "Security" }, "type": "STRING", "label": "unused", "value": "" }
+  ],
+  "files": [ { "id": "file1", "name": "synthetic.txt", "size": 10 } ]
+}

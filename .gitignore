@@ -1,0 +1,13 @@
+/target/
+/node_modules/
+/dist/
+/.supervision/
+/.claude/settings.local.json
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.1pux
+*.1pif
+*.vault

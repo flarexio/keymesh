@@ -1,0 +1,13 @@
+{
+  "id": "synthapiitem000000000000a4",
+  "title": "Synthetic API Credential",
+  "vault": { "id": "synthvault000000000000000v1" },
+  "category": "API_CREDENTIAL",
+  "fields": [
+    { "id": "username", "type": "STRING", "label": "username", "value": "svc-synthetic" },
+    { "id": "credential", "type": "CONCEALED", "label": "credential", "value": "SYNTH-API-TOKEN-0000" },
+    { "id": "type", "type": "MENU", "label": "type", "value": "bearer" },
+    { "id": "hostname", "type": "STRING", "label": "hostname", "value": "api.example.test" },
+    { "id": "expires", "type": "DATE", "label": "expires", "value": "1893456000" }
+  ]
+}

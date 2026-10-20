@@ -1,0 +1,8 @@
+{
+  "id": "synthdocitem000000000000a9",
+  "title": "Synthetic Document",
+  "vault": { "id": "synthvault000000000000000v1" },
+  "category": "DOCUMENT",
+  "fields": [],
+  "files": [ { "id": "f", "name": "doc.pdf", "size": 1 } ]
+}
