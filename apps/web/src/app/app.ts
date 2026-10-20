@@ -1,42 +1,98 @@
-import { Component, OnInit, inject } from '@angular/core';
+import { Component, OnInit, effect, inject } from '@angular/core';
+import { I18n } from './core/i18n/i18n.service';
 import { VaultService } from './core/vault.service';
+import { DisplayPrefs } from './shared/display-prefs';
+import { ConfirmDialog, ConfirmService, Toasts, ToastService } from './shared/feedback';
+import { Icon } from './shared/icon';
 import { Start } from './features/start';
 import { VaultShell } from './features/vault-shell';
 
 @Component({
   selector: 'app-root',
-  imports: [Start, VaultShell],
+  imports: [Start, VaultShell, DisplayPrefs, ConfirmDialog, Toasts, Icon],
   template: `
-    <div class="banner" role="note" data-testid="demo-banner">
-      SYNTHETIC DEMO — NOT PRODUCTION. Development-only key provider held in memory. Do not enter real
-      secrets.
+    <a class="skip-link" href="#main">{{ i18n.t('app.skipToContent') }}</a>
+    <div class="demo-strip" role="note" data-testid="demo-banner">
+      <km-icon name="shieldAlert" />
+      <p><strong>{{ i18n.t('demo.label') }}</strong> <span>{{ i18n.t('demo.detail') }}</span></p>
     </div>
-    <header class="app-head">
-      <h1>Keymesh <span class="muted small">vault demo</span></h1>
-      @if (vault.status() === 'unlocked' || vault.status() === 'stale') {
-        <div class="head-meta">
-          <span class="muted small" data-testid="key-mode">key: {{ vault.keyMode() }} · rev {{ vault.revision() }}</span>
-          <button type="button" class="primary" data-testid="lock" (click)="vault.lock()">Lock</button>
-        </div>
-      }
+    <header class="appbar">
+      <div class="brand">
+        <span class="brand-mark"><km-icon name="logo" /></span>
+        <span class="brand-name">Keymesh</span>
+        <span class="brand-tag">{{ i18n.t('app.tagline') }}</span>
+      </div>
+      <div class="appbar-tools">
+        <km-display-prefs />
+        @if (open()) {
+          <button type="button" class="btn btn-primary lock-btn" data-testid="lock" (click)="vault.lock()">
+            <km-icon name="lock" /><span>{{ i18n.t('app.lock') }}</span>
+          </button>
+        }
+      </div>
     </header>
-    <main>
-      @if (vault.status() === 'loading') {
-        <p aria-live="polite">Loading the Rust/WASM core…</p>
-      } @else if (vault.status() === 'failed') {
-        <p role="alert" class="error">{{ vault.error() }}</p>
-      } @else if (vault.status() === 'unlocked' || vault.status() === 'stale') {
+    <main id="main" tabindex="-1" [class.main-vault]="open()">
+      @if (open()) {
         <km-vault-shell />
       } @else {
-        <km-start />
+      @switch (vault.status()) {
+        @case ('loading') {
+          <div class="state-screen" aria-live="polite" aria-busy="true">
+            <span class="spinner" aria-hidden="true"></span>
+            <p>{{ i18n.t('app.loading') }}</p>
+          </div>
+        }
+        @case ('failed') {
+          <div class="state-screen">
+            <section class="card state-card" role="alert">
+              <span class="state-icon danger"><km-icon name="alert" /></span>
+              <h2>{{ i18n.t('app.failedTitle') }}</h2>
+              <p>{{ i18n.t('app.failedBody') }}</p>
+              <button type="button" class="btn btn-primary" (click)="reloadPage()">
+                <km-icon name="refresh" /><span>{{ i18n.t('app.reloadPage') }}</span>
+              </button>
+            </section>
+          </div>
+        }
+        @default {
+          <km-start />
+        }
+      }
       }
     </main>
+    <km-confirm-dialog />
+    <km-toasts />
   `,
 })
 export class App implements OnInit {
   protected readonly vault = inject(VaultService);
+  protected readonly i18n = inject(I18n);
+  private readonly confirm = inject(ConfirmService);
+  private readonly toast = inject(ToastService);
+
+  constructor() {
+    // Locking closes any pending confirmation and clears notifications.
+    let wasOpen = false;
+    effect(() => {
+      const open = this.open();
+      if (wasOpen && !open) {
+        this.confirm.settle(false);
+        this.toast.clear();
+      }
+      wasOpen = open;
+    });
+  }
+
+  protected open(): boolean {
+    const s = this.vault.status();
+    return s === 'unlocked' || s === 'stale';
+  }
 
   ngOnInit(): void {
     void this.vault.init();
+  }
+
+  protected reloadPage(): void {
+    location.reload();
   }
 }

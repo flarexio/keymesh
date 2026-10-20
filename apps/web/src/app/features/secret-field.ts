@@ -1,5 +1,9 @@
 import { Component, OnDestroy, inject, input, signal } from '@angular/core';
+import { errorKey } from '../core/errors';
+import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { VaultService } from '../core/vault.service';
+import { ToastService } from '../shared/feedback';
+import { Icon } from '../shared/icon';
 
 let nextId = 0;
 
@@ -11,39 +15,45 @@ let nextId = 0;
  */
 @Component({
   selector: 'km-secret-field',
+  imports: [Icon],
   template: `
-    <div class="secret-row">
-      <span class="label" [id]="labelId">{{ label() }}</span>
-      <span class="value mono" [attr.aria-labelledby]="labelId" data-testid="secret-value">
+    <div class="secret-row" [class.revealed]="shown() !== null">
+      <span class="secret-label" [id]="labelId">{{ label() }}</span>
+      <span class="secret-value mono" [attr.aria-labelledby]="labelId" data-testid="secret-value">
         @if (shown() !== null) {
           {{ shown() }}
         } @else {
-          <span aria-label="hidden">••••••••</span>
+          <span class="mask" [attr.aria-label]="i18n.t('secret.hidden')">••••••••••••</span>
         }
       </span>
-      <span class="actions">
-        <button type="button" (click)="toggle()" [attr.aria-pressed]="shown() !== null">
-          {{ shown() !== null ? 'Hide' : 'Reveal' }}
+      <span class="secret-actions">
+        <button type="button" class="btn btn-sm" (click)="toggle()" [attr.aria-pressed]="shown() !== null">
+          <km-icon [name]="shown() !== null ? 'eyeOff' : 'eye'" /><span>{{ i18n.t(shown() !== null ? 'secret.hide' : 'secret.reveal') }}</span>
         </button>
-        <button type="button" (click)="copy()">Copy</button>
+        <button type="button" class="btn btn-sm" (click)="copy()">
+          <km-icon name="copy" /><span>{{ i18n.t('secret.copy') }}</span>
+        </button>
       </span>
     </div>
-    @if (status()) {
-      <span class="hint" role="status">{{ status() }}</span>
+    @if (error(); as e) {
+      <p class="field-error" role="alert">{{ i18n.t(e) }}</p>
     }
   `,
 })
 export class SecretField implements OnDestroy {
   private readonly vault = inject(VaultService);
+  private readonly toast = inject(ToastService);
+  protected readonly i18n = inject(I18n);
   readonly itemId = input.required<string>();
   readonly slot = input.required<string>();
   readonly label = input.required<string>();
   protected readonly shown = signal<string | null>(null);
-  protected readonly status = signal<string | null>(null);
+  protected readonly error = signal<MessageKey | null>(null);
   protected readonly labelId = `secret-label-${++nextId}`;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
   protected toggle(): void {
+    this.error.set(null);
     if (this.shown() !== null) {
       this.hide();
       return;
@@ -52,16 +62,17 @@ export class SecretField implements OnDestroy {
       this.shown.set(this.vault.reveal(this.itemId(), this.slot()));
       this.timer = setTimeout(() => this.hide(), 30_000);
     } catch (e) {
-      this.status.set(e instanceof Error ? e.message : 'Cannot reveal');
+      this.error.set(errorKey(e));
     }
   }
 
   protected async copy(): Promise<void> {
+    this.error.set(null);
     try {
       await navigator.clipboard.writeText(this.vault.reveal(this.itemId(), this.slot()));
-      this.status.set('Copied to clipboard.');
+      this.toast.show('secret.copied');
     } catch (e) {
-      this.status.set(e instanceof Error ? e.message : 'Copy failed');
+      this.error.set(e instanceof DOMException ? 'errors.clipboard' : errorKey(e));
     }
   }
 

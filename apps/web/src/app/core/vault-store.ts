@@ -19,7 +19,11 @@ export interface StoredVault {
 }
 
 export class ConflictError extends Error {
-  constructor(message = 'The vault was changed elsewhere (another tab?). Reload it to continue.') {
+  constructor(
+    message = 'The vault was changed elsewhere (another tab?). Reload it to continue.',
+    /** `staleTab`: this tab already knew it was out of date. */
+    readonly code: 'conflict' | 'staleTab' = 'conflict',
+  ) {
     super(message);
     this.name = 'ConflictError';
   }

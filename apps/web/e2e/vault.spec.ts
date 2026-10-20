@@ -5,88 +5,21 @@
  */
 import { expect, Page, test } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-
-/** Planted markers: must never appear in storage or exported bytes. */
-const M = {
-  loginTitle: 'SYNTHMARK-TITLE-LOGIN',
-  url: 'https://synthmark-url.example.test/login',
-  password: 'SYNTHMARK-PW-0001',
-  notes: 'SYNTHMARK-NOTES',
-  recovery: 'SYNTHMARK-RC-1',
-  customSecret: 'SYNTHMARK-CUSTOM-PIN',
-  secret: 'SYNTHMARK-API-TOKEN',
-  contactName: 'SYNTHMARK Ada',
-  email: 'synthmark-ada@example.test',
-  walletPhrase: 'SYNTHMARK alpha beta gamma',
-  noteBody: 'SYNTHMARK-NOTE-BODY',
-  totpSecret: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',
-};
-const RFC_URI = `otpauth://totp/SynthIssuer:synth?secret=${M.totpSecret}&issuer=SynthIssuer&digits=8`;
-
-function assertNoMarkers(bytes: Buffer, what: string): void {
-  const text = bytes.toString('utf8');
-  const lower = text.toLowerCase();
-  for (const [name, value] of Object.entries(M)) {
-    expect(lower.includes(value.toLowerCase()), `${what} leaked ${name}`).toBe(false);
-  }
-  expect(text.startsWith('{'), `${what} is the JSON envelope`).toBe(true);
-  expect(text).toContain('"format": "keymesh.vault"');
-}
-
-async function storedBytes(page: Page): Promise<Buffer> {
-  const arr = await page.evaluate(
-    () =>
-      new Promise<number[]>((resolve, reject) => {
-        const r = indexedDB.open('keymesh-demo', 1);
-        r.onerror = () => reject(r.error);
-        r.onsuccess = () => {
-          const g = r.result.transaction('vault').objectStore('vault').get('primary');
-          g.onerror = () => reject(g.error);
-          g.onsuccess = () => {
-            resolve(g.result ? Array.from(g.result.bytes as Uint8Array) : []);
-            r.result.close();
-          };
-        };
-      }),
-  );
-  return Buffer.from(arr);
-}
-
-async function browserStorageSummary(page: Page) {
-  return page.evaluate(async () => ({
-    dbs: (await indexedDB.databases()).map((d) => d.name),
-    local: localStorage.length,
-    session: sessionStorage.length,
-    cookies: document.cookie,
-  }));
-}
-
-async function start(page: Page, mode: 'ephemeral' | 'synthetic-fixture') {
-  await page.goto('/');
-  await expect(page.getByTestId('demo-banner')).toContainText('NOT PRODUCTION');
-  await page.locator(`input[name=mode][value=${mode}]`).check();
-  await page.getByRole('button', { name: 'Start demo vault' }).click();
-  await expect(page.getByTestId('key-mode')).toContainText(mode);
-}
-
-async function newItem(page: Page, kind: string) {
-  await page.getByTestId('new-item').selectOption(kind);
-}
-
-const field = (page: Page, label: string) => page.getByLabel(label, { exact: true });
-
-async function create(page: Page, title: string) {
-  await page.getByRole('button', { name: 'Create' }).click();
-  await expect(page.locator('#detail-title')).toHaveText(title);
-}
-
-/** Auto-retrying locator for list titles (never snapshot the DOM). */
-const titles = (page: Page) => page.locator('.item-list .title');
-
-async function openItem(page: Page, title: string) {
-  await page.locator('.item-list button', { hasText: title }).first().click();
-  await expect(page.locator('#detail-title')).toHaveText(title);
-}
+import {
+  M,
+  RFC_URI,
+  assertNoMarkers,
+  browserStorageSummary,
+  category,
+  confirmDialog,
+  create,
+  field,
+  newItem,
+  openItem,
+  start,
+  storedBytes,
+  titles,
+} from './helpers';
 
 async function createAllKinds(page: Page) {
   // Login with secrets, notes, recovery code and a concealed custom field.
@@ -94,9 +27,9 @@ async function createAllKinds(page: Page) {
   await field(page, 'Title').fill(M.loginTitle);
   await field(page, 'Username').fill('synth-user');
   await field(page, 'Password').fill(M.password);
-  await field(page, 'URLs (one per line)').fill(M.url);
-  await field(page, 'Recovery codes (one per line)').fill(M.recovery);
-  await field(page, 'Tags (comma separated)').fill('synthetic, e2e');
+  await field(page, 'URLs').fill(M.url);
+  await field(page, 'Recovery codes').fill(M.recovery);
+  await field(page, 'Tags').fill('synthetic, e2e');
   await field(page, 'Notes').fill(M.notes);
   await page.getByRole('button', { name: 'Add custom field' }).click();
   await field(page, 'Label').fill('backup pin');
@@ -123,7 +56,7 @@ async function createAllKinds(page: Page) {
   await newItem(page, 'crypto_wallet');
   await field(page, 'Title').fill('Synthetic wallet');
   await field(page, 'Network').fill('testnet');
-  await field(page, 'Addresses (one per line)').fill('synthetic-addr-1');
+  await field(page, 'Wallet addresses').fill('synthetic-addr-1');
   await field(page, 'Recovery phrase').fill(M.walletPhrase);
   await create(page, 'Synthetic wallet');
 
@@ -214,14 +147,14 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await page.getByTestId('search').fill('synthmark-url');
   await expect(titles(page)).toHaveText([`${M.loginTitle} edited`]);
   await page.getByTestId('search').fill('');
-  await page.getByTestId('kind-filter').selectOption('secret');
+  await category(page, 'secret');
   await expect(titles(page)).toHaveCount(3);
-  await page.getByTestId('kind-filter').selectOption('');
+  await category(page, '');
 
   // Delete.
   await openItem(page, 'Synthetic note');
-  page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: 'Delete' }).click();
+  await confirmDialog(page);
   await expect(page.locator('.item-list')).not.toContainText('Synthetic note');
   await expect(titles(page)).toHaveCount(9);
 
@@ -300,8 +233,8 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   // Change the vault after the backup, then restore it.
   await page.getByRole('button', { name: 'Items' }).click();
   await openItem(page, 'Synthetic wallet');
-  page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: 'Delete' }).click();
+  await confirmDialog(page);
   await expect(page.locator('.item-list')).not.toContainText('Synthetic wallet');
   const afterDelete = await storedBytes(page);
 
@@ -360,7 +293,7 @@ test('second tab cannot clobber newer data', async ({ context }) => {
   await field(b, 'Title').fill('Note from stale tab B');
   await field(b, 'Note').fill('b');
   await b.getByRole('button', { name: 'Create' }).click();
-  await expect(b.locator('form .error')).toContainText('changed elsewhere');
+  await expect(b.getByTestId('form-error')).toContainText('changed elsewhere');
 
   // Storage still has A's data; B reloads and sees it.
   await b.getByRole('button', { name: 'Reload from storage' }).click();
@@ -390,7 +323,7 @@ test('second tab writing without the broadcast is rejected by compare-and-swap',
   await field(b2, 'Title').fill('Written by stale B');
   await field(b2, 'Note').fill('b');
   await b2.getByRole('button', { name: 'Create' }).click();
-  await expect(b2.locator('form .error')).toContainText('changed elsewhere');
+  await expect(b2.getByTestId('form-error')).toContainText('changed elsewhere');
   await expect(b2.getByRole('alert').filter({ hasText: 'changed elsewhere' }).first()).toBeVisible();
   await b2.getByRole('button', { name: 'Reload from storage' }).click();
   await expect(titles(b2)).toHaveText(['Written by A']);
@@ -479,8 +412,8 @@ test('lock during a pending restore wins: nothing installed or persisted', async
   await addNote(page, 'Kept note');
   const backupPath = testInfo.outputPath('before-delete.keymesh');
   await downloadBackup(page, backupPath);
-  page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: 'Delete' }).click();
+  await confirmDialog(page);
   await expect(titles(page)).toHaveCount(0);
   const before = await storedBytes(page);
 
@@ -572,7 +505,7 @@ test('reused revision after a restore cannot be clobbered by a deaf stale tab', 
   await field(b, 'Title').fill('Z from stale B');
   await field(b, 'Note').fill('z');
   await b.getByRole('button', { name: 'Create' }).click();
-  await expect(b.locator('form .error')).toContainText('changed elsewhere');
+  await expect(b.getByTestId('form-error')).toContainText('changed elsewhere');
   expect((await storedBytes(a)).equals(afterA)).toBe(true);
   await b.getByRole('button', { name: 'Reload from storage' }).click();
   await expect(titles(b)).toHaveText(['Y']);

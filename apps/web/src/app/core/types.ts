@@ -9,17 +9,16 @@ export type ItemKind =
   | 'totp'
   | 'secure_note';
 
-export const KIND_LABELS: Record<ItemKind, string> = {
-  login: 'Login',
-  secret: 'Secret / API credential',
-  contact: 'Contact',
-  crypto_wallet: 'Crypto wallet record',
-  ed25519_key: 'Ed25519 key',
-  totp: 'TOTP',
-  secure_note: 'Secure note',
-};
-
-export const KINDS = Object.keys(KIND_LABELS) as ItemKind[];
+/** Display order; labels live in the i18n catalogs (`kind.<kind>`). */
+export const KINDS: readonly ItemKind[] = [
+  'login',
+  'secret',
+  'contact',
+  'crypto_wallet',
+  'ed25519_key',
+  'totp',
+  'secure_note',
+];
 
 export interface Summary {
   id: string;

@@ -126,7 +126,7 @@ Implemented with `ed25519-dalek` 2. The stored format is the 32-byte RFC 8032 se
 * Reports contain only hashed provenance ids (or `target:<n>` when a fetch failed before identification), allowlisted category codes, statuses, error codes, counts and constant warning codes. They never contain values, titles, raw ids, field ids, stderr or arguments.
 * The JSON field shape (`id/type/purpose/label/value/section`, `urls[].href`, `vault.id`) comes from the `op` item JSON format as understood at M1. The official reference pages do not specify it. **It has not been verified against real `op` output**, because accessing real data was not authorized.
 
-## Browser demo (M2)
+## Browser demo (M2, UI refined in M3)
 
 Status: **synthetic demo, development-only key handling, not production.**
 
@@ -149,7 +149,7 @@ Angular (apps/web)  ── JSON views / masked slots ──▶  keymesh-wasm (wa
 * A slot's plaintext crosses only through `reveal(id, slot)`, used by the Reveal and Copy buttons. Revealed text is rendered as text content, never as an attribute, and is hidden again after 30 seconds or on lock.
 * Ed25519 seeds are never revealable. Only the public key, in hex and as an OpenSSH line, is exposed, and there is no signing API.
 * Generated passwords, random secrets and Ed25519 keys can be created and stored entirely inside WASM. Password preview, and the Generate button in the login form, return the value to the UI on purpose.
-* Errors use the core's messages, which contain no secret values. Item-input parse errors are reported generically, because serde messages can quote input.
+* The core's error messages contain no secret values, and item-input parse errors are reported generically, because serde messages can quote input. The UI never shows raw error text anyway: `apps/web/src/app/core/errors.ts` maps known conditions to localized messages and everything else to a generic "something went wrong" (see *Language and appearance*).
 
 ### Key providers (DEVELOPMENT ONLY)
 
@@ -163,7 +163,7 @@ The key is never exported to JavaScript and never appears in the URL, storage, c
 ### Persistence and concurrency
 
 * IndexedDB database `keymesh-demo`, store `vault`, key `primary` holds `{bytes, vaultId, kekId, revision}`. `bytes` is the same `keymesh.vault` v1 envelope as on native.
-* No local/session storage or cookies are used.
+* No vault data, key material or item index is kept in Web Storage. The only `localStorage` entry is the non-secret display preference (see *Language and appearance*). No sessionStorage or cookies are used.
 * **Every write is an exact-snapshot compare-and-swap** inside one readwrite transaction. It succeeds only if the stored envelope is byte-for-byte the snapshot this tab last read or wrote; `null` means storage must still be empty.
   * Exact bytes are compared, not revision numbers. Restoring an older backup can bring back a revision number that a stale tab already holds with different content, and a revision check would let that tab overwrite newer data.
   * This applies to mutations, restore, the initial vault and discard. There is no unconditional write path.
@@ -193,7 +193,18 @@ The key is never exported to JavaScript and never appears in the URL, storage, c
 
 * A CSP meta tag and server header allow `default-src 'self'` and `script-src 'self' 'wasm-unsafe-eval'`. Styles allow `'unsafe-inline'` for Angular component styles. Critical-CSS inlining is disabled, so no inline event handler is needed.
 * There are no third-party origins, analytics or remote fonts (system font stack only). E2E asserts that only same-origin requests are made.
+* The saved theme and language are applied before first paint by `public/preferences-boot.js`, a same-origin classic script loaded from `<head>`. No inline script and no new CSP allowance is needed; E2E asserts the page has no inline scripts and logs no CSP violations.
 * `scripts/serve.mjs` (production build) binds to 127.0.0.1 and sends `nosniff`, `no-referrer`, COOP and `frame-ancestors 'none'`.
+
+### Language and appearance (M3)
+
+* **Locales:** exactly `zh-TW` (繁體中文) and `en`. `src/app/core/i18n/en.ts` is the source catalog and defines `MessageKey`; `zh-tw.ts` is typed `Record<MessageKey, string>`, and Angular strict template checking makes an unknown key in a template a build error. `I18n.t()` reads the locale signal, so switching re-renders text without touching component state: form inputs, selection, generator previews, TOTP codes and keys are unchanged, and nothing is written to the vault. Dates and numbers use `Intl` for the active locale. User data, technical identifiers, key formats and wallet addresses are not translated.
+* **Labels from the core:** secret slot labels from `bridge.rs` (`password`, `recovery_code:n`, …) are mapped by slot key to catalog entries. Custom-field labels are the user's own text.
+* **Errors:** `errorKey()` maps app error classes (`VaultError` codes, `LockedError`, `StaleWorkError`, `ConflictError`) and a fixed allowlist of core message prefixes to catalog keys. Anything else becomes `errors.unexpected`; the raw text is neither shown nor logged.
+* **Appearance:** `system` (default), `light` or `dark`. `system` follows `prefers-color-scheme`, including live OS changes; an explicit choice overrides the OS until `system` is chosen again. Colours are `light-dark()` tokens driven by `color-scheme`, so native controls, scrollbars, dialogs and toasts follow the same theme. Without JavaScript the OS preference applies.
+* **Default language:** the first `navigator.languages` entry that is Chinese (any `zh*` → `zh-TW`) or English; otherwise English.
+* **Persistence:** only an explicit choice is saved, as `{"locale","theme"}` JSON under `localStorage["keymesh.settings.v1"]`. Missing, corrupt or partially invalid values fall back per field; blocked or full storage keeps the choice for the current page and shows a note. `<html lang>`, `data-theme` and the document title are kept in sync.
+* See `docs/DESIGN.md` for tokens and UI conventions.
 
 ### Limitations
 

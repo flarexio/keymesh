@@ -44,6 +44,24 @@ export class LockedError extends Error {
   }
 }
 
+/** Known, secret-free failure with a stable code for localized messages. */
+export type VaultErrorCode =
+  | 'noStoredVault'
+  | 'ephemeralKeyLost'
+  | 'restoreNotAllowed'
+  | 'backupTooLarge'
+  | 'backupRejected';
+
+export class VaultError extends Error {
+  constructor(
+    readonly code: VaultErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'VaultError';
+  }
+}
+
 /** Work invoked before a lock (or reload/restore/discard); never applied. */
 export class StaleWorkError extends Error {
   constructor() {
@@ -256,7 +274,7 @@ export class VaultService {
     return this.run(async (guard) => {
       const rec = await this.store.read();
       guard();
-      if (!rec) throw new Error('No stored demo vault.');
+      if (!rec) throw new VaultError('noStoredVault', 'No stored demo vault.');
       const key =
         this.key && this.key.keyId === rec.kekId
           ? this.key
@@ -264,7 +282,8 @@ export class VaultService {
             ? this.provider('synthetic-fixture')
             : null;
       if (!key) {
-        throw new Error(
+        throw new VaultError(
+          'ephemeralKeyLost',
           'This demo vault was encrypted with an ephemeral key that no longer exists. It cannot be opened.',
         );
       }
@@ -440,23 +459,23 @@ export class VaultService {
     return this.run(async (guard) => {
       const status = this.status();
       if (status === 'stale') {
-        throw new ConflictError('This tab is out of date. Reload from storage before restoring.');
+        throw new ConflictError('This tab is out of date. Reload from storage before restoring.', 'staleTab');
       }
       if (status !== 'unlocked' && status !== 'empty') {
-        throw new Error('Restore needs an unlocked vault or empty storage.');
+        throw new VaultError('restoreNotAllowed', 'Restore needs an unlocked vault or empty storage.');
       }
-      if (file.size > this.maxBytes()) throw new Error('Backup file is too large.');
+      if (file.size > this.maxBytes()) throw new VaultError('backupTooLarge', 'Backup file is too large.');
       const expected = status === 'unlocked' ? this.snapshot : null;
       const bytes = new Uint8Array(await file.arrayBuffer());
       guard();
-      if (bytes.length > this.maxBytes()) throw new Error('Backup file is too large.');
+      if (bytes.length > this.maxBytes()) throw new VaultError('backupTooLarge', 'Backup file is too large.');
       const key = this.key ?? this.provider('synthetic-fixture');
       let candidate: VaultSession;
       try {
         candidate = this.c().VaultSession.open(bytes, key);
       } catch (e) {
         if (key !== this.key) key.free();
-        throw new Error(`Backup rejected, nothing was changed: ${message(e)}`);
+        throw new VaultError('backupRejected', `Backup rejected, nothing was changed: ${message(e)}`);
       }
       const drop = () => {
         candidate.free();

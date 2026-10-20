@@ -2,14 +2,17 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Keymesh — synthetic demo vault</title>
+  <title>Keymesh</title>
   <base href="/">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <!-- No third-party origins. 'wasm-unsafe-eval' is required to compile the core's WebAssembly. -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
   <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="light dark">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <!-- Saved language/appearance applied before first paint (same-origin file, not inline). -->
+  <script src="preferences-boot.js"></script>
 </head>
 <body>
   <app-root></app-root>

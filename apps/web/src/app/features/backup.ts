@@ -1,5 +1,8 @@
 import { Component, computed, inject, signal } from '@angular/core';
+import { errorKey } from '../core/errors';
+import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { VaultService } from '../core/vault.service';
+import { Icon } from '../shared/icon';
 
 /**
  * Encrypted backup of the stored envelope and verified restore. A restore
@@ -8,44 +11,55 @@ import { VaultService } from '../core/vault.service';
  */
 @Component({
   selector: 'km-backup',
+  imports: [Icon],
   template: `
-    <section class="panel" aria-labelledby="backup-title">
-      <h2 id="backup-title">Encrypted backup</h2>
-      <p>
-        Downloads the encrypted vault envelope exactly as stored. It contains no plaintext and can
-        only be restored with the same demo key provider ({{ keyLabel() }}).
-      </p>
-      <button type="button" class="primary" (click)="download()">Download encrypted backup</button>
-
-      <h3>Restore (synthetic demo harness)</h3>
-      <p class="hint">
-        Restore replaces the stored demo vault only after the file decrypts with the current demo key.
-        Maximum size {{ maxMiB() }} MiB.
-      </p>
-      <label>Backup file <input type="file" data-testid="restore-input" (change)="restore($event)" /></label>
-
-      @if (message()) {
-        <p role="status" data-testid="backup-status">{{ message() }}</p>
+    <div class="page">
+      <header class="page-head">
+        <h2 id="backup-title">{{ i18n.t('backup.title') }}</h2>
+        <p class="lead">{{ i18n.t('backup.lead') }}</p>
+      </header>
+      <div class="card-grid card-grid-2">
+        <section class="card tool-card" aria-labelledby="backup-download">
+          <h3 id="backup-download" class="card-title"><km-icon name="download" />{{ i18n.t('backup.download.title') }}</h3>
+          <p>{{ i18n.t('backup.download.body', { key: keyLabel() }) }}</p>
+          <div class="tool-actions">
+            <button type="button" class="btn btn-primary" data-testid="backup-download" (click)="download()">
+              <km-icon name="download" /><span>{{ i18n.t('backup.download.button') }}</span>
+            </button>
+          </div>
+        </section>
+        <section class="card tool-card" aria-labelledby="backup-restore">
+          <h3 id="backup-restore" class="card-title"><km-icon name="upload" />{{ i18n.t('backup.restore.title') }}</h3>
+          <p>{{ i18n.t('backup.restore.body', { mib: maxMiB() }) }}</p>
+          <label class="file-drop">
+            <km-icon name="upload" />
+            <span>{{ i18n.t('backup.chooseFile') }}</span>
+            <input type="file" class="visually-hidden-input" data-testid="restore-input" (change)="restore($event)" />
+          </label>
+        </section>
+      </div>
+      @if (message(); as m) {
+        <div class="callout callout-success" role="status" data-testid="backup-status"><km-icon name="check" /><p>{{ i18n.t(m) }}</p></div>
       }
-      @if (error()) {
-        <p role="alert" class="error" data-testid="backup-error">{{ error() }}</p>
+      @if (error(); as e) {
+        <div class="callout callout-danger" role="alert" data-testid="backup-error"><km-icon name="alert" /><p>{{ i18n.t(e) }}</p></div>
       }
-    </section>
+    </div>
   `,
 })
 export class Backup {
   private readonly vault = inject(VaultService);
-  protected readonly message = signal<string | null>(null);
-  protected readonly error = signal<string | null>(null);
+  protected readonly i18n = inject(I18n);
+  protected readonly message = signal<MessageKey | null>(null);
+  protected readonly error = signal<MessageKey | null>(null);
   protected readonly maxMiB = computed(() => Math.floor(this.vault.maxBytes() / (1024 * 1024)));
   protected readonly keyLabel = computed(() =>
-    this.vault.keyMode() === 'synthetic-fixture'
-      ? 'synthetic fixture key'
-      : 'ephemeral key of this page session',
+    this.i18n.t(this.vault.keyMode() === 'synthetic-fixture' ? 'backup.keyFixture' : 'backup.keyEphemeral'),
   );
 
   protected async download(): Promise<void> {
     this.error.set(null);
+    this.message.set(null);
     try {
       const bytes = await this.vault.backupBytes();
       const blob = new Blob([bytes.slice().buffer], { type: 'application/octet-stream' });
@@ -55,9 +69,9 @@ export class Backup {
       a.download = `keymesh-demo-backup-rev${this.vault.revision()}.keymesh`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      this.message.set('Encrypted backup downloaded.');
+      this.message.set('backup.downloaded');
     } catch (e) {
-      this.error.set(e instanceof Error ? e.message : 'Backup failed');
+      this.error.set(errorKey(e));
     }
   }
 
@@ -70,9 +84,9 @@ export class Backup {
     this.message.set(null);
     try {
       await this.vault.restore(file);
-      this.message.set('Backup restored.');
+      this.message.set('backup.restored');
     } catch (e) {
-      this.error.set(e instanceof Error ? e.message : 'Restore failed');
+      this.error.set(errorKey(e));
     }
   }
 }
