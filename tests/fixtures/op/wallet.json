@@ -1,7 +1,7 @@
 {
-  "id": "synthwalletitem0000000000a3",
+  "id": "synthwalletitem000000000a3",
   "title": "Synthetic Wallet",
-  "vault": { "id": "synthvault000000000000000v1" },
+  "vault": { "id": "synthvault0000000000000001" },
   "category": "CRYPTO_WALLET",
   "fields": [
     { "id": "recoveryPhrase", "type": "CONCEALED", "label": "recovery phrase", "value": "SYNTH-WORDS alpha beta gamma delta" },

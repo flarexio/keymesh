@@ -33,6 +33,52 @@ use std::collections::HashSet;
 use zeroize::Zeroizing;
 
 pub const PROVIDER: &str = "1password";
+/// Custom-field section holding source metadata without a typed mapping.
+pub const META_SECTION: &str = "1password";
+
+/// Category codes that may appear in reports (from `op item list --help`, in
+/// the upper-snake form used by `op` JSON). Anything else is `UNKNOWN`.
+pub const KNOWN_CATEGORIES: &[&str] = &[
+    "API_CREDENTIAL",
+    "BANK_ACCOUNT",
+    "CREDIT_CARD",
+    "DATABASE",
+    "DOCUMENT",
+    "DRIVER_LICENSE",
+    "EMAIL_ACCOUNT",
+    "IDENTITY",
+    "LOGIN",
+    "MEMBERSHIP",
+    "OUTDOOR_LICENSE",
+    "PASSPORT",
+    "PASSWORD",
+    "REWARD_PROGRAM",
+    "SECURE_NOTE",
+    "SERVER",
+    "SOCIAL_SECURITY_NUMBER",
+    "SOFTWARE_LICENSE",
+    "SSH_KEY",
+    "WIRELESS_ROUTER",
+];
+
+fn published_category(upper: &str) -> &'static str {
+    KNOWN_CATEGORIES
+        .iter()
+        .find(|c| **c == upper)
+        .copied()
+        .unwrap_or("UNKNOWN")
+}
+
+/// 1Password item/vault ids as shown in `op item get --help`
+/// (e.g. `kiramv6tpjijkuci7fig4lndta`): 26 lowercase alphanumerics. Inferred
+/// from the CLI help, not verified against real output; anything else fails
+/// closed as malformed output.
+fn is_op_id(s: &str) -> bool {
+    s.len() == 26
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
 /// Custom-field section holding source URLs that have no typed mapping.
 pub const URL_SECTION: &str = "urls";
 
@@ -331,15 +377,19 @@ struct Draft {
     notes: Option<SecretString>,
     custom_fields: Vec<CustomField>,
     data: ItemData,
-    /// For logins: link to the first TOTP draft of the same source item.
-    link_totp: bool,
+    /// For logins: source id of the TOTP record the login should link to
+    /// (the first OTP field of the same source item). Stable across imports
+    /// and resolved to a local item id at apply time.
+    totp_source: Option<String>,
     mapped_fields: usize,
 }
 
 impl Draft {
-    /// SHA-256 over the mapped content (the login→TOTP link is excluded: it is
-    /// a local id, and TOTP changes show up in the TOTP record's own
-    /// fingerprint). Stored only inside the encrypted item.
+    /// SHA-256 over the mapped content plus the *source-level* login→TOTP
+    /// relationship (`totp_source`), so adding, replacing, removing or
+    /// reordering OTP fields changes the login's fingerprint. The local item
+    /// id of the link is not included (it is resolved at apply time and
+    /// checked separately in [`decide`]). Stored only inside the encrypted item.
     fn fingerprint(&self) -> String {
         #[derive(Serialize)]
         struct Fp<'a> {
@@ -348,6 +398,7 @@ impl Draft {
             notes: &'a Option<SecretString>,
             custom: &'a [CustomField],
             data: &'a ItemData,
+            totp_source: &'a Option<String>,
         }
         let j = Zeroizing::new(
             serde_json::to_vec(&Fp {
@@ -356,6 +407,7 @@ impl Draft {
                 notes: &self.notes,
                 custom: &self.custom_fields,
                 data: &self.data,
+                totp_source: &self.totp_source,
             })
             .expect("draft serializes"),
         );
@@ -458,21 +510,45 @@ fn run_checked(
     Ok(out)
 }
 
-/// Stable, account-scoped id for a secret reference. The account selector and
-/// path are hashed so the report does not reveal them. Different selectors for
-/// the same account (shorthand vs. sign-in address vs. ID) give different ids:
-/// that can produce a duplicate record, never an overwrite of another
-/// account's record.
-fn ref_source_id(account: &str, reference: &str) -> String {
+/// Domain-separated, unambiguous provenance id: SHA-256 over a version tag,
+/// the `kind`, and every component length-prefixed (u64 big-endian), so no
+/// choice of component contents (separators, NULs, empty strings) can make two
+/// different tuples collide by concatenation. Untrusted components never
+/// appear in clear in ids or reports.
+pub fn provenance_id(kind: &str, parts: &[&str]) -> String {
     let mut h = Sha256::new();
-    h.update(b"keymesh.op-ref.v2\0");
-    h.update(account.as_bytes());
-    h.update(b"\0");
-    h.update(reference.as_bytes());
+    let mut put = |b: &[u8]| {
+        h.update((b.len() as u64).to_be_bytes());
+        h.update(b);
+    };
+    put(b"keymesh.op-provenance.v3");
+    put(kind.as_bytes());
+    for p in parts {
+        put(p.as_bytes());
+    }
     format!(
-        "{PROVIDER}:acct-ref:{}",
+        "{PROVIDER}:{kind}:{}",
         data_encoding::HEXLOWER.encode(&h.finalize()[..16])
     )
+}
+
+/// Source id of an `op` item (vault UUID + item UUID).
+pub fn item_source_id(vault_id: &str, item_id: &str) -> String {
+    provenance_id("item", &[vault_id, item_id])
+}
+
+/// Source id of one OTP field of an item. Field ids are provider data of
+/// unknown shape and are only ever hashed.
+pub fn otp_source_id(vault_id: &str, item_id: &str, field_id: &str) -> String {
+    provenance_id("otp", &[vault_id, item_id, field_id])
+}
+
+/// Account-scoped id for a secret reference (account selector + path, both
+/// hashed). Different selectors for the same account (shorthand vs. sign-in
+/// address vs. ID) give different ids: that can produce a duplicate record,
+/// never an overwrite of another account's record.
+pub fn ref_source_id(account: &str, reference: &str) -> String {
+    provenance_id("acct-ref", &[account, reference])
 }
 
 fn fetch_one(runner: &dyn OpRunner, target: &OpTarget, n: usize) -> Fetched {
@@ -512,14 +588,10 @@ fn fetch_one(runner: &dyn OpRunner, target: &OpTarget, n: usize) -> Fetched {
                 Ok(i) => i,
                 Err(_) => return fail(ImportErrorCode::MalformedOutput),
             };
-            if item.id.is_empty() || item.vault.id.is_empty() {
+            if !is_op_id(&item.id) || !is_op_id(&item.vault.id) {
                 return fail(ImportErrorCode::MalformedOutput);
             }
-            let source_id = format!("{PROVIDER}:item:{}/{}", item.vault.id, item.id);
-            if check_arg("id", &source_id, false).is_err() {
-                return fail(ImportErrorCode::MalformedOutput);
-            }
-            map_item(source_id, item)
+            map_item(item)
         }
     }
 }
@@ -572,7 +644,7 @@ fn map_reference(
         notes: None,
         custom_fields: vec![],
         data,
-        link_totp: false,
+        totp_source: None,
         mapped_fields: 1,
     })
 }
@@ -685,9 +757,17 @@ fn empty_note(notes: &Option<SecretString>) -> ItemData {
     })
 }
 
-fn map_item(source_id: String, item: OpItem) -> Fetched {
-    let category = item.category.as_deref().map(str::to_ascii_uppercase);
-    let cat = category.clone().unwrap_or_default();
+fn map_item(item: OpItem) -> Fetched {
+    let source_id = item_source_id(&item.vault.id, &item.id);
+    let original_category = item.category.clone().filter(|c| !c.is_empty());
+    let cat = original_category
+        .as_deref()
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_default();
+    // Only allowlisted codes are published in reports.
+    let category = original_category
+        .as_ref()
+        .map(|_| published_category(&cat).to_owned());
     let failed = |code| Fetched::Failed {
         source_id: source_id.clone(),
         code,
@@ -772,6 +852,7 @@ fn map_item(source_id: String, item: OpItem) -> Fetched {
 
     // OTP fields become TOTP items holding the provisioning secret.
     let mut drafts: Vec<Draft> = Vec::new();
+    let mut otp_ids: HashSet<&str> = HashSet::new();
     for i in 0..p.fields.len() {
         if p.fields[i].ftype != "OTP" {
             continue;
@@ -780,13 +861,18 @@ fn map_item(source_id: String, item: OpItem) -> Fetched {
             Some((config, issuer, account_name)) => {
                 p.used[i] = true;
                 p.mapped += 1;
-                let fid = if p.fields[i].id.is_empty() {
-                    drafts.len().to_string()
+                let fid = p.fields[i].id;
+                let otp_id = if fid.is_empty() || !otp_ids.insert(fid) {
+                    // Missing or duplicate field id: fall back to position.
+                    provenance_id(
+                        "otp-index",
+                        &[&item.vault.id, &item.id, &drafts.len().to_string()],
+                    )
                 } else {
-                    p.fields[i].id.to_owned()
+                    otp_source_id(&item.vault.id, &item.id, fid)
                 };
                 drafts.push(Draft {
-                    source_id: format!("{source_id}#otp:{fid}"),
+                    source_id: otp_id,
                     title: format!("{title} (TOTP)").chars().take(MAX_TITLE).collect(),
                     tags: vec![],
                     notes: None,
@@ -796,7 +882,7 @@ fn map_item(source_id: String, item: OpItem) -> Fetched {
                         issuer,
                         account_name,
                     }),
-                    link_totp: false,
+                    totp_source: None,
                     mapped_fields: 1,
                 });
             }
@@ -804,7 +890,6 @@ fn map_item(source_id: String, item: OpItem) -> Fetched {
             None => warnings.push("otp_unparsed_preserved".into()),
         }
     }
-    let has_totp = !drafts.is_empty();
 
     // URLs not consumed by a typed mapping are preserved as custom fields.
     let mut url_used = vec![false; item.urls.len()];
@@ -953,7 +1038,31 @@ fn map_item(source_id: String, item: OpItem) -> Fetched {
         warnings.push(format!("empty_urls_skipped:{empty_urls}"));
     }
 
-    let is_login = matches!(data, ItemData::Login(_));
+    let totp_source = match data {
+        ItemData::Login(_) => drafts.first().map(|d| d.source_id.clone()),
+        _ => None,
+    };
+    // Original provider ids (validated above), encrypted, for traceability:
+    // reports only carry the hashed source id.
+    for (label, value) in [("vault id", &item.vault.id), ("item id", &item.id)] {
+        custom_fields.push(CustomField {
+            section: Some(META_SECTION.into()),
+            label: label.into(),
+            kind: FieldKind::Text,
+            source_type: Some("ID".into()),
+            value: SecretString::new(value.as_str()),
+        });
+    }
+    if let Some(orig) = original_category.filter(|_| published_category(&cat) == "UNKNOWN") {
+        // Unknown category: preserved verbatim inside the encrypted item.
+        custom_fields.push(CustomField {
+            section: Some(META_SECTION.into()),
+            label: "category".into(),
+            kind: FieldKind::Text,
+            source_type: Some("CATEGORY".into()),
+            value: SecretString::new(orig),
+        });
+    }
     let notes = match data {
         // The note body already holds the notes.
         ItemData::SecureNote(_) => None,
@@ -971,7 +1080,7 @@ fn map_item(source_id: String, item: OpItem) -> Fetched {
         notes,
         custom_fields,
         data,
-        link_totp: is_login && has_totp,
+        totp_source,
         mapped_fields: p.mapped,
     });
 
@@ -1008,13 +1117,36 @@ enum Decision {
     Update(ItemId),
 }
 
+/// Local id of the TOTP record a login draft should link to, if that record
+/// already exists in the vault.
+fn resolve_link(vault: &Vault, d: &Draft) -> Option<ItemId> {
+    d.totp_source
+        .as_deref()
+        .and_then(|s| vault.find_by_source(PROVIDER, s))
+        .map(|t| t.id.clone())
+}
+
+/// Whether an existing item's local login→TOTP link matches what the draft
+/// requires. A required link whose target does not exist yet never matches.
+fn link_matches(vault: &Vault, d: &Draft, existing: &Item) -> bool {
+    let ItemData::Login(cur) = &existing.data else {
+        return true;
+    };
+    match (&d.totp_source, resolve_link(vault, d)) {
+        (None, _) => cur.totp_item.is_none(),
+        (Some(_), Some(want)) => cur.totp_item.as_ref() == Some(&want),
+        (Some(_), None) => false,
+    }
+}
+
 fn decide(vault: &Vault, d: &Draft, policy: ConflictPolicy) -> Decision {
     match vault.find_by_source(PROVIDER, &d.source_id) {
         None => Decision::Create,
         Some(e)
             if e.source
                 .as_ref()
-                .is_some_and(|s| s.fingerprint == d.fingerprint()) =>
+                .is_some_and(|s| s.fingerprint == d.fingerprint())
+                && link_matches(vault, d, e) =>
         {
             Decision::Unchanged(e.id.clone())
         }
@@ -1095,11 +1227,10 @@ fn apply_entry(
     let mut created: Vec<ItemId> = Vec::new();
     let mut updated: Vec<Item> = Vec::new();
     let mut out = Vec::new();
-    // Item id of the first TOTP record, for the login link.
-    let mut totp_id: Option<ItemId> = None;
     let mut result = Ok(());
     for d in drafts {
-        let link = if d.link_totp { totp_id.clone() } else { None };
+        // TOTP drafts precede the login, so its target exists by now.
+        let link = resolve_link(vault, d);
         let step = match decide(vault, d, policy) {
             Decision::Create => ItemId::generate(rng)
                 .map_err(|_| ImportErrorCode::Io)
@@ -1135,9 +1266,6 @@ fn apply_entry(
         };
         match step {
             Ok((status, id)) => {
-                if matches!(d.data, ItemData::Totp(_)) && totp_id.is_none() {
-                    totp_id = Some(id.clone());
-                }
                 out.push(outcome(d, status, Some(id)));
             }
             Err(code) => {

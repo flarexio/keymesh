@@ -1,7 +1,7 @@
 {
   "id": "synthsshitem000000000000a5",
   "title": "Synthetic SSH Key",
-  "vault": { "id": "synthvault000000000000000v1" },
+  "vault": { "id": "synthvault0000000000000001" },
   "category": "SSH_KEY",
   "fields": [
     { "id": "private_key", "type": "SSHKEY", "label": "private key", "value": "-----BEGIN PRIVATE KEY-----\nSYNTH-NOT-A-REAL-KEY\n-----END PRIVATE KEY-----\n" },

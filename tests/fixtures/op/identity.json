@@ -1,7 +1,7 @@
 {
-  "id": "synthidentityitem00000000a2",
+  "id": "synthidentityitem0000000a2",
   "title": "Synthetic Person",
-  "vault": { "id": "synthvault000000000000000v1" },
+  "vault": { "id": "synthvault0000000000000001" },
   "category": "IDENTITY",
   "fields": [
     { "id": "firstname", "type": "STRING", "label": "first name", "value": "Ada" },

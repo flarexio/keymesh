@@ -2,7 +2,7 @@
   "id": "synthapiitem000000000000a4",
   "title": "Synthetic API Credential",
   "vault": {
-    "id": "synthvault000000000000000v1"
+    "id": "synthvault0000000000000001"
   },
   "category": "API_CREDENTIAL",
   "fields": [

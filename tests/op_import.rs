@@ -4,17 +4,22 @@
 
 use keymesh::crypto::EphemeralKeyProvider;
 use keymesh::import::op::{
-    plan, ConflictPolicy, ImportErrorCode, ImportReport, ImportStatus, OpRunner, OpTarget,
-    RunError, RunOutput,
+    item_source_id, otp_source_id, plan, provenance_id, ConflictPolicy, ImportErrorCode,
+    ImportReport, ImportStatus, OpRunner, OpTarget, RunError, RunOutput,
 };
 use keymesh::model::{FieldKind, ItemData, ItemKind, SecretFormat};
 use keymesh::rng::OsRandom;
 use keymesh::storage;
-use keymesh::totp::{code_at, parse_otpauth_uri};
+use keymesh::totp::{code_at, parse_base32_secret, parse_otpauth_uri};
 use keymesh::vault::Vault;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
+
+/// Synthetic ids shaped like the one in `op item get --help`
+/// (26 lowercase alphanumerics). Not verified against real `op` output.
+const VAULT_ID: &str = "synthvault0000000000000001";
+const LOGIN_ID: &str = "synthloginitem0000000000a1";
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(
@@ -43,6 +48,10 @@ const SECRETS: &[&str] = &[
     "SYNTH-STDERR-SECRET",
     "SYNTH-REF-VALUE",
     "SYNTH-URL-",
+    "SYNTH-SECRET-CATEGORY",
+    "SYNTH-ID-MARKER",
+    "SYNTH-OTP-FIELD-ID",
+    "JBSWY3DP",
     "Synthetic Example Login",
     "synthetic-user@example.test",
 ];
@@ -254,14 +263,14 @@ fn maps_every_category_and_round_trips_through_encrypted_store() {
     let doc = rep
         .entries
         .iter()
-        .find(|e| e.source_id.ends_with("synthdocitem000000000000a9"))
+        .find(|e| e.source_id == item_source_id(VAULT_ID, "synthdocitem000000000000a9"))
         .unwrap();
     assert_eq!(doc.status, ImportStatus::Unsupported);
     let login_entry = &rep.entries[0];
-    assert_eq!(
-        login_entry.source_id,
-        "1password:item:synthvault000000000000000v1/synthloginitem0000000000a1"
-    );
+    assert_eq!(login_entry.source_id, item_source_id(VAULT_ID, LOGIN_ID));
+    assert!(login_entry.source_id.starts_with("1password:item:"));
+    assert!(!login_entry.source_id.contains(LOGIN_ID), "ids are hashed");
+    assert_eq!(login_entry.category.as_deref(), Some("LOGIN"));
     assert!(login_entry
         .warnings
         .contains(&"attachments_not_imported:1".to_string()));
@@ -387,7 +396,20 @@ fn maps_every_category_and_round_trips_through_encrypted_store() {
         .iter()
         .find(|n| n.title == "Synthetic Router")
         .unwrap();
-    assert_eq!(router.custom_fields.len(), 4); // 3 fields + 1 preserved URL
+    assert_eq!(router.custom_fields.len(), 6); // 3 fields + 1 URL + vault/item id
+    let meta = |label: &str| {
+        router
+            .custom_fields
+            .iter()
+            .find(|f| f.section.as_deref() == Some("1password") && f.label == label)
+            .map(|f| f.value.expose().to_owned())
+    };
+    assert_eq!(meta("vault id").as_deref(), Some(VAULT_ID));
+    assert_eq!(
+        meta("item id").as_deref(),
+        Some("synthrouteritem000000000a8")
+    );
+    assert_eq!(meta("category"), None, "known category is not duplicated");
     let fut = router
         .custom_fields
         .iter()
@@ -887,4 +909,269 @@ mod process {
             "read\n--no-newline\n--account=synthetic-a.example.test\nop://Synthetic Vault/Item/credential\n"
         );
     }
+}
+
+// --- Review 2: untrusted metadata and provenance ---------------------------
+
+fn login_json() -> serde_json::Value {
+    serde_json::from_slice(&fixture("login.json")).unwrap()
+}
+
+/// Runner serving one JSON value for every `op item get`.
+fn json_runner(v: serde_json::Value) -> FakeRunner {
+    let bytes = serde_json::to_vec(&v).unwrap();
+    FakeRunner::new(move |_| Ok(ok(bytes.clone())))
+}
+
+#[test]
+fn adversarial_metadata_never_reaches_reports() {
+    // Unknown category carrying a marker: published as constant UNKNOWN,
+    // original preserved inside the encrypted item.
+    let mut j = login_json();
+    j["category"] = "SYNTH-SECRET-CATEGORY".into();
+    let (p, mut v) = new_vault();
+    let rep =
+        plan(&json_runner(j), &[item("x")]).apply(&mut v, ConflictPolicy::Skip, &mut OsRandom);
+    assert_no_leak(&rep);
+    assert_eq!(rep.entries[0].category.as_deref(), Some("UNKNOWN"));
+    assert_eq!(rep.counts.failed, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meta.keymesh");
+    storage::create(&path, &mut v, &p, &mut OsRandom).unwrap();
+    assert!(!std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("SYNTH-SECRET-CATEGORY"));
+    let v = storage::load(&path, &p).unwrap();
+    let preserved = v
+        .items()
+        .flat_map(|i| i.custom_fields.iter())
+        .find(|f| f.section.as_deref() == Some("1password") && f.label == "category")
+        .expect("original category preserved");
+    assert_eq!(preserved.value.expose(), "SYNTH-SECRET-CATEGORY");
+
+    // Known categories pass through unchanged and are not duplicated.
+    let (_p, v) = new_vault();
+    let rep = plan(&json_runner(login_json()), &[item("x")]).preview(&v, ConflictPolicy::Skip);
+    assert_eq!(rep.entries[0].category.as_deref(), Some("LOGIN"));
+
+    // Marker in OTP field id: never in source ids.
+    let mut j = login_json();
+    j["fields"][3]["id"] = "SYNTH-OTP-FIELD-ID/../x".into();
+    let (_p, mut v) = new_vault();
+    let rep =
+        plan(&json_runner(j), &[item("x")]).apply(&mut v, ConflictPolicy::Skip, &mut OsRandom);
+    assert_no_leak(&rep);
+    assert_eq!(rep.counts.created, 2);
+    let totp_rec = rep.entries[0]
+        .records
+        .iter()
+        .find(|r| r.kind == ItemKind::Totp)
+        .unwrap();
+    assert_eq!(
+        totp_rec.source_id,
+        otp_source_id(VAULT_ID, LOGIN_ID, "SYNTH-OTP-FIELD-ID/../x")
+    );
+
+    // Markers / separators in item or vault ids: rejected as malformed.
+    for (field, bad) in [
+        ("id", "SYNTH-ID-MARKER-aaaaaaaaaaa"),
+        ("id", "abc/def0000000000000000000"),
+        ("id", "short"),
+        ("id", "UPPERCASE0000000000000000A"),
+    ] {
+        let mut j = login_json();
+        j[field] = bad.into();
+        let (_p, v) = new_vault();
+        let rep = plan(&json_runner(j), &[item("x")]).preview(&v, ConflictPolicy::Skip);
+        assert_no_leak(&rep);
+        assert_eq!(
+            rep.entries[0].error,
+            Some(ImportErrorCode::MalformedOutput),
+            "{bad}"
+        );
+        assert_eq!(rep.entries[0].source_id, "target:0");
+        assert_eq!(rep.entries[0].category, None);
+    }
+    let mut j = login_json();
+    j["vault"]["id"] = "SYNTH-ID-MARKER/vault/0000".into();
+    let (_p, v) = new_vault();
+    let rep = plan(&json_runner(j), &[item("x")]).preview(&v, ConflictPolicy::Skip);
+    assert_no_leak(&rep);
+    assert_eq!(rep.entries[0].error, Some(ImportErrorCode::MalformedOutput));
+}
+
+#[test]
+fn provenance_encoding_is_unambiguous() {
+    // Composite components that concatenate identically must not collide.
+    assert_ne!(
+        provenance_id("item", &["a/b", "c"]),
+        provenance_id("item", &["a", "b/c"])
+    );
+    assert_ne!(
+        provenance_id("item", &["ab", "c"]),
+        provenance_id("item", &["a", "bc"])
+    );
+    assert_ne!(
+        provenance_id("item", &["a\0b", "c"]),
+        provenance_id("item", &["a", "b\0c"])
+    );
+    assert_ne!(
+        provenance_id("item", &["a", "b"]),
+        provenance_id("otp", &["a", "b"])
+    );
+    assert_ne!(
+        provenance_id("item", &["a", "b"]),
+        provenance_id("item", &["a", "b", ""])
+    );
+    assert_ne!(otp_source_id("v", "i", "x"), otp_source_id("v", "ix", ""));
+    assert_ne!(item_source_id("a", "b"), item_source_id("b", "a"));
+    // Stable across calls.
+    assert_eq!(
+        item_source_id(VAULT_ID, LOGIN_ID),
+        item_source_id(VAULT_ID, LOGIN_ID)
+    );
+}
+
+// --- Review 2: login -> TOTP relationship reconciliation -------------------
+
+const SECRET_A: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+const SECRET_B: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+fn otp_field(id: &str, secret: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "type": "OTP",
+        "label": "one-time password",
+        "value": format!("otpauth://totp/Example:u?secret={secret}&issuer=Example"),
+        "totp": "123456"
+    })
+}
+
+/// login.json with its OTP fields replaced by `otps` (in order).
+fn login_with(otps: &[(&str, &str)]) -> serde_json::Value {
+    let mut j = login_json();
+    let fields = j["fields"].as_array_mut().unwrap();
+    fields.retain(|f| f["type"] != "OTP");
+    for (id, secret) in otps {
+        fields.push(otp_field(id, secret));
+    }
+    j
+}
+
+/// Secret (Base32) of the TOTP item the login currently links to.
+fn linked_secret(v: &Vault) -> Option<Vec<u8>> {
+    let login = v.items().find(|i| i.kind() == ItemKind::Login).unwrap();
+    let ItemData::Login(l) = &login.data else {
+        panic!()
+    };
+    let id = l.totp_item.as_ref()?;
+    let ItemData::Totp(t) = &v.get(id).unwrap().data else {
+        panic!("link must point to a TOTP item")
+    };
+    Some(t.config.secret.expose().to_vec())
+}
+
+fn secret(b32: &str) -> Option<Vec<u8>> {
+    Some(parse_base32_secret(b32).unwrap().expose().to_vec())
+}
+
+fn statuses(r: &ImportReport) -> Vec<(ItemKind, ImportStatus)> {
+    r.entries[0]
+        .records
+        .iter()
+        .map(|x| (x.kind, x.status))
+        .collect()
+}
+
+/// Imports `before`, persists, then re-imports `after` and checks that the
+/// default policy is non-destructive, Update repairs the link, preview and
+/// apply agree, and the result is idempotent after an encrypted round-trip.
+fn relink_case(before: serde_json::Value, after: serde_json::Value, expect: Option<Vec<u8>>) {
+    let (p, mut v) = new_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relink.keymesh");
+    let r0 =
+        plan(&json_runner(before), &[item("x")]).apply(&mut v, ConflictPolicy::Skip, &mut OsRandom);
+    assert_eq!(r0.counts.failed, 0);
+    storage::create(&path, &mut v, &p, &mut OsRandom).unwrap();
+    let mut v = storage::load(&path, &p).unwrap();
+    let old_link = linked_secret(&v);
+    assert_ne!(old_link, expect, "test case must change the link");
+
+    let runner = json_runner(after);
+    let pl = plan(&runner, &[item("x")]);
+
+    // Default: the login is reported as a conflict and stays as it was.
+    let pre_skip = pl.preview(&v, ConflictPolicy::Skip);
+    assert_eq!(pre_skip.entries[0].status, ImportStatus::Conflict);
+    let mut v_skip = storage::load(&path, &p).unwrap();
+    let r_skip = pl.apply(&mut v_skip, ConflictPolicy::Skip, &mut OsRandom);
+    assert_eq!(r_skip.entries[0].status, ImportStatus::Conflict);
+    assert_eq!(linked_secret(&v_skip), old_link, "default must not relink");
+    assert_no_leak(&r_skip);
+
+    // Update: preview and apply agree record by record.
+    let pre = pl.preview(&v, ConflictPolicy::Update);
+    let applied = pl.apply(&mut v, ConflictPolicy::Update, &mut OsRandom);
+    assert_no_leak(&applied);
+    let as_would = |s: ImportStatus| match s {
+        ImportStatus::Created => ImportStatus::WouldCreate,
+        ImportStatus::Updated => ImportStatus::WouldUpdate,
+        other => other,
+    };
+    assert_eq!(
+        statuses(&pre),
+        statuses(&applied)
+            .into_iter()
+            .map(|(k, s)| (k, as_would(s)))
+            .collect::<Vec<_>>()
+    );
+    assert!(statuses(&applied).contains(&(ItemKind::Login, ImportStatus::Updated)));
+    assert_eq!(linked_secret(&v), expect);
+
+    // Persisted round-trip, then re-import is fully unchanged (both policies).
+    storage::save(&path, &mut v, &p, &mut OsRandom).unwrap();
+    let mut v = storage::load(&path, &p).unwrap();
+    assert_eq!(linked_secret(&v), expect);
+    for policy in [ConflictPolicy::Skip, ConflictPolicy::Update] {
+        let again = plan(&runner, &[item("x")]).apply(&mut v, policy, &mut OsRandom);
+        assert_eq!(
+            again.entries[0].status,
+            ImportStatus::UnchangedDuplicate,
+            "{policy:?}"
+        );
+        assert_eq!(linked_secret(&v), expect);
+    }
+}
+
+#[test]
+fn relink_when_otp_added() {
+    relink_case(
+        login_with(&[]),
+        login_with(&[("otpA", SECRET_A)]),
+        secret(SECRET_A),
+    );
+}
+
+#[test]
+fn relink_when_otp_replaced() {
+    relink_case(
+        login_with(&[("otpA", SECRET_A)]),
+        login_with(&[("otpB", SECRET_B)]),
+        secret(SECRET_B),
+    );
+}
+
+#[test]
+fn unlink_when_otp_removed() {
+    relink_case(login_with(&[("otpA", SECRET_A)]), login_with(&[]), None);
+}
+
+#[test]
+fn relink_when_otp_reordered() {
+    relink_case(
+        login_with(&[("otpA", SECRET_A), ("otpB", SECRET_B)]),
+        login_with(&[("otpB", SECRET_B), ("otpA", SECRET_A)]),
+        secret(SECRET_B),
+    );
 }

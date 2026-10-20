@@ -100,17 +100,22 @@ Implemented with `ed25519-dalek` 2. The stored format is the 32-byte RFC 8032 se
 * Authentication comes from the user's existing `op` session. Keymesh never asks for credentials.
 * `plan()` fetches and maps targets into in-memory drafts. `preview()` reports without writing. `apply()` mutates the vault in memory, all-or-nothing per entry, and the caller then saves it encrypted.
 * **Account scoping:**
-  * Item ids. An item's source id uses the vault UUID and item UUID from `op`'s JSON output. Those identify the item independently of the account selector.
+  * Item ids. An item's source id is derived from the vault id and item id in `op`'s JSON output. Those identify the item independently of the account selector. Both ids must have the shape shown in `op item get --help` (26 lowercase alphanumerics, e.g. `kiramv6tpjijkuci7fig4lndta`); anything else fails closed as `malformed_output`. That shape is inferred from the CLI help and **not verified against real output**. The synthetic fixtures use ids of that shape on purpose.
   * Reference ids. A secret reference is a *path* of names, and a path is only unique within one account. When `--account` is omitted, `op` falls back to `OP_ACCOUNT` or its default account, and that can change between runs. Keymesh therefore rejects reference targets that have no explicit account (`invalid_target`, with no `op` call made).
-  * Reference id format. A reference's source id is `1password:acct-ref:<first 16 bytes of SHA-256("keymesh.op-ref.v2" ‖ account ‖ reference)>`. Neither the account nor the path appears in reports.
+  * Reference id format. See *Provenance ids* below. Neither the account nor the path appears in reports.
   * Aliases. The same account named by different selectors (shorthand, sign-in address, ID) produces different ids. That can create a duplicate record; it never overwrites another account's record.
-  * Migration. Commit `fc838fb` used the account-less `1password:ref:<hash>` id. Records imported from references at that commit will not be matched under the new id, and re-importing them creates a new record. Only synthetic development vaults exist, so no migration code was added.
+  * Migration. Source ids changed twice during M1 review: at `fc838fb` they were `1password:item:<vault>/<item>`, `…#otp:<field>` and `1password:ref:<hash>`; at `5465bcc` references became `1password:acct-ref:<hash>`; now every id uses the v3 provenance hash. Records imported by earlier M1 commits are not matched, so re-importing them creates new records. Only synthetic development vaults exist, so no migration code was added.
+* **Provenance ids** (all derived from untrusted provider data, never shown in clear):
+  * `provenance_id(kind, parts)` = `1password:<kind>:<hex of the first 16 bytes of SHA-256>`, computed over the tag `keymesh.op-provenance.v3`, the kind and every part, each length-prefixed (u64 big-endian). Separators, NULs or empty parts cannot make two tuples collide.
+  * item: `(vault id, item id)`; OTP field: `(vault id, item id, field id)`; an OTP field with a missing or duplicate id falls back to `otp-index` `(vault id, item id, position)`, which is not stable under reordering; reference: `acct-ref` `(account, reference)`.
+* **Report metadata:** a category is published only if it is on the allowlist of the 20 categories listed by `op item list --help`, in the upper-snake form; anything else is reported as `UNKNOWN`, and the original value is preserved as an encrypted custom field (`section = "1password"`, label `category`). Each imported item also keeps the original vault id and item id as encrypted custom fields in the same section, for traceability.
 * Dedup: each item records `ImportSource {provider, source_id, fingerprint}` inside its encrypted payload. Re-importing gives one of these results:
   * unchanged content → `unchanged_duplicate`
   * changed content → `conflict` (the default), or `updated` with `ConflictPolicy::Update`
   * the same target twice in one run → `duplicate_in_run`
 * Mapping:
-  * LOGIN maps to Login, plus one TOTP item per OTP field, holding the provisioning URI/secret. The first TOTP item is linked from the Login. The ephemeral `totp` code key is ignored.
+  * LOGIN maps to Login, plus one TOTP item per OTP field, holding the provisioning URI/secret. The Login links to the TOTP item of its *first* OTP field. The ephemeral `totp` code key is ignored.
+  * **Link reconciliation:** the Login's fingerprint includes the source id of its link target, and a Login only counts as unchanged if its local `totp_item` also resolves to that target's local item. Adding, replacing, removing or reordering OTP fields therefore shows as `conflict` under the default policy, which leaves the Login and its link untouched (a TOTP record for a newly added OTP field is still created, as a new record), and as `updated` under `ConflictPolicy::Update`, which points the Login at the current target or clears the link. TOTP records that are no longer referenced are kept, never deleted.
   * PASSWORD and API_CREDENTIAL map to Secret.
   * SSH_KEY maps to a Secret with format `opaque_private_key`. It is never presented as an Ed25519 key.
   * SECURE_NOTE maps to SecureNote, IDENTITY to Contact, and CRYPTO_WALLET to CryptoWalletRecord.
@@ -118,5 +123,5 @@ Implemented with `ed25519-dalek` 2. The stored format is the 32-byte RFC 8032 se
   * Fields that aren't consumed become encrypted custom fields carrying their source type. Unknown types get `kind = unsupported`.
   * Every item URL that isn't mapped into `Login.urls` is kept verbatim as an encrypted custom field. This covers URLs on every non-login category, and login URLs that fail URL validation. The field has `section = "urls"`, `kind = url` and `source_type = "URL"`, with the label taken from the source URL's label or defaulting to `url`. Warnings count invalid and empty URLs.
   * Warnings give counts for empty fields and attachments.
-* Reports contain source ids (`1password:item:<vault-id>/<item-id>`, `1password:ref:<sha256 prefix>`, or `target:<n>`), statuses, error codes, counts and warning codes. They never contain values, titles, stderr or arguments.
+* Reports contain only hashed provenance ids (or `target:<n>` when a fetch failed before identification), allowlisted category codes, statuses, error codes, counts and constant warning codes. They never contain values, titles, raw ids, field ids, stderr or arguments.
 * The JSON field shape (`id/type/purpose/label/value/section`, `urls[].href`, `vault.id`) comes from the `op` item JSON format as understood at M1. The official reference pages do not specify it. **It has not been verified against real `op` output**, because accessing real data was not authorized.
