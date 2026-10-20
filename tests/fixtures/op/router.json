@@ -1,11 +1,34 @@
 {
   "id": "synthrouteritem000000000a8",
   "title": "Synthetic Router",
-  "vault": { "id": "synthvault000000000000000v1" },
+  "vault": {
+    "id": "synthvault000000000000000v1"
+  },
   "category": "WIRELESS_ROUTER",
   "fields": [
-    { "id": "name", "type": "STRING", "label": "base station name", "value": "synthetic-ap" },
-    { "id": "wireless_password", "type": "CONCEALED", "label": "wireless network password", "value": "SYNTH-WIFI-PASS" },
-    { "id": "weird", "type": "SOME_FUTURE_TYPE", "label": "future", "value": "SYNTH-FUTURE" }
+    {
+      "id": "name",
+      "type": "STRING",
+      "label": "base station name",
+      "value": "synthetic-ap"
+    },
+    {
+      "id": "wireless_password",
+      "type": "CONCEALED",
+      "label": "wireless network password",
+      "value": "SYNTH-WIFI-PASS"
+    },
+    {
+      "id": "weird",
+      "type": "SOME_FUTURE_TYPE",
+      "label": "future",
+      "value": "SYNTH-FUTURE"
+    }
+  ],
+  "urls": [
+    {
+      "label": "admin console",
+      "href": "http://192.0.2.1/SYNTH-URL-router"
+    }
   ]
 }

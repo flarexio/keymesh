@@ -67,6 +67,7 @@ Public metadata is limited to the header plus item ids and revisions. The item c
 * `create` uses no-clobber. `save` re-reads the on-disk header and refuses if the vault id or revision differs from the loaded one (lost-update guard). This guard is not a lock: two writers racing inside the check→rename window are not excluded.
 * A failed decrypt never produces an empty vault, and there is no path that saves a fresh vault over an existing file.
 * `backup` and `restore` verify that the source decrypts before writing. Without `--force`, `restore` won't replace an existing file.
+* Reads and writes share one size bound, `MAX_VAULT_BYTES` (64 MiB). An oversize vault is refused when `create` or `save` is called, before any temp file is written: the old file stays byte-identical and loadable, and the in-memory revision does not advance. The caller must shrink the vault and save again.
 
 ## Generators
 
@@ -91,12 +92,19 @@ Implemented with `ed25519-dalek` 2. The stored format is the 32-byte RFC 8032 se
 
 * Targets are explicit only:
   * an item: `op item get <item> --vault=<v> --format=json --reveal [--account=<a>]`
-  * a single field reference: `op read --no-newline [--account=<a>] op://v/i/[s/]f`
+  * a single field reference: `op read --no-newline --account=<a> op://v/i/[s/]f`. The account is **required** here, as explained below.
 * No list, whoami or enumeration commands run. `--otp` and `?attribute=otp` are never used or accepted.
-* No shell is involved: arguments go out as an argv vector, stdin is closed, and output is bounded to 16 MiB with a timeout. `OP_DEBUG` is removed from the child environment.
+* No shell is involved: arguments go out as an argv vector, stdin is closed, and output is bounded to 16 MiB. `OP_DEBUG` is removed from the child environment.
+* The timeout is end to end: it covers the child running *and* the collection of its stdout and stderr. The child is spawned as the leader of a new process group. On timeout, or on a reader error, the whole group gets SIGKILL, so descendants holding the pipes open cannot hang an import. A descendant that deliberately escapes into its own session or process group is not covered.
 * Positional values that start with `-`, control characters and values over 512 bytes are rejected before anything executes.
 * Authentication comes from the user's existing `op` session. Keymesh never asks for credentials.
 * `plan()` fetches and maps targets into in-memory drafts. `preview()` reports without writing. `apply()` mutates the vault in memory, all-or-nothing per entry, and the caller then saves it encrypted.
+* **Account scoping:**
+  * Item ids. An item's source id uses the vault UUID and item UUID from `op`'s JSON output. Those identify the item independently of the account selector.
+  * Reference ids. A secret reference is a *path* of names, and a path is only unique within one account. When `--account` is omitted, `op` falls back to `OP_ACCOUNT` or its default account, and that can change between runs. Keymesh therefore rejects reference targets that have no explicit account (`invalid_target`, with no `op` call made).
+  * Reference id format. A reference's source id is `1password:acct-ref:<first 16 bytes of SHA-256("keymesh.op-ref.v2" ‖ account ‖ reference)>`. Neither the account nor the path appears in reports.
+  * Aliases. The same account named by different selectors (shorthand, sign-in address, ID) produces different ids. That can create a duplicate record; it never overwrites another account's record.
+  * Migration. Commit `fc838fb` used the account-less `1password:ref:<hash>` id. Records imported from references at that commit will not be matched under the new id, and re-importing them creates a new record. Only synthetic development vaults exist, so no migration code was added.
 * Dedup: each item records `ImportSource {provider, source_id, fingerprint}` inside its encrypted payload. Re-importing gives one of these results:
   * unchanged content → `unchanged_duplicate`
   * changed content → `conflict` (the default), or `updated` with `ConflictPolicy::Update`
@@ -108,6 +116,7 @@ Implemented with `ed25519-dalek` 2. The stored format is the 32-byte RFC 8032 se
   * SECURE_NOTE maps to SecureNote, IDENTITY to Contact, and CRYPTO_WALLET to CryptoWalletRecord.
   * DOCUMENT is reported as `unsupported`. Other categories become a SecureNote that preserves every field.
   * Fields that aren't consumed become encrypted custom fields carrying their source type. Unknown types get `kind = unsupported`.
+  * Every item URL that isn't mapped into `Login.urls` is kept verbatim as an encrypted custom field. This covers URLs on every non-login category, and login URLs that fail URL validation. The field has `section = "urls"`, `kind = url` and `source_type = "URL"`, with the label taken from the source URL's label or defaulting to `url`. Warnings count invalid and empty URLs.
   * Warnings give counts for empty fields and attachments.
 * Reports contain source ids (`1password:item:<vault-id>/<item-id>`, `1password:ref:<sha256 prefix>`, or `target:<n>`), statuses, error codes, counts and warning codes. They never contain values, titles, stderr or arguments.
 * The JSON field shape (`id/type/purpose/label/value/section`, `urls[].href`, `vault.id`) comes from the `op` item JSON format as understood at M1. The official reference pages do not specify it. **It has not been verified against real `op` output**, because accessing real data was not authorized.

@@ -227,6 +227,7 @@ struct ImportArgs {
     #[arg(long = "item", requires = "op_vault")]
     items: Vec<String>,
     /// Single field reference op://vault/item/[section/]field (repeatable).
+    /// Requires --account.
     #[arg(long = "ref")]
     refs: Vec<String>,
     /// Update previously imported items whose source changed.
@@ -644,6 +645,11 @@ fn import_op(cli: &Cli, a: &ImportArgs) -> R<()> {
         account: a.account.clone(),
         reference: r.clone(),
     }));
+    if !a.refs.is_empty() && a.account.is_none() {
+        return Err(usage(
+            "--ref requires --account (references are only unique within an account)",
+        ));
+    }
     if targets.is_empty() {
         return Err(usage(
             "specify --op-vault with --item, or --ref (no implicit enumeration)",

@@ -33,6 +33,8 @@ use std::collections::HashSet;
 use zeroize::Zeroizing;
 
 pub const PROVIDER: &str = "1password";
+/// Custom-field section holding source URLs that have no typed mapping.
+pub const URL_SECTION: &str = "urls";
 
 // ---------------------------------------------------------------------------
 // Runner port
@@ -103,9 +105,16 @@ impl OpTarget {
                 check_arg("item", item, true)?;
             }
             OpTarget::Reference { account, reference } => {
-                if let Some(a) = account {
-                    check_arg("account", a, false)?;
-                }
+                // Secret references are paths (vault/item/field names), which
+                // are only unique within an account. Without `--account`, `op`
+                // resolves OP_ACCOUNT or its default account, which can change
+                // between runs, so provenance would be ambiguous: require it.
+                let Some(a) = account else {
+                    return Err(Error::Import(
+                        "reference targets require an explicit account".into(),
+                    ));
+                };
+                check_arg("account", a, false)?;
                 check_arg("reference", reference, true)?;
                 let path = reference
                     .strip_prefix("op://")
@@ -273,6 +282,8 @@ struct OpVault {
 
 #[derive(Deserialize)]
 struct OpUrl {
+    #[serde(default)]
+    label: Option<String>,
     #[serde(default)]
     href: Option<String>,
 }
@@ -447,19 +458,29 @@ fn run_checked(
     Ok(out)
 }
 
-fn ref_source_id(reference: &str) -> String {
-    let h = Sha256::digest(reference.as_bytes());
+/// Stable, account-scoped id for a secret reference. The account selector and
+/// path are hashed so the report does not reveal them. Different selectors for
+/// the same account (shorthand vs. sign-in address vs. ID) give different ids:
+/// that can produce a duplicate record, never an overwrite of another
+/// account's record.
+fn ref_source_id(account: &str, reference: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"keymesh.op-ref.v2\0");
+    h.update(account.as_bytes());
+    h.update(b"\0");
+    h.update(reference.as_bytes());
     format!(
-        "{PROVIDER}:ref:{}",
-        data_encoding::HEXLOWER.encode(&h[..12])
+        "{PROVIDER}:acct-ref:{}",
+        data_encoding::HEXLOWER.encode(&h.finalize()[..16])
     )
 }
 
 fn fetch_one(runner: &dyn OpRunner, target: &OpTarget, n: usize) -> Fetched {
     let fallback_id = match target {
-        OpTarget::Reference { reference, .. } if target.validate().is_ok() => {
-            ref_source_id(reference)
-        }
+        OpTarget::Reference {
+            account: Some(account),
+            reference,
+        } if target.validate().is_ok() => ref_source_id(account, reference),
         _ => format!("target:{n}"),
     };
     let fail = |code| Fetched::Failed {
@@ -475,15 +496,17 @@ fn fetch_one(runner: &dyn OpRunner, target: &OpTarget, n: usize) -> Fetched {
         Err(code) => return fail(code),
     };
     match target {
-        OpTarget::Reference { reference, .. } => match map_reference(reference, &out.stdout) {
-            Ok(d) => Fetched::Ok {
-                source_id: fallback_id.clone(),
-                category: None,
-                drafts: vec![d],
-                warnings: vec![],
-            },
-            Err(code) => fail(code),
-        },
+        OpTarget::Reference { reference, .. } => {
+            match map_reference(fallback_id.clone(), reference, &out.stdout) {
+                Ok(d) => Fetched::Ok {
+                    source_id: fallback_id.clone(),
+                    category: None,
+                    drafts: vec![d],
+                    warnings: vec![],
+                },
+                Err(code) => fail(code),
+            }
+        }
         OpTarget::Item { .. } => {
             let item: OpItem = match serde_json::from_slice(&out.stdout) {
                 Ok(i) => i,
@@ -501,7 +524,11 @@ fn fetch_one(runner: &dyn OpRunner, target: &OpTarget, n: usize) -> Fetched {
     }
 }
 
-fn map_reference(reference: &str, stdout: &[u8]) -> std::result::Result<Draft, ImportErrorCode> {
+fn map_reference(
+    source_id: String,
+    reference: &str,
+    stdout: &[u8],
+) -> std::result::Result<Draft, ImportErrorCode> {
     let value = Zeroizing::new(
         std::str::from_utf8(stdout)
             .map_err(|_| ImportErrorCode::MalformedOutput)?
@@ -517,7 +544,6 @@ fn map_reference(reference: &str, stdout: &[u8]) -> std::result::Result<Draft, I
     } else {
         title
     };
-    let source_id = ref_source_id(reference);
     let data = if value
         .trim_start()
         .to_ascii_lowercase()
@@ -780,18 +806,22 @@ fn map_item(source_id: String, item: OpItem) -> Fetched {
     }
     let has_totp = !drafts.is_empty();
 
+    // URLs not consumed by a typed mapping are preserved as custom fields.
+    let mut url_used = vec![false; item.urls.len()];
     let primary: Option<ItemData> = match cat.as_str() {
         "LOGIN" => {
             let username = p.text(|f| f.purpose == "USERNAME");
             let password = p.secret(|f| f.purpose == "PASSWORD");
             let mut urls = Vec::new();
-            for u in &item.urls {
+            for (i, u) in item.urls.iter().enumerate() {
                 match u.href.as_deref() {
                     Some(h) if is_url(h) && h.chars().count() <= crate::model::MAX_SHORT => {
-                        urls.push(h.to_owned())
+                        urls.push(h.to_owned());
+                        url_used[i] = true;
                     }
-                    Some(_) => warnings.push("invalid_url_skipped".into()),
-                    None => {}
+                    // Kept below as an encrypted custom field.
+                    Some(h) if !h.is_empty() => warnings.push("invalid_url_preserved".into()),
+                    _ => {}
                 }
             }
             Some(ItemData::Login(Login {
@@ -881,7 +911,7 @@ fn map_item(source_id: String, item: OpItem) -> Fetched {
         }
     };
 
-    let custom_fields: Vec<CustomField> = p
+    let mut custom_fields: Vec<CustomField> = p
         .fields
         .iter()
         .zip(&p.used)
@@ -895,6 +925,33 @@ fn map_item(source_id: String, item: OpItem) -> Fetched {
             value: SecretString::new(f.value.as_str()),
         })
         .collect();
+    let mut empty_urls = 0usize;
+    for (u, _) in item.urls.iter().zip(&url_used).filter(|(_, used)| !**used) {
+        let Some(href) = u.href.as_deref().filter(|h| !h.is_empty()) else {
+            empty_urls += 1;
+            continue;
+        };
+        let label = u
+            .label
+            .as_deref()
+            .filter(|l| !l.is_empty())
+            .unwrap_or("url")
+            .to_owned();
+        // Never truncate: an over-long label fails the item explicitly.
+        if label.chars().count() > MAX_LABEL {
+            return failed(ImportErrorCode::InvalidData);
+        }
+        custom_fields.push(CustomField {
+            section: Some(URL_SECTION.into()),
+            label,
+            kind: FieldKind::Url,
+            source_type: Some("URL".into()),
+            value: SecretString::new(href),
+        });
+    }
+    if empty_urls > 0 {
+        warnings.push(format!("empty_urls_skipped:{empty_urls}"));
+    }
 
     let is_login = matches!(data, ItemData::Login(_));
     let notes = match data {

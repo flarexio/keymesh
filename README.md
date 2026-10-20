@@ -24,6 +24,13 @@ Local-first encrypted vault core in Rust. An Angular UI is planned for later.
 | Keymesh login (mnemonic, image keycards), wallet/identity/KMS, NATS, blockchain | ❌ deferred | Out of M1 scope |
 | Angular UI, sync | ❌ deferred | |
 
+## Known limitations (accepted for M1)
+
+- **Demo key provider only:** the CLI key comes from `KEYMESH_DEMO_KEY`. Real unlock and recovery aren't designed yet.
+- **Single writer:** `save` refuses when the file changed since it was loaded, but there is no file lock. Two writers racing during the save can still conflict.
+- **Whole-file rollback** to an older valid vault file can't be detected without external state.
+- **Size limit:** vault files are limited to 64 MiB for both reading and writing. A save that would exceed it is refused and leaves the old file intact.
+
 ## Build and test
 
 ```sh
@@ -57,7 +64,7 @@ Secret values (passwords, note bodies, recovery phrases, TOTP URIs) come in on s
 ```sh
 cargo run -q -- import-op preview --op-vault "<vault>" --item "<item>"   # no writes
 cargo run -q -- import-op apply   --op-vault "<vault>" --item "<item>"
-cargo run -q -- import-op preview --ref "op://<vault>/<item>/<field>"
+cargo run -q -- import-op preview --account "<account>" --ref "op://<vault>/<item>/<field>"   # --account required
 ```
 
 The importer:

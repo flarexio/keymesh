@@ -42,6 +42,7 @@ const SECRETS: &[&str] = &[
     "SYNTH-FUTURE",
     "SYNTH-STDERR-SECRET",
     "SYNTH-REF-VALUE",
+    "SYNTH-URL-",
     "Synthetic Example Login",
     "synthetic-user@example.test",
 ];
@@ -155,7 +156,7 @@ fn exact_argument_vectors_and_no_enumeration() {
         ]
     );
     let r = OpTarget::Reference {
-        account: None,
+        account: Some("synthetic-a.example.test".into()),
         reference: "op://Synthetic Vault/Item/credential".into(),
     };
     assert_eq!(
@@ -163,6 +164,7 @@ fn exact_argument_vectors_and_no_enumeration() {
         [
             "read",
             "--no-newline",
+            "--account=synthetic-a.example.test",
             "op://Synthetic Vault/Item/credential"
         ]
     );
@@ -204,6 +206,12 @@ fn rejects_option_injection_and_unsafe_references() {
         OpTarget::Reference {
             account: None,
             reference: "op://v//f".into(),
+        },
+        // Valid path but no explicit account: `op` would fall back to
+        // OP_ACCOUNT / its default account, so provenance would be ambiguous.
+        OpTarget::Reference {
+            account: None,
+            reference: "op://Synthetic Vault/Item/credential".into(),
         },
     ] {
         let runner = FakeRunner::items(ALL);
@@ -262,7 +270,7 @@ fn maps_every_category_and_round_trips_through_encrypted_store() {
         .contains(&"empty_fields_skipped:1".to_string()));
     assert!(login_entry
         .warnings
-        .contains(&"invalid_url_skipped".to_string()));
+        .contains(&"invalid_url_preserved".to_string()));
 
     // Persist encrypted, reload, verify content.
     let dir = tempfile::tempdir().unwrap();
@@ -379,7 +387,7 @@ fn maps_every_category_and_round_trips_through_encrypted_store() {
         .iter()
         .find(|n| n.title == "Synthetic Router")
         .unwrap();
-    assert_eq!(router.custom_fields.len(), 3);
+    assert_eq!(router.custom_fields.len(), 4); // 3 fields + 1 preserved URL
     let fut = router
         .custom_fields
         .iter()
@@ -514,14 +522,14 @@ fn reference_import_uses_op_read() {
         Ok(ok(b"SYNTH-REF-VALUE".to_vec()))
     });
     let t = OpTarget::Reference {
-        account: None,
+        account: Some("synthetic-a.example.test".into()),
         reference: "op://Synthetic Vault/Item/credential".into(),
     };
     let (_p, mut v) = new_vault();
     let rep =
         plan(&runner, std::slice::from_ref(&t)).apply(&mut v, ConflictPolicy::Skip, &mut OsRandom);
     assert_no_leak(&rep);
-    assert!(rep.entries[0].source_id.starts_with("1password:ref:"));
+    assert!(rep.entries[0].source_id.starts_with("1password:acct-ref:"));
     assert_eq!(rep.counts.created, 1);
     let it = v.items().next().unwrap();
     let ItemData::Secret(s) = &it.data else {
@@ -531,6 +539,176 @@ fn reference_import_uses_op_read() {
     // Idempotent on the same reference.
     let rep = plan(&runner, &[t]).apply(&mut v, ConflictPolicy::Skip, &mut OsRandom);
     assert_eq!(rep.entries[0].status, ImportStatus::UnchangedDuplicate);
+}
+
+fn acct_ref(account: &str) -> OpTarget {
+    OpTarget::Reference {
+        account: Some(account.into()),
+        reference: "op://Synthetic Vault/Item/credential".into(),
+    }
+}
+
+/// Answers `op read` with a value that depends on `--account=`.
+fn per_account_runner(a_value: &'static str, b_value: &'static str) -> FakeRunner {
+    FakeRunner::new(move |args| {
+        let acct = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--account="))
+            .expect("reference reads always carry --account");
+        Ok(ok(match acct {
+            "synthetic-a.example.test" => a_value,
+            "synthetic-b.example.test" => b_value,
+            _ => unreachable!(),
+        }
+        .as_bytes()
+        .to_vec()))
+    })
+}
+
+fn secret_values(v: &Vault) -> Vec<String> {
+    let mut out: Vec<String> = v
+        .items()
+        .filter_map(|i| match &i.data {
+            ItemData::Secret(s) => Some(s.secret.expose().to_owned()),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn same_reference_in_two_accounts_stays_distinct() {
+    let a = acct_ref("synthetic-a.example.test");
+    let b = acct_ref("synthetic-b.example.test");
+    let runner = per_account_runner("SYNTH-REF-VALUE-A", "SYNTH-REF-VALUE-B");
+    let (p, mut v) = new_vault();
+
+    // Same batch: two distinct sources, not a duplicate-in-run.
+    let rep =
+        plan(&runner, &[a.clone(), b.clone()]).apply(&mut v, ConflictPolicy::Skip, &mut OsRandom);
+    assert_eq!(rep.counts.created, 2);
+    assert_eq!(rep.counts.duplicates_in_run, 0);
+    assert_ne!(rep.entries[0].source_id, rep.entries[1].source_id);
+    for e in &rep.entries {
+        assert!(
+            !e.source_id.contains("synthetic-"),
+            "account not exposed in report"
+        );
+    }
+    assert_eq!(
+        secret_values(&v),
+        ["SYNTH-REF-VALUE-A", "SYNTH-REF-VALUE-B"]
+    );
+
+    // Persist and reload, then re-import: both unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refs.keymesh");
+    storage::create(&path, &mut v, &p, &mut OsRandom).unwrap();
+    let mut v = storage::load(&path, &p).unwrap();
+    let rep =
+        plan(&runner, &[a.clone(), b.clone()]).apply(&mut v, ConflictPolicy::Skip, &mut OsRandom);
+    assert_eq!(rep.counts.unchanged, 2);
+    assert_eq!(v.len(), 2);
+
+    // Account B's value changes: only B conflicts/updates; A untouched.
+    let changed = per_account_runner("SYNTH-REF-VALUE-A", "SYNTH-REF-VALUE-B2");
+    let rep =
+        plan(&changed, &[a.clone(), b.clone()]).apply(&mut v, ConflictPolicy::Skip, &mut OsRandom);
+    assert_eq!(rep.entries[0].status, ImportStatus::UnchangedDuplicate);
+    assert_eq!(rep.entries[1].status, ImportStatus::Conflict);
+    assert_eq!(
+        secret_values(&v),
+        ["SYNTH-REF-VALUE-A", "SYNTH-REF-VALUE-B"]
+    );
+    let rep = plan(&changed, &[a, b]).apply(&mut v, ConflictPolicy::Update, &mut OsRandom);
+    assert_eq!(rep.entries[0].status, ImportStatus::UnchangedDuplicate);
+    assert_eq!(rep.entries[1].status, ImportStatus::Updated);
+    storage::save(&path, &mut v, &p, &mut OsRandom).unwrap();
+    let v = storage::load(&path, &p).unwrap();
+    assert_eq!(
+        secret_values(&v),
+        ["SYNTH-REF-VALUE-A", "SYNTH-REF-VALUE-B2"]
+    );
+}
+
+/// URL custom fields of the item with `title`, as (label, value) pairs.
+fn url_fields(v: &Vault, title: &str) -> Vec<(String, String)> {
+    v.items()
+        .find(|i| i.title == title)
+        .unwrap_or_else(|| panic!("{title} missing"))
+        .custom_fields
+        .iter()
+        .filter(|f| f.kind == FieldKind::Url && f.section.as_deref() == Some("urls"))
+        .map(|f| (f.label.clone(), f.value.expose().to_owned()))
+        .collect()
+}
+
+#[test]
+fn urls_are_preserved_for_every_category() {
+    let runner = FakeRunner::items(ALL);
+    let targets: Vec<_> = ["login", "note", "password", "router", "api"]
+        .into_iter()
+        .map(item)
+        .collect();
+    let (p, mut v) = new_vault();
+    let rep = plan(&runner, &targets).apply(&mut v, ConflictPolicy::Skip, &mut OsRandom);
+    assert_no_leak(&rep);
+    assert_eq!(rep.counts.failed, 0);
+
+    // Encrypted round-trip; the file must not contain URLs in plaintext.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("urls.keymesh");
+    storage::create(&path, &mut v, &p, &mut OsRandom).unwrap();
+    assert!(!std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("SYNTH-URL"));
+    let v = storage::load(&path, &p).unwrap();
+
+    assert_eq!(
+        url_fields(&v, "Synthetic Note"),
+        [
+            (
+                "docs".to_string(),
+                "https://SYNTH-URL-note.example.test/path?q=1&x=%20y#frag".to_string()
+            ),
+            (
+                "url".to_string(),
+                "https://SYNTH-URL-note2.example.test".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        url_fields(&v, "Synthetic Password"),
+        [(
+            "website".to_string(),
+            "https://SYNTH-URL-pw.example.test/login".to_string()
+        )]
+    );
+    assert_eq!(
+        url_fields(&v, "Synthetic Router"),
+        [(
+            "admin console".to_string(),
+            "http://192.0.2.1/SYNTH-URL-router".to_string()
+        )]
+    );
+    assert_eq!(
+        url_fields(&v, "Synthetic API Credential"),
+        [(
+            "endpoint".to_string(),
+            "https://SYNTH-URL-api.example.test/v1".to_string()
+        )]
+    );
+    // Login: valid URL mapped to Login.urls, invalid one preserved verbatim.
+    assert_eq!(
+        url_fields(&v, "Synthetic Example Login"),
+        [("bad".to_string(), "not a url".to_string())]
+    );
+    let login = v.items().find(|i| i.kind() == ItemKind::Login).unwrap();
+    let ItemData::Login(l) = &login.data else {
+        panic!()
+    };
+    assert_eq!(l.urls, ["https://login.example.test/"]);
 }
 
 // --- Fake executable through the real process runner ----------------------
@@ -650,20 +828,63 @@ mod process {
         assert!(start.elapsed() < Duration::from_secs(10));
     }
 
+    /// The child exits at once, but a descendant keeps the pipes open. The
+    /// deadline must cover output collection, and the descendant is killed.
+    #[test]
+    fn timeout_covers_descendants_holding_pipes() {
+        let pid_dir = tempfile::tempdir().unwrap();
+        let pid_file = pid_dir.path().join("pid");
+        let (_env, mut runner) = fake_op(
+            "orphan",
+            &[("FAKE_OP_PID_FILE", pid_file.to_str().unwrap())],
+        );
+        runner.timeout = Duration::from_millis(500);
+        let (_p, v) = new_vault();
+        let start = Instant::now();
+        let rep = plan(&runner, &[item("x")]).preview(&v, ConflictPolicy::Skip);
+        let elapsed = start.elapsed();
+        assert_eq!(rep.entries[0].error, Some(ImportErrorCode::Timeout));
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+
+        // The descendant must not outlive the import (Linux: check /proc).
+        #[cfg(target_os = "linux")]
+        {
+            let pid = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .to_owned();
+            let stat = format!("/proc/{pid}/stat");
+            let gone = (0..300).any(|_| {
+                let alive = std::fs::read_to_string(&stat)
+                    // Field 3 is the state; a zombie is already dead.
+                    .map(|s| {
+                        !s.rsplit(')')
+                            .next()
+                            .unwrap_or("")
+                            .trim_start()
+                            .starts_with('Z')
+                    })
+                    .unwrap_or(false);
+                if alive {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                !alive
+            });
+            assert!(gone, "descendant {pid} still running");
+        }
+    }
+
     #[test]
     fn reference_value_through_fake_executable() {
         let (env, runner) = fake_op("value", &[("FAKE_OP_VALUE", "SYNTH-REF-VALUE")]);
         let (_p, mut v) = new_vault();
-        let t = OpTarget::Reference {
-            account: None,
-            reference: "op://Synthetic Vault/Item/credential".into(),
-        };
+        let t = acct_ref("synthetic-a.example.test");
         let rep = plan(&runner, &[t]).apply(&mut v, ConflictPolicy::Skip, &mut OsRandom);
         assert_no_leak(&rep);
         assert_eq!(rep.counts.created, 1);
         assert_eq!(
             std::fs::read_to_string(&env.args_file).unwrap(),
-            "read\n--no-newline\nop://Synthetic Vault/Item/credential\n"
+            "read\n--no-newline\n--account=synthetic-a.example.test\nop://Synthetic Vault/Item/credential\n"
         );
     }
 }
