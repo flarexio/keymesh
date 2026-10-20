@@ -80,9 +80,8 @@ async function create(page: Page, title: string) {
   await expect(page.locator('#detail-title')).toHaveText(title);
 }
 
-async function itemTitles(page: Page): Promise<string[]> {
-  return page.locator('.item-list .title').allTextContents();
-}
+/** Auto-retrying locator for list titles (never snapshot the DOM). */
+const titles = (page: Page) => page.locator('.item-list .title');
 
 async function openItem(page: Page, title: string) {
   await page.locator('.item-list button', { hasText: title }).first().click();
@@ -157,7 +156,7 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
 
   await start(page, 'synthetic-fixture');
   await createAllKinds(page);
-  expect(await itemTitles(page)).toHaveLength(7);
+  await expect(titles(page)).toHaveCount(7);
 
   // Masked by default, explicit reveal, copy without rendering.
   await openItem(page, M.loginTitle);
@@ -186,8 +185,8 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await expect(page.locator('.detail')).toContainText('generated locally (not provider-issued)');
   const genRow = page.locator('km-secret-field', { hasText: 'Secret' });
   await genRow.getByRole('button', { name: 'Reveal' }).click();
-  const generated = (await genRow.getByTestId('secret-value').textContent())!.trim();
-  expect(generated).toHaveLength(24);
+  // Revealed: exactly 24 non-space characters (default profile).
+  await expect(genRow.getByTestId('secret-value')).toHaveText(/^\s*\S{24}\s*$/);
   await page.getByRole('button', { name: 'Generators' }).click();
   await page.getByRole('button', { name: 'Generate & save as Secret' }).nth(1).click();
   await expect(page.locator('#detail-title')).toHaveText('Generated secret');
@@ -199,7 +198,7 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await page.getByRole('button', { name: 'Generate & save key' }).click();
   await expect(page.locator('#detail-title')).toHaveText('Generated Ed25519 key');
   await expect(page.locator('.detail')).toContainText('ssh-ed25519 ');
-  expect(await itemTitles(page)).toHaveLength(10);
+  await expect(titles(page)).toHaveCount(10);
 
   // Edit (blank secret keeps the stored value) and search.
   await openItem(page, M.loginTitle);
@@ -213,10 +212,10 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await pw2.getByRole('button', { name: 'Reveal' }).click();
   await expect(pw2).toContainText(M.password);
   await page.getByTestId('search').fill('synthmark-url');
-  expect(await itemTitles(page)).toEqual([`${M.loginTitle} edited`]);
+  await expect(titles(page)).toHaveText([`${M.loginTitle} edited`]);
   await page.getByTestId('search').fill('');
   await page.getByTestId('kind-filter').selectOption('secret');
-  expect(await itemTitles(page)).toHaveLength(3);
+  await expect(titles(page)).toHaveCount(3);
   await page.getByTestId('kind-filter').selectOption('');
 
   // Delete.
@@ -224,7 +223,7 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: 'Delete' }).click();
   await expect(page.locator('.item-list')).not.toContainText('Synthetic note');
-  expect(await itemTitles(page)).toHaveLength(9);
+  await expect(titles(page)).toHaveCount(9);
 
   // Storage holds only the encrypted envelope.
   assertNoMarkers(await storedBytes(page), 'IndexedDB');
@@ -257,7 +256,7 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
 
   // Demo unlock (test-provider transition, not app identity).
   await page.getByRole('button', { name: 'Unlock demo session' }).click();
-  expect(await itemTitles(page)).toHaveLength(9);
+  await expect(titles(page)).toHaveCount(9);
 
   // A mutation started immediately before lock is rejected, not applied.
   await newItem(page, 'secure_note');
@@ -269,14 +268,14 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   });
   await expect(page.getByRole('heading', { name: 'Vault locked' })).toBeVisible();
   await page.getByRole('button', { name: 'Unlock demo session' }).click();
-  expect(await itemTitles(page)).not.toContain('SYNTHMARK-RACE');
-  expect(await itemTitles(page)).toHaveLength(9);
+  await expect(page.locator('.item-list')).not.toContainText('SYNTHMARK-RACE');
+  await expect(titles(page)).toHaveCount(9);
 
   // Persistence across reload (synthetic fixture key reopens).
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Stored demo vault found' })).toBeVisible();
   await page.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
-  expect(await itemTitles(page)).toHaveLength(9);
+  await expect(titles(page)).toHaveCount(9);
 
   // TOTP shows the code for the (controlled) current time.
   await page.clock.setFixedTime(new Date(59_000));
@@ -319,7 +318,7 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
     expect((await storedBytes(page)).equals(afterDelete), `${name} must not overwrite`).toBe(true);
   }
   await page.getByRole('button', { name: 'Items' }).click();
-  expect(await itemTitles(page)).not.toContain('Synthetic wallet');
+  await expect(page.locator('.item-list')).not.toContainText('Synthetic wallet');
 
   // Valid restore brings the deleted item back; the core decrypts markers.
   await page.getByRole('button', { name: 'Backup' }).click();
@@ -349,7 +348,7 @@ test('second tab cannot clobber newer data', async ({ context }) => {
   const b = await context.newPage();
   await b.goto('/');
   await b.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
-  expect(await itemTitles(b)).toEqual(['Note from tab A']);
+  await expect(titles(b)).toHaveText(['Note from tab A']);
 
   // A writes; B is told its copy is stale and cannot write over it.
   await newItem(a, 'secure_note');
@@ -365,10 +364,10 @@ test('second tab cannot clobber newer data', async ({ context }) => {
 
   // Storage still has A's data; B reloads and sees it.
   await b.getByRole('button', { name: 'Reload from storage' }).click();
-  expect(await itemTitles(b)).toEqual(['Note from tab A', 'Second note from tab A']);
+  await expect(titles(b)).toHaveText(['Note from tab A', 'Second note from tab A']);
   await a.reload();
   await a.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
-  expect(await itemTitles(a)).toEqual(['Note from tab A', 'Second note from tab A']);
+  await expect(titles(a)).toHaveText(['Note from tab A', 'Second note from tab A']);
 });
 
 test('second tab writing without the broadcast is rejected by compare-and-swap', async ({ context }) => {
@@ -394,7 +393,7 @@ test('second tab writing without the broadcast is rejected by compare-and-swap',
   await expect(b2.locator('form .error')).toContainText('changed elsewhere');
   await expect(b2.getByRole('alert').filter({ hasText: 'changed elsewhere' }).first()).toBeVisible();
   await b2.getByRole('button', { name: 'Reload from storage' }).click();
-  expect(await itemTitles(b2)).toEqual(['Written by A']);
+  await expect(titles(b2)).toHaveText(['Written by A']);
 });
 
 test('wrong-key backup is refused and ephemeral vaults are not recoverable after reload', async ({
@@ -436,6 +435,6 @@ test('wrong-key backup is refused and ephemeral vaults are not recoverable after
   await expect(q.getByTestId('backup-error')).toContainText('Backup rejected');
   expect((await storedBytes(q)).equals(before)).toBe(true);
   await q.getByRole('button', { name: 'Items' }).click();
-  expect(await itemTitles(q)).toEqual(['Fixture note']);
+  await expect(titles(q)).toHaveText(['Fixture note']);
   await fx.close();
 });
