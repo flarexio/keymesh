@@ -4,10 +4,12 @@
  * - The key provider is DEVELOPMENT ONLY and lives in WASM memory; its key is
  *   never visible to JavaScript, the URL, storage or logs.
  * - Every mutation runs inside the Rust core, is sealed there and persisted
- *   to IndexedDB with compare-and-swap; the session revision only advances
- *   after the write succeeded.
- * - `lock()` drops the decrypted vault in WASM and bumps an epoch: results of
- *   any asynchronous work started before the lock are discarded.
+ *   to IndexedDB with an exact-snapshot compare-and-swap; the session revision
+ *   only advances after the write succeeded.
+ * - Lock wins: every asynchronous operation captures the lock generation
+ *   (`epoch`) when it is *invoked* and re-checks it before it starts and after
+ *   every `await`. Work invoked before a lock never installs state or reveals
+ *   data afterwards, and is not persisted where cancellation is still possible.
  */
 import { Injectable, InjectionToken, computed, inject, signal } from '@angular/core';
 import { CLOCK } from './clock';
@@ -30,7 +32,7 @@ export type Status =
   | 'stored' // envelope stored, no session
   | 'locked' // session locked, provider still in memory
   | 'unlocked'
-  | 'stale' // another writer changed storage; reload required
+  | 'stale' // storage changed elsewhere; reload required
   | 'failed';
 
 export type KeyMode = 'ephemeral' | 'synthetic-fixture';
@@ -42,10 +44,10 @@ export class LockedError extends Error {
   }
 }
 
-/** Thrown when async work finished after a lock/reload; result discarded. */
+/** Work invoked before a lock (or reload/restore/discard); never applied. */
 export class StaleWorkError extends Error {
   constructor() {
-    super('The operation was cancelled because the vault was locked.');
+    super('The operation was cancelled because the vault was locked or replaced.');
     this.name = 'StaleWorkError';
   }
 }
@@ -56,17 +58,34 @@ export const VAULT_STORE = new InjectionToken<VaultStore>('keymesh.vault-store',
   factory: () => new VaultStore(indexedDB),
 });
 
+/** Loads the compiled core; tests may substitute a controllable fake. */
+export const CORE_LOADER = new InjectionToken<() => Promise<Core>>('keymesh.core-loader', {
+  providedIn: 'root',
+  factory: () => loadCore,
+});
+
 function message(e: unknown): string {
   return e instanceof Error ? e.message : 'unexpected error';
 }
+
+function sameBytes(a: Uint8Array | null, b: Uint8Array | null): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+type Guard = () => void;
 
 @Injectable({ providedIn: 'root' })
 export class VaultService {
   private readonly clock = inject(CLOCK);
   private readonly store = inject(VAULT_STORE);
+  private readonly loadCore = inject(CORE_LOADER);
   private core: Core | null = null;
   private key: DemoKeyProvider | null = null;
   private session: VaultSession | null = null;
+  /** Exact stored envelope this tab last read or wrote (CAS snapshot). */
+  private snapshot: Uint8Array | null = null;
   private epoch = 0;
   private queue: Promise<unknown> = Promise.resolve();
   private channel: BroadcastChannel | null =
@@ -76,7 +95,6 @@ export class VaultService {
   readonly stored = signal<EnvelopeInfo | null>(null);
   readonly keyMode = signal<KeyMode | null>(null);
   readonly error = signal<string | null>(null);
-  readonly notice = signal<string | null>(null);
   readonly query = signal('');
   readonly kindFilter = signal<ItemKind | ''>('');
   readonly items = signal<Summary[]>([]);
@@ -87,30 +105,32 @@ export class VaultService {
   readonly maxBytes = signal(64 * 1024 * 1024);
 
   constructor() {
-    this.channel?.addEventListener('message', (ev: MessageEvent) => {
-      const d = ev.data as { vaultId?: string; revision?: number } | null;
-      if (!d) return;
-      if (
-        this.session &&
-        this.status() === 'unlocked' &&
-        d.vaultId === this.stored()?.vault_id &&
-        typeof d.revision === 'number' &&
-        d.revision !== this.revision()
-      ) {
-        this.status.set('stale');
-      }
-    });
+    // Any write elsewhere: compare exact bytes (revisions can repeat after a
+    // restore), and stop editing if storage no longer matches our snapshot.
+    this.channel?.addEventListener('message', () => void this.checkExternalChange());
   }
 
   async init(): Promise<void> {
     try {
-      this.core = await loadCore();
+      this.core = await this.loadCore();
       this.maxBytes.set(this.core.maxEnvelopeBytes());
-      await this.refreshStored();
+      await this.run(async (guard) => {
+        const rec = await this.store.read();
+        guard();
+        this.showStored(rec);
+      });
     } catch (e) {
       this.error.set(`Failed to start: ${message(e)}`);
       this.status.set('failed');
     }
+  }
+
+  private async checkExternalChange(): Promise<void> {
+    if (!this.session || this.status() !== 'unlocked') return;
+    const epoch = this.epoch;
+    const rec = await this.store.read();
+    if (epoch !== this.epoch || this.status() !== 'unlocked') return;
+    if (!rec || !sameBytes(rec.bytes, this.snapshot)) this.status.set('stale');
   }
 
   private c(): Core {
@@ -123,15 +143,10 @@ export class VaultService {
     return this.session;
   }
 
-  private async refreshStored(): Promise<void> {
-    const rec = await this.store.read();
-    if (!rec) {
-      this.stored.set(null);
-      this.status.set('empty');
-      return;
-    }
-    this.stored.set(this.info(rec.bytes));
-    this.status.set(this.key ? 'locked' : 'stored');
+  private showStored(rec: StoredVault | null): void {
+    this.snapshot = rec?.bytes ?? null;
+    this.stored.set(rec ? this.info(rec.bytes) : null);
+    this.status.set(rec ? (this.key ? 'locked' : 'stored') : 'empty');
   }
 
   private info(bytes: Uint8Array): EnvelopeInfo {
@@ -162,39 +177,85 @@ export class VaultService {
     return { bytes, vaultId: info.vault_id, kekId: info.kek_id, revision: info.revision };
   }
 
-  private setSession(s: VaultSession, key: DemoKeyProvider): void {
+  /** Install a decrypted session. Invalidates work invoked before it. */
+  private install(s: VaultSession, key: DemoKeyProvider, bytes: Uint8Array): void {
+    this.epoch++;
     this.session?.free();
     this.session = s;
+    if (this.key && this.key !== key) this.key.free();
     this.key = key;
+    this.snapshot = bytes;
+    this.stored.set(this.info(bytes));
     this.keyMode.set(key.mode as KeyMode);
     this.revision.set(s.revision());
     this.status.set('unlocked');
     this.error.set(null);
+    this.version.update((v) => v + 1);
     this.refreshList();
   }
 
+  /**
+   * Serialize async work. The lock generation is captured at invocation; the
+   * returned guard throws StaleWorkError once a lock/reload/restore happened.
+   */
+  private run<T>(fn: (guard: Guard) => Promise<T>): Promise<T> {
+    const epoch = this.epoch;
+    const guard: Guard = () => {
+      if (epoch !== this.epoch) throw new StaleWorkError();
+    };
+    const p = this.queue.then(() => {
+      guard();
+      return fn(guard);
+    });
+    this.queue = p.catch(() => undefined);
+    return p;
+  }
+
   /** New empty vault, persisted immediately. Refuses if one is stored. */
-  async startNew(mode: KeyMode): Promise<void> {
-    return this.run(async () => {
+  startNew(mode: KeyMode): Promise<void> {
+    return this.run(async (guard) => {
       const key = this.provider(mode);
       const s = this.c().VaultSession.create(key);
       const sealed = s.seal(key);
       const bytes = sealed.bytes;
       const revision = sealed.revision;
       sealed.free();
-      await this.store.create(this.record(bytes));
+      try {
+        guard();
+        await this.store.create(this.record(bytes));
+      } catch (e) {
+        s.free();
+        key.free();
+        throw e;
+      }
+      if (this.isStale(guard)) {
+        // Persisted, but a lock won: keep the key so it can be unlocked.
+        s.free();
+        this.key = key;
+        this.keyMode.set(key.mode as KeyMode);
+        throw new StaleWorkError();
+      }
       s.commit(revision);
-      this.stored.set(this.info(bytes));
-      this.setSession(s, key);
+      this.install(s, key, bytes);
       this.broadcast();
     });
   }
 
-  /** Decrypt the stored envelope. Fixture key (after reload) or the key
-   *  still held in memory (unlock after lock). */
-  async openStored(): Promise<void> {
-    return this.run(async () => {
+  private isStale(guard: Guard): boolean {
+    try {
+      guard();
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Decrypt the stored envelope: the synthetic fixture key (after reload)
+   *  or the key still held in memory (unlock after lock). */
+  openStored(): Promise<void> {
+    return this.run(async (guard) => {
       const rec = await this.store.read();
+      guard();
       if (!rec) throw new Error('No stored demo vault.');
       const key =
         this.key && this.key.keyId === rec.kekId
@@ -207,13 +268,11 @@ export class VaultService {
           'This demo vault was encrypted with an ephemeral key that no longer exists. It cannot be opened.',
         );
       }
-      const s = this.c().VaultSession.open(rec.bytes, key);
-      this.stored.set(this.info(rec.bytes));
-      this.setSession(s, key);
+      this.install(this.c().VaultSession.open(rec.bytes, key), key, rec.bytes);
     });
   }
 
-  /** Remove decrypted state. Pending async results are discarded. */
+  /** Remove decrypted state. Every pending or queued operation is cancelled. */
   lock(): void {
     this.epoch++;
     this.session?.lock();
@@ -221,20 +280,22 @@ export class VaultService {
     this.session = null;
     this.items.set([]);
     this.query.set('');
-    this.notice.set(null);
     this.version.update((v) => v + 1);
     this.status.set(this.stored() ? 'locked' : 'empty');
   }
 
-  /** Discard the stored demo vault (and the in-memory key). */
-  async discard(): Promise<void> {
+  /** Discard the stored demo vault, but only the one this tab last saw. */
+  discard(): Promise<void> {
+    const expected = this.snapshot;
     this.lock();
-    this.key?.free();
-    this.key = null;
-    this.keyMode.set(null);
-    await this.store.clear();
-    this.stored.set(null);
-    this.status.set('empty');
+    return this.run(async (guard) => {
+      await this.store.compareAndClear(expected);
+      guard();
+      this.key?.free();
+      this.key = null;
+      this.keyMode.set(null);
+      this.showStored(null);
+    });
   }
 
   // --- reads ---------------------------------------------------------------
@@ -305,32 +366,41 @@ export class VaultService {
   }
 
   /**
-   * Apply `fn` in the core, seal, persist with compare-and-swap, then commit
-   * the revision. Mutations are serialized. If persisting fails the in-memory
+   * Apply `fn` in the core, seal, persist with compare-and-swap against the
+   * exact snapshot, then commit. If sealing fails (e.g. size limit) the core
+   * has already rolled the change back. If persisting fails the in-memory
    * change is not trusted: the session is marked stale and must be reloaded.
    */
   private mutate<T>(fn: (s: VaultSession) => T): Promise<T> {
-    return this.run(async () => {
+    return this.run(async (guard) => {
       if (this.status() === 'stale') throw new ConflictError();
       const s = this.s();
       const key = this.key!;
-      const epoch = this.epoch;
-      const expected = s.revision();
+      const expected = this.snapshot;
       const result = fn(s);
-      const sealed = s.seal(key);
-      const revision = sealed.revision;
-      const bytes = sealed.bytes;
-      sealed.free();
+      let bytes: Uint8Array;
+      let revision: number;
       try {
-        await this.store.compareAndPut(expected, this.record(bytes));
+        const sealed = s.seal(key);
+        bytes = sealed.bytes;
+        revision = sealed.revision;
+        sealed.free();
       } catch (e) {
-        // The in-memory change was not persisted: never keep editing on top
-        // of it. Reload from storage is required.
-        if (epoch === this.epoch) this.status.set('stale');
+        this.version.update((v) => v + 1);
+        this.refreshList();
         throw e;
       }
-      if (epoch !== this.epoch) throw new StaleWorkError();
+      try {
+        await this.store.compareAndSwap(expected, this.record(bytes));
+      } catch (e) {
+        if (!this.isStale(guard)) this.status.set('stale');
+        throw e;
+      }
+      // Locked while writing: the ciphertext is stored (unlock re-reads it),
+      // but the freed session is never touched again.
+      guard();
       s.commit(revision);
+      this.snapshot = bytes;
       this.revision.set(revision);
       this.stored.set(this.info(bytes));
       this.version.update((v) => v + 1);
@@ -341,48 +411,74 @@ export class VaultService {
   }
 
   private broadcast(): void {
-    const info = this.stored();
-    this.channel?.postMessage({ vaultId: info?.vault_id, revision: info?.revision });
-  }
-
-  /** Serialize async work; report errors without leaking values. */
-  private run<T>(fn: () => Promise<T>): Promise<T> {
-    const p = this.queue.then(fn, fn);
-    this.queue = p.catch(() => undefined);
-    return p;
+    this.channel?.postMessage({ changed: true });
   }
 
   // --- backup / restore ------------------------------------------------------
 
-  /** The stored encrypted envelope, exactly as persisted. */
-  async backupBytes(): Promise<Uint8Array> {
-    if (this.status() !== 'unlocked') throw new LockedError();
-    const rec = await this.store.read();
-    if (!rec) throw new Error('Nothing stored to back up.');
-    if (rec.revision !== this.revision()) throw new ConflictError();
-    return rec.bytes;
+  /** The stored encrypted envelope, exactly as persisted by this session. */
+  backupBytes(): Promise<Uint8Array> {
+    return this.run(async (guard) => {
+      if (this.status() !== 'unlocked') throw new LockedError();
+      const rec = await this.store.read();
+      guard();
+      if (!rec || !sameBytes(rec.bytes, this.snapshot)) {
+        this.status.set('stale');
+        throw new ConflictError();
+      }
+      return rec.bytes;
+    });
   }
 
   /**
-   * Restore an encrypted backup. It must decrypt with the current demo key
-   * (or the synthetic fixture key when no session exists) BEFORE anything is
-   * written; on any failure the stored vault is untouched.
+   * Restore an encrypted backup. Allowed from an unlocked, non-stale session
+   * (replacing exactly the envelope this tab last saw) or into empty storage
+   * (synthetic fixture key). The file must decrypt BEFORE anything is written;
+   * the write is a compare-and-swap; a lock at any point wins.
    */
-  async restore(file: File): Promise<void> {
-    return this.run(async () => {
+  restore(file: File): Promise<void> {
+    return this.run(async (guard) => {
+      const status = this.status();
+      if (status === 'stale') {
+        throw new ConflictError('This tab is out of date. Reload from storage before restoring.');
+      }
+      if (status !== 'unlocked' && status !== 'empty') {
+        throw new Error('Restore needs an unlocked vault or empty storage.');
+      }
       if (file.size > this.maxBytes()) throw new Error('Backup file is too large.');
+      const expected = status === 'unlocked' ? this.snapshot : null;
       const bytes = new Uint8Array(await file.arrayBuffer());
+      guard();
+      if (bytes.length > this.maxBytes()) throw new Error('Backup file is too large.');
       const key = this.key ?? this.provider('synthetic-fixture');
-      let s: VaultSession;
+      let candidate: VaultSession;
       try {
-        s = this.c().VaultSession.open(bytes, key);
+        candidate = this.c().VaultSession.open(bytes, key);
       } catch (e) {
+        if (key !== this.key) key.free();
         throw new Error(`Backup rejected, nothing was changed: ${message(e)}`);
       }
-      this.epoch++;
-      await this.store.replace(this.record(bytes));
-      this.stored.set(this.info(bytes));
-      this.setSession(s, key);
+      const drop = () => {
+        candidate.free();
+        if (key !== this.key) key.free();
+      };
+      try {
+        guard();
+        await this.store.compareAndSwap(expected, this.record(bytes));
+      } catch (e) {
+        drop();
+        if (e instanceof ConflictError && !this.isStale(guard) && status === 'unlocked') {
+          this.status.set('stale');
+        }
+        throw e;
+      }
+      if (this.isStale(guard)) {
+        // Lock won while the (already verified) backup was being written:
+        // nothing is installed; unlocking later reads the stored envelope.
+        drop();
+        throw new StaleWorkError();
+      }
+      this.install(candidate, key, bytes);
       this.broadcast();
     });
   }

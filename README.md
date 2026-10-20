@@ -25,8 +25,8 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | Browser TOTP: live code + remaining time, otpauth URI / Base32 entry | ✅ | Clock injectable (E2E uses Playwright's clock); QR/camera scanning ❌ not implemented |
 | IndexedDB persistence of the encrypted envelope only | ✅ | No plaintext, key or search index stored; E2E checks that planted markers are absent |
 | Browser lock / demo unlock | ✅ | Lock drops the decrypted vault in WASM, bumps an epoch so work started earlier is discarded; unlock is a demo-key transition, not identity |
-| Encrypted backup download / verified restore | ✅ | Restore must decrypt with the current demo key before anything is written; size limit 64 MiB |
-| Cross-tab writes | ✅ rejected | Compare-and-swap on the stored revision plus a BroadcastChannel stale notice; stale tabs must reload |
+| Encrypted backup download / verified restore | ✅ | Restore must decrypt with the current demo key before anything is written; a lock at any point wins; 64 MiB limit enforced on open and seal |
+| Cross-tab writes | ✅ rejected | Exact-snapshot compare-and-swap on every write (mutation, restore, discard) plus a BroadcastChannel stale notice; stale tabs cannot edit or restore until they reload |
 | Offline startup (service worker / PWA) | ⏳ deferred | No service worker; the app needs its origin to load |
 | 1Password import in the browser | ❌ by design | Native CLI only; no endpoint runs `op`; the browser shows CLI instructions |
 | Production unlock / recovery | ❌ not started | Lost ephemeral demo key ⇒ demo ciphertext is unrecoverable |

@@ -477,30 +477,48 @@ fn locked() -> Error {
 /// decrypted vault (items and data key); every later call fails.
 pub struct Session {
     vault: Option<Vault>,
+    /// State as of the last persisted (or opened) envelope. A change that
+    /// cannot be sealed is rolled back to it, so memory never diverges from
+    /// what can be stored.
+    committed: Option<Vault>,
     /// Revision produced by the last [`Session::seal`], awaiting commit.
     pending: Option<u64>,
+    /// Same bound as [`Session::open`]; smaller only in tests.
+    max_bytes: usize,
 }
 
 impl Session {
-    pub fn create(key: &DemoKey) -> Result<Self> {
-        Ok(Self {
-            vault: Some(Vault::create(key.provider(), &mut OsRandom)?),
+    fn with_vault(vault: Vault) -> Self {
+        Self {
+            committed: Some(vault.clone()),
+            vault: Some(vault),
             pending: None,
-        })
+            max_bytes: MAX_ENVELOPE_BYTES,
+        }
+    }
+
+    pub fn create(key: &DemoKey) -> Result<Self> {
+        Ok(Self::with_vault(Vault::create(
+            key.provider(),
+            &mut OsRandom,
+        )?))
     }
 
     /// Decrypt an envelope. Fails closed on wrong key, corruption, unknown
     /// format or oversize input.
     pub fn open(bytes: &[u8], key: &DemoKey) -> Result<Self> {
         check_size(bytes)?;
-        Ok(Self {
-            vault: Some(Vault::decrypt(bytes, key.provider())?),
-            pending: None,
-        })
+        Ok(Self::with_vault(Vault::decrypt(bytes, key.provider())?))
+    }
+
+    #[cfg(test)]
+    fn set_max_bytes_for_tests(&mut self, n: usize) {
+        self.max_bytes = n;
     }
 
     pub fn lock(&mut self) {
         self.vault = None;
+        self.committed = None;
         self.pending = None;
     }
 
@@ -903,16 +921,44 @@ impl Session {
 
     /// Seal the next revision without changing the session. The caller
     /// persists the bytes and then calls [`Session::commit`].
+    ///
+    /// The envelope must fit the same size bound [`Session::open`] accepts.
+    /// On any failure nothing is published (no pending revision) and the
+    /// in-memory vault is rolled back to the last committed state.
     pub fn seal(&mut self, key: &DemoKey) -> Result<(Vec<u8>, u64)> {
-        let (bytes, rev) = self.v()?.seal_next(key.provider(), &mut OsRandom)?;
-        self.pending = Some(rev);
-        Ok((bytes, rev))
+        self.pending = None;
+        let sealed = self
+            .v()?
+            .seal_next(key.provider(), &mut OsRandom)
+            .and_then(|(bytes, rev)| {
+                if bytes.len() > self.max_bytes {
+                    Err(Error::Format(
+                        "vault would exceed the maximum size; the change was discarded".into(),
+                    ))
+                } else {
+                    Ok((bytes, rev))
+                }
+            });
+        match sealed {
+            Ok((bytes, rev)) => {
+                self.pending = Some(rev);
+                Ok((bytes, rev))
+            }
+            Err(e) => {
+                self.vault = self.committed.clone();
+                Err(e)
+            }
+        }
     }
 
     /// Record that `revision` (from the last [`Session::seal`]) was written.
     pub fn commit(&mut self, revision: u64) -> Result<()> {
         match self.pending.take() {
-            Some(r) if r == revision => self.vm()?.mark_persisted(revision),
+            Some(r) if r == revision => {
+                self.vm()?.mark_persisted(revision)?;
+                self.committed = self.vault.clone();
+                Ok(())
+            }
             _ => Err(Error::Integrity("no matching sealed revision".into())),
         }
     }
@@ -1142,6 +1188,80 @@ mod tests {
         let info = inspect_envelope(&bytes).unwrap();
         assert_eq!(info.revision, 1);
         assert_eq!(info.kek_id, FixtureKeyProvider::KEY_ID);
+    }
+
+    #[test]
+    fn oversize_seal_is_refused_and_rolls_back() {
+        let k = DemoKey::fixture();
+        let mut s = Session::create(&k).unwrap();
+        s.create_item(input(
+            serde_json::json!({"title": "small", "data": {"kind": "secure_note", "body": "x"}}),
+        ))
+        .unwrap();
+        let good = persist(&mut s, &k);
+        // A limit just above the current envelope: the next big item cannot fit.
+        let limit = good.len() + 2048;
+        s.set_max_bytes_for_tests(limit);
+        let big = "y".repeat(8192);
+        s.create_item(input(
+            serde_json::json!({"title": "big", "data": {"kind": "secure_note", "body": big}}),
+        ))
+        .unwrap();
+        let err = s.seal(&k).unwrap_err();
+        assert!(matches!(err, Error::Format(_)), "{err:?}");
+        // No pending revision was published and the change was rolled back.
+        assert!(s.commit(2).is_err());
+        assert_eq!(s.revision().unwrap(), 1);
+        let titles: Vec<String> = s
+            .list("", "")
+            .unwrap()
+            .into_iter()
+            .map(|x| x.title)
+            .collect();
+        assert_eq!(titles, ["small"]);
+        // The previously persisted envelope still opens (production limit).
+        assert_eq!(
+            Session::open(&good, &k)
+                .unwrap()
+                .list("", "")
+                .unwrap()
+                .len(),
+            1
+        );
+        // A change that fits still works afterwards, at the next revision.
+        s.create_item(input(
+            serde_json::json!({"title": "ok", "data": {"kind": "secure_note", "body": "z"}}),
+        ))
+        .unwrap();
+        let (b, r) = s.seal(&k).unwrap();
+        assert!(b.len() <= limit);
+        assert_eq!(r, 2);
+        s.commit(r).unwrap();
+    }
+
+    #[test]
+    fn exactly_at_limit_seals_and_reopens() {
+        let k = DemoKey::fixture();
+        let mut s = Session::create(&k).unwrap();
+        s.create_item(input(
+            serde_json::json!({"title": "a", "data": {"kind": "secure_note", "body": "x"}}),
+        ))
+        .unwrap();
+        let (b, _) = s.seal(&k).unwrap();
+        // Sealed size is deterministic for fixed content (fresh nonces, same lengths).
+        s.set_max_bytes_for_tests(b.len());
+        let (b2, r) = s.seal(&k).unwrap();
+        assert_eq!(b2.len(), b.len());
+        s.commit(r).unwrap();
+        s.set_max_bytes_for_tests(b.len() - 1);
+        assert!(s.seal(&k).is_err());
+    }
+
+    #[test]
+    fn production_seal_limit_matches_open_limit() {
+        let k = DemoKey::fixture();
+        let s = Session::create(&k).unwrap();
+        assert_eq!(s.max_bytes, MAX_ENVELOPE_BYTES);
     }
 
     #[test]

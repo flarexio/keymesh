@@ -438,3 +438,167 @@ test('wrong-key backup is refused and ephemeral vaults are not recoverable after
   await expect(titles(q)).toHaveText(['Fixture note']);
   await fx.close();
 });
+
+// --- M2 review 1: restore vs lock, stale tabs, revision reuse ---------------
+
+async function downloadBackup(page: Page, path: string): Promise<Buffer> {
+  await page.getByRole('button', { name: 'Backup' }).click();
+  const [dl] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: 'Download encrypted backup' }).click(),
+  ]);
+  await dl.saveAs(path);
+  await page.getByRole('button', { name: 'Items' }).click();
+  return readFile(path);
+}
+
+async function addNote(page: Page, title: string) {
+  await newItem(page, 'secure_note');
+  await field(page, 'Title').fill(title);
+  await field(page, 'Note').fill('n');
+  await create(page, title);
+}
+
+async function openFixture(page: Page) {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
+  await expect(page.getByTestId('key-mode')).toContainText('synthetic-fixture');
+}
+
+/** A tab that never receives cross-tab notifications. */
+async function deafPage(context: import('@playwright/test').BrowserContext) {
+  const p = await context.newPage();
+  await p.addInitScript(() => {
+    (window as unknown as { BroadcastChannel: unknown }).BroadcastChannel = undefined;
+  });
+  return p;
+}
+
+test('lock during a pending restore wins: nothing installed or persisted', async ({ page }, testInfo) => {
+  await start(page, 'synthetic-fixture');
+  await addNote(page, 'Kept note');
+  const backupPath = testInfo.outputPath('before-delete.keymesh');
+  await downloadBackup(page, backupPath);
+  page.once('dialog', (d) => d.accept());
+  await page.getByRole('button', { name: 'Delete' }).click();
+  await expect(titles(page)).toHaveCount(0);
+  const before = await storedBytes(page);
+
+  // Hold the backup file read open until the test releases it.
+  await page.evaluate(() => {
+    const w = window as unknown as { __release: () => void };
+    const gate = new Promise<void>((r) => (w.__release = r));
+    const orig = Blob.prototype.arrayBuffer;
+    Blob.prototype.arrayBuffer = async function (this: Blob) {
+      await gate;
+      return orig.call(this);
+    };
+  });
+  await page.getByRole('button', { name: 'Backup' }).click();
+  await page.getByTestId('restore-input').setInputFiles(backupPath);
+  await page.getByTestId('lock').click();
+  await expect(page.getByRole('heading', { name: 'Vault locked' })).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __release: () => void }).__release());
+
+  // Still locked, nothing revealed, storage unchanged.
+  await page.waitForTimeout(500);
+  await expect(page.getByRole('heading', { name: 'Vault locked' })).toBeVisible();
+  expect(await page.content()).not.toContain('Kept note');
+  expect((await storedBytes(page)).equals(before)).toBe(true);
+  await page.getByRole('button', { name: 'Unlock demo session' }).click();
+  await expect(titles(page)).toHaveCount(0);
+});
+
+test('stale tab restore is rejected (notification delivered)', async ({ context }, testInfo) => {
+  const a = await context.newPage();
+  await start(a, 'synthetic-fixture');
+  const b = await context.newPage();
+  await openFixture(b);
+  const backupPath = testInfo.outputPath('old.keymesh');
+  await downloadBackup(b, backupPath);
+
+  await addNote(a, 'Newer note from A');
+  await expect(b.getByRole('alert').filter({ hasText: 'changed elsewhere' })).toBeVisible();
+  const afterA = await storedBytes(a);
+  await b.getByRole('button', { name: 'Backup' }).click();
+  await b.getByTestId('restore-input').setInputFiles(backupPath);
+  await expect(b.getByTestId('backup-error')).toContainText('out of date');
+  expect((await storedBytes(a)).equals(afterA)).toBe(true);
+  await a.reload();
+  await a.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
+  await expect(titles(a)).toHaveText(['Newer note from A']);
+});
+
+test('stale tab restore is rejected by compare-and-swap (notification missed)', async ({ context }, testInfo) => {
+  const a = await context.newPage();
+  await start(a, 'synthetic-fixture');
+  const b = await deafPage(context);
+  await openFixture(b);
+  const backupPath = testInfo.outputPath('old.keymesh');
+  await downloadBackup(b, backupPath);
+
+  await addNote(a, 'Newer note from A');
+  const afterA = await storedBytes(a);
+  // B never heard about A's write and still looks editable.
+  await expect(b.getByRole('alert').filter({ hasText: 'changed elsewhere' })).toHaveCount(0);
+  await b.getByRole('button', { name: 'Backup' }).click();
+  await b.getByTestId('restore-input').setInputFiles(backupPath);
+  await expect(b.getByTestId('backup-error')).toContainText('changed elsewhere');
+  expect((await storedBytes(a)).equals(afterA)).toBe(true);
+  await expect(b.getByRole('alert').filter({ hasText: 'changed elsewhere' }).first()).toBeVisible();
+});
+
+test('reused revision after a restore cannot be clobbered by a deaf stale tab', async ({ context }, testInfo) => {
+  const a = await context.newPage();
+  await start(a, 'synthetic-fixture'); // revision 1
+  const rev1 = testInfo.outputPath('rev1.keymesh');
+  await downloadBackup(a, rev1);
+  await addNote(a, 'X'); // revision 2 (bytes R)
+
+  const b = await deafPage(context);
+  await openFixture(b); // B holds revision 2, bytes R
+  await expect(b.getByTestId('key-mode')).toContainText('rev 2');
+
+  await a.getByRole('button', { name: 'Backup' }).click();
+  await a.getByTestId('restore-input').setInputFiles(rev1); // back to revision 1
+  await expect(a.getByTestId('backup-status')).toHaveText('Backup restored.');
+  await a.getByRole('button', { name: 'Items' }).click();
+  await addNote(a, 'Y'); // revision 2 again, different bytes
+  await expect(a.getByTestId('key-mode')).toContainText('rev 2');
+  const afterA = await storedBytes(a);
+
+  // Same vault id and revision as B's view — only exact bytes differ.
+  await newItem(b, 'secure_note');
+  await field(b, 'Title').fill('Z from stale B');
+  await field(b, 'Note').fill('z');
+  await b.getByRole('button', { name: 'Create' }).click();
+  await expect(b.locator('form .error')).toContainText('changed elsewhere');
+  expect((await storedBytes(a)).equals(afterA)).toBe(true);
+  await b.getByRole('button', { name: 'Reload from storage' }).click();
+  await expect(titles(b)).toHaveText(['Y']);
+});
+
+test('initial restore into empty storage', async ({ browser }, testInfo) => {
+  const src = await browser.newContext();
+  const p = await src.newPage();
+  await start(p, 'synthetic-fixture');
+  await addNote(p, 'Restored note');
+  const path = testInfo.outputPath('initial.keymesh');
+  await downloadBackup(p, path);
+  await src.close();
+
+  const dst = await browser.newContext();
+  const q = await dst.newPage();
+  await q.goto('/');
+  // Malformed first: nothing is written, still empty.
+  await q.getByTestId('initial-restore-input').setInputFiles({
+    name: 'bad.keymesh',
+    mimeType: 'application/octet-stream',
+    buffer: Buffer.from('garbage'),
+  });
+  await expect(q.getByRole('alert')).toContainText('Backup rejected');
+  expect((await storedBytes(q)).length).toBe(0);
+  await q.getByTestId('initial-restore-input').setInputFiles(path);
+  await expect(titles(q)).toHaveText(['Restored note']);
+  await dst.close();
+});

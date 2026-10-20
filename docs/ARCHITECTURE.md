@@ -164,23 +164,30 @@ The key is never exported to JavaScript and never appears in the URL, storage, c
 
 * IndexedDB database `keymesh-demo`, store `vault`, key `primary` holds `{bytes, vaultId, kekId, revision}`. `bytes` is the same `keymesh.vault` v1 envelope as on native.
 * No local/session storage or cookies are used.
-* A mutation runs in WASM, then `seal()` produces revision N+1, then a single readwrite IndexedDB transaction performs `compareAndPut(expected = N)`. The session's revision advances only after that write succeeds (`commit`).
-* A write by a stale tab is rejected and nothing is written.
-* After any failed persist the tab is marked *stale*: editing is blocked until it reloads from storage, which drops any unsaved in-memory change.
-* A `BroadcastChannel` message lets other tabs show the stale notice before they try to write. The compare-and-swap protects data even without that message, and E2E covers both paths.
-* Mutations within a tab are serialized through a promise queue.
+* **Every write is an exact-snapshot compare-and-swap** inside one readwrite transaction. It succeeds only if the stored envelope is byte-for-byte the snapshot this tab last read or wrote; `null` means storage must still be empty.
+  * Exact bytes are compared, not revision numbers. Restoring an older backup can bring back a revision number that a stale tab already holds with different content, and a revision check would let that tab overwrite newer data.
+  * This applies to mutations, restore, the initial vault and discard. There is no unconditional write path.
+* A mutation runs in WASM, then `seal()` produces the envelope, then the compare-and-swap writes it. The session revision advances only after the write succeeded (`commit`).
+* `seal()` enforces the same 64 MiB bound that `open()` accepts. If a change would exceed it, or sealing fails for any other reason, nothing is published, the session rolls back to its last committed state, and the stored envelope is untouched and still readable.
+* After a failed persist the tab is marked *stale*. Editing, and restoring from that tab, are blocked until it reloads from storage, which drops any unsaved in-memory change.
+* Other tabs receive a `BroadcastChannel` ping and compare the stored bytes against their snapshot. Bytes are used rather than revisions for the same reuse reason. The compare-and-swap protects data even when the ping is missed, and E2E covers both paths.
+* Async work within a tab is serialized through a promise queue.
 
 ### Lock
 
-* `lock()` drops the decrypted `Vault` (items and data key) inside WASM and frees the session handle. It also clears list, search and selection state, and bumps an epoch.
+* `lock()` drops the decrypted `Vault`, its checkpoint and the data key inside WASM, and frees the session handle. It also clears list, search and selection state, and bumps the lock generation (`epoch`).
+* **Lock wins.** Every asynchronous operation (unlock, start, mutation, backup, restore, discard) captures the generation when it is *invoked*, not when the queue reaches it. It re-checks the generation before starting and after every `await`. Work invoked before a lock never installs a session, never repopulates the UI and never commits.
+* Where cancellation is still possible, nothing is persisted: a restore checks the generation before its compare-and-swap.
+* If a lock lands while an already-verified write is in flight, the ciphertext write completes but nothing is installed. Unlocking later reads whatever is stored.
 * Every vault operation then fails with "vault is locked", in both the core session and the service.
-* Async work that started before the lock checks the epoch and discards its result, so a mutation queued just before a lock is rejected. E2E covers this.
 * The development key provider stays in WASM memory so the demo can unlock again. That is a test-provider transition, not app identity.
 
 ### Backup and restore
 
-* Backup downloads the stored envelope bytes exactly as stored, after checking they match the session's revision. They are ciphertext only, and E2E checks them for planted markers.
-* Restore first checks the file size (64 MiB maximum), then decrypts the file with the current demo key, or the fixture key if no session exists. Only on success does it replace the stored record. Truncated, garbage, unknown-version and wrong-key files are rejected, and the existing vault stays byte-identical.
+* Backup downloads the stored envelope bytes exactly as stored, after checking they match this tab's snapshot. They are ciphertext only, and E2E checks them for planted markers.
+* Restore is allowed only from an unlocked, non-stale tab, which replaces exactly the envelope it last saw, or into empty storage using the synthetic fixture key (labelled as a test harness).
+* Restore first checks the file size (64 MiB maximum), then decrypts the file with the demo key. Only then, if no lock happened, does it compare-and-swap.
+* Truncated, garbage, unknown-version and wrong-key files are rejected, and the stored vault stays byte-identical. The same happens if another tab wrote meanwhile.
 
 ### Browser hardening
 

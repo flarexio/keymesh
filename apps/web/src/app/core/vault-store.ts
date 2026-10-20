@@ -5,9 +5,10 @@
  * fields (vault id, key id, revision). No plaintext, no key material and no
  * search index is ever stored.
  *
- * Writers use compare-and-swap inside a single readwrite transaction:
- * a save succeeds only if the stored revision still equals the revision the
- * writer loaded, so a second tab can never silently clobber newer data.
+ * Every write is a compare-and-swap inside one readwrite transaction: it
+ * succeeds only if the stored envelope is exactly the snapshot the writer last
+ * saw, so another tab (or an older restore) can never be silently clobbered.
+ * There is no unconditional write path.
  */
 
 export interface StoredVault {
@@ -39,6 +40,12 @@ function done(tx: IDBTransaction): Promise<void> {
     tx.onabort = () => reject(tx.error ?? new ConflictError());
     tx.onerror = () => reject(tx.error ?? new Error('IndexedDB transaction failed'));
   });
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 function isStored(v: unknown): v is StoredVault {
@@ -82,43 +89,56 @@ export class VaultStore {
 
   /** First save of a new vault. Never replaces an existing record. */
   async create(v: StoredVault): Promise<void> {
-    const db = await this.open();
-    const tx = db.transaction('vault', 'readwrite');
-    const os = tx.objectStore('vault');
-    const existing = await req(os.get(KEY));
-    if (existing !== undefined) {
-      tx.abort();
-      throw new ConflictError('A stored demo vault already exists. Discard it first.');
+    try {
+      await this.compareAndSwap(null, v);
+    } catch (e) {
+      if (e instanceof ConflictError) {
+        throw new ConflictError('A stored demo vault already exists. Discard it first.');
+      }
+      throw e;
     }
-    os.add(v, KEY);
-    await done(tx);
   }
 
   /**
-   * Replace the record only if it still holds `expectedRevision` of the same
-   * vault. Otherwise nothing is written and ConflictError is thrown.
+   * Atomically replace the record only if the stored envelope is byte-for-byte
+   * the snapshot this writer last saw (`null`: storage must be empty).
+   * Comparing exact bytes, not revision numbers, keeps this safe when a
+   * restored backup reuses an older revision. On mismatch nothing is written.
    */
-  async compareAndPut(expectedRevision: number, v: StoredVault): Promise<void> {
+  async compareAndSwap(expected: Uint8Array | null, next: StoredVault): Promise<void> {
     const db = await this.open();
     const tx = db.transaction('vault', 'readwrite');
     const os = tx.objectStore('vault');
     const cur = await req(os.get(KEY));
-    if (!isStored(cur) || cur.vaultId !== v.vaultId || cur.revision !== expectedRevision) {
+    const matches =
+      expected === null
+        ? cur === undefined
+        : isStored(cur) && sameBytes(cur.bytes, expected);
+    if (!matches) {
       tx.abort();
       throw new ConflictError();
     }
-    os.put(v, KEY);
+    os.put(next, KEY);
     await done(tx);
   }
 
-  /** Unconditional replace — only after the caller verified `v` decrypts. */
-  async replace(v: StoredVault): Promise<void> {
+  /** Delete the record only if it is exactly `expected` (null: already empty). */
+  async compareAndClear(expected: Uint8Array | null): Promise<void> {
     const db = await this.open();
     const tx = db.transaction('vault', 'readwrite');
-    tx.objectStore('vault').put(v, KEY);
+    const os = tx.objectStore('vault');
+    const cur = await req(os.get(KEY));
+    const matches =
+      expected === null ? cur === undefined : isStored(cur) && sameBytes(cur.bytes, expected);
+    if (!matches) {
+      tx.abort();
+      throw new ConflictError('The stored vault changed elsewhere; reload before discarding.');
+    }
+    if (cur !== undefined) os.delete(KEY);
     await done(tx);
   }
 
+  /** Test helper / explicit reset. */
   async clear(): Promise<void> {
     const db = await this.open();
     const tx = db.transaction('vault', 'readwrite');

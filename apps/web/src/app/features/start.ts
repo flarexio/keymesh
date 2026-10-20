@@ -42,6 +42,9 @@ import { KeyMode, VaultService } from '../core/vault.service';
             </label>
           </fieldset>
           <button type="button" class="primary" (click)="act(vault.startNew(mode()))">Start demo vault</button>
+          <h3>Or restore an encrypted backup (test harness)</h3>
+          <p class="hint">Only backups made with the public synthetic fixture key can be restored here. Nothing is written unless the file decrypts.</p>
+          <label>Backup file <input type="file" data-testid="initial-restore-input" (change)="restore($event)" /></label>
         }
       }
       @if (error()) {
@@ -62,6 +65,13 @@ export class Start {
     } catch (e) {
       this.error.set(e instanceof Error ? e.message : 'Operation failed');
     }
+  }
+
+  protected restore(ev: Event): Promise<void> | void {
+    const el = ev.target as HTMLInputElement;
+    const file = el.files?.[0];
+    el.value = '';
+    if (file) return this.act(this.vault.restore(file));
   }
 
   protected discard(): Promise<void> | void {

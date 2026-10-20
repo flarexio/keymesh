@@ -123,6 +123,9 @@ pub fn read_header(bytes: &[u8]) -> Result<VaultHeader> {
     })
 }
 
+/// `Clone` lets storage adapters keep a last-committed checkpoint; clones hold
+/// their own copy of the data key, zeroized on drop like the original.
+#[derive(Clone)]
 pub struct Vault {
     vault_id: String,
     kek_id: String,
