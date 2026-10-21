@@ -376,6 +376,7 @@ test('switching language/theme keeps unsaved input, selection, TOTP and keys; va
   await page.getByTestId('generate-password').click();
   const gen = page.getByTestId('generated-password');
   await gen.getByRole('button', { name: zhTW['secret.reveal'] }).click();
+  await expect(page.getByTestId('generated-value')).not.toContainText('•');
   const preview = await page.getByTestId('generated-value').innerText();
   await setLocale(page, 'en');
   await setTheme(page, 'dark');

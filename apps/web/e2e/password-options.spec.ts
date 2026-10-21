@@ -82,6 +82,7 @@ async function revealGenerated(page: Page, t: Catalog): Promise<string> {
 async function revealStored(page: Page, t: Catalog, label: string): Promise<string> {
   const row = page.locator('km-secret-field', { hasText: label });
   await row.getByRole('button', { name: t['secret.reveal'] }).click();
+  await expect(row.getByTestId('secret-value')).not.toContainText('•');
   return row.getByTestId('secret-value').innerText();
 }
 
