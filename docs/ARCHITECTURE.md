@@ -194,7 +194,7 @@ The key is never exported to JavaScript and never appears in the URL, storage, c
 * A CSP meta tag and server header allow `default-src 'self'` and `script-src 'self' 'wasm-unsafe-eval'`. Styles allow `'unsafe-inline'` for Angular component styles. Critical-CSS inlining is disabled, so no inline event handler is needed.
 * There are no third-party origins, analytics or remote fonts (system font stack only). E2E asserts that only same-origin requests are made.
 * The saved theme and language are applied before first paint by `public/preferences-boot.js`, a same-origin classic script loaded from `<head>`. No inline script and no new CSP allowance is needed; E2E asserts the page has no inline scripts and logs no CSP violations.
-* `scripts/serve.mjs` (production build) binds to 127.0.0.1 and sends `nosniff`, `no-referrer`, COOP and `frame-ancestors 'none'`.
+* `scripts/serve.mjs` (production build) binds to 127.0.0.1 and sends `nosniff`, `no-referrer`, COOP and `frame-ancestors 'none'`. An explicit `HOST=<one literal IP>` enables a LAN preview; wildcards and hostnames are refused, and the headers are unchanged. That origin is plain HTTP and not a secure context: there is no Clipboard API, COOP is ignored and traffic is unencrypted (see `apps/web/README.md`).
 
 ### Language and appearance (M3)
 

@@ -3,9 +3,10 @@ import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { LOCALES, Locale, PreferencesService, THEMES, ThemePreference } from '../core/preferences';
 import { Icon, IconName } from './icon';
 
-/** Language names are shown in their own language on purpose. */
+/** Language names are shown in their own language on purpose. The zh-TW
+ * catalog stays Traditional Chinese (Taiwan); the option is labelled 中文. */
 const LOCALE_LABELS: Record<Locale, { short: string; long: string }> = {
-  'zh-TW': { short: '繁中', long: '繁體中文' },
+  'zh-TW': { short: '中文', long: '中文' },
   en: { short: 'EN', long: 'English' },
 };
 

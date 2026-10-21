@@ -69,6 +69,11 @@ export class SecretField implements OnDestroy {
   protected async copy(): Promise<void> {
     this.error.set(null);
     try {
+      // Absent on non-secure origins (plain-HTTP LAN preview): check before revealing.
+      if (!navigator.clipboard) {
+        this.error.set('errors.clipboard');
+        return;
+      }
       await navigator.clipboard.writeText(this.vault.reveal(this.itemId(), this.slot()));
       this.toast.show('secret.copied');
     } catch (e) {

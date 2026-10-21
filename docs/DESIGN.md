@@ -37,7 +37,7 @@ No remote fonts, images or icon fonts are loaded. Icons are a small local stroke
 ## Components and conventions
 
 - **Buttons:** primary (filled accent, one per area), secondary (outlined), ghost, and destructive (outlined in red; a filled red confirm only inside the confirmation dialog). Icon and text together; icon-only buttons carry an `aria-label` and a `title`.
-- **Segmented controls** (language, appearance) show the selected option as a raised chip with a border and a heavier weight, not by colour alone, and expose `aria-pressed`. Language options are written in their own language (繁中 / EN).
+- **Segmented controls** (language, appearance) show the selected option as a raised chip with a border and a heavier weight, not by colour alone, and expose `aria-pressed`. Language options are written in their own language: 中文 (locale `zh-TW`, Traditional Chinese, Taiwan) / EN, with accessible names 中文 / English.
 - **Forms:** visible labels bound with `for`/`id`, and hints linked through `aria-describedby`. Validation runs on submit and then live: `aria-invalid`, a red border plus an icon and a message, and focus moves to the first invalid field. Native browser validation bubbles are disabled (`novalidate`) because they would appear in the browser's language, not the app's.
 - **Secrets** are masked by default with explicit Reveal/Hide (`aria-pressed`) and Copy. They are revealed as text content only and hidden again after 30 s or on lock.
 - **Destructive actions** (delete item, discard stored vault) use an in-app modal `<dialog>` with a danger icon, a plain-language consequence and Cancel focused first. Escape cancels; locking closes it.

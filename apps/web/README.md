@@ -7,7 +7,7 @@ An Angular 22 app running the real Keymesh Rust core, compiled to WebAssembly (`
 > - There is no real unlock, recovery or account system.
 > - Do not enter real secrets.
 
-## Build and run (loopback only)
+## Build and run (loopback by default)
 
 You need a Rust toolchain with the `wasm32-unknown-unknown` target, `wasm-bindgen-cli` 0.2.129 (must match the crate pin) and Node 24+.
 
@@ -17,6 +17,27 @@ npm run build:wasm     # cargo build --target wasm32 + wasm-bindgen → src/app/
 npm run build          # production build → dist/web/browser (strict template type checking)
 npm start              # serves dist/web/browser on http://127.0.0.1:4310 (loopback only)
 ```
+
+### Optional LAN preview (explicit HOST, plain HTTP)
+
+```sh
+HOST=192.168.50.100 node scripts/serve.mjs 4310   # one literal IP; default stays 127.0.0.1
+```
+
+`HOST` must be a single literal IP address. Hostnames and wildcard binds (`0.0.0.0`, `::`) are refused. The security headers (CSP, `nosniff`, `no-referrer`, COOP, `frame-ancestors 'none'`, `no-store`) are unchanged. The server only serves static build files: it has no API, never runs `op` and holds no secrets.
+
+`http://<LAN IP>` is **not a secure context**. Checked in Chromium against `http://192.168.50.100:4310`:
+
+| Feature | Over plain-HTTP LAN |
+|---|---|
+| `isSecureContext` | `false`; browsers show "Not secure" |
+| WebAssembly core, `crypto.getRandomValues` (generators, keys, encryption) | works |
+| IndexedDB, localStorage (preferences), BroadcastChannel | work, but storage is per origin: a vault saved at `http://192.168.50.100:4310` is separate from one at `http://127.0.0.1:4310` |
+| Clipboard API (Copy) | missing; Copy shows "The browser did not allow copying to the clipboard". Reveal still works |
+| `Cross-Origin-Opener-Policy` | ignored by the browser on untrustworthy origins (a console error says so) |
+| `crypto.subtle` | missing (not used by Keymesh) |
+
+Traffic is unencrypted. Anyone on the network can read the served app and could modify it in transit, for example by injecting script that reads an unlocked vault. Vault data never leaves the browser, but use synthetic data only and treat a LAN preview as a UI check, not a security boundary.
 
 ## Checks
 
@@ -32,6 +53,7 @@ npm run e2e            # Playwright, headless Chromium, real WASM, no request in
 - unsaved input, TOTP codes and keys preserved across switches, with unchanged vault bytes;
 - keyboard use, narrow viewports (320–390 px), corrupt or blocked preference storage, and CSP;
 - real pointer clicks on all seven New-item menu options (empty and one-item list, 1280×860/600/460, mobile) with clipping and hit-test checks, and ≥44px touch targets for the preference controls under touch emulation.
+- the Chinese option labelled 中文 (text, title and accessible name) in both locales, and Copy failing with a localized message when the Clipboard API is absent (plain-HTTP LAN origin).
 
 Screenshots: `KEYMESH_SCREENSHOT_DIR=/abs/dir npm run e2e` writes desktop screenshots for each locale × theme and mobile screenshots to that directory. `KEYMESH_SCREENSHOT=/abs/path.png` sets the M2 flow screenshot. Without these variables, screenshots go to the git-ignored `test-results/`. Keep screenshots out of the repository.
 

@@ -162,7 +162,7 @@ async function expectSingleLanguage(page: Page, locale: Locale, where: string) {
     expect(leaked, `English UI text in zh-TW at ${where}`).toEqual([]);
   } else {
     // The only Chinese an English page may show is the language option itself.
-    const rest = text.replaceAll('繁中', '').replaceAll('繁體中文', '');
+    const rest = text.replaceAll('中文', '');
     const cjk = rest.split('\n').filter((l) => CJK.test(l));
     expect(cjk, `Chinese UI text in en at ${where}`).toEqual([]);
     expect(ZH_FRAGMENTS.filter((f) => rest.includes(f))).toEqual([]);
@@ -378,7 +378,7 @@ test('keyboard: skip link, visible focus, preference controls, menu and dialog',
   await page.keyboard.press('Tab');
   await expect(page.locator('.skip-link')).toBeFocused();
   await page.keyboard.press('Tab');
-  await page.keyboard.press('Tab'); // globe icon is not focusable: 繁中, then EN
+  await page.keyboard.press('Tab'); // globe icon is not focusable: 中文, then EN
   const zhBtn = page.locator('[data-locale="zh-TW"]');
   await page.keyboard.press('Shift+Tab');
   await expect(zhBtn).toBeFocused();
@@ -684,3 +684,39 @@ for (const locale of ['zh-TW', 'en'] as const) {
     }
   });
 }
+
+for (const locale of ['zh-TW', 'en'] as const) {
+  test(`${locale}: the Chinese language option reads 中文 (visible, title and accessible name)`, async ({ browser }) => {
+    const context = await browser.newContext({ locale: locale === 'zh-TW' ? 'zh-TW' : 'en-US' });
+    const page = await context.newPage();
+    await page.goto('/');
+    await expect(page.locator('html')).toHaveAttribute('lang', locale);
+    const zh = page.locator('[data-locale="zh-TW"]');
+    await expect(zh).toHaveText('中文');
+    await expect(zh).toHaveAttribute('title', '中文');
+    await expect(zh).toHaveAttribute('lang', 'zh-TW');
+    await expect(page.getByRole('button', { name: '中文', exact: true })).toHaveCount(1);
+    await expect(page.locator('[data-locale="en"]')).toHaveText('EN');
+    await expect(page.getByRole('button', { name: 'English', exact: true })).toHaveCount(1);
+    for (const where of ['start', 'unlocked']) {
+      if (where === 'unlocked') await startFixtureVault(page);
+      const text = await ownedText(page);
+      expect(text, `old label at ${where}`).not.toContain('繁中');
+      expect(text, `old label at ${where}`).not.toContain('繁體中文');
+    }
+    await context.close();
+  });
+}
+
+test('copy fails with a localized clipboard message where the Clipboard API is missing (plain-HTTP LAN origin)', async ({ page }) => {
+  // Non-secure origins (e.g. http://<LAN IP>) have no navigator.clipboard.
+  await page.addInitScript(() => Object.defineProperty(Navigator.prototype, 'clipboard', { get: () => undefined }));
+  await page.goto('/');
+  await startFixtureVault(page);
+  await seed(page);
+  await openItem(page, 'Synthetic Mail');
+  const row = page.locator('km-secret-field', { hasText: en['field.password'] });
+  await row.getByRole('button', { name: en['secret.copy'] }).click();
+  await expect(page.locator('.detail')).toContainText(en['errors.clipboard']);
+  await expect(page.locator('.detail')).not.toContainText('SYNTH-pw-0001');
+});
