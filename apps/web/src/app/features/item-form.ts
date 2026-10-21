@@ -1,10 +1,14 @@
+import { NgTemplateOutlet } from '@angular/common';
 import { Component, OnInit, computed, inject, input, output, signal } from '@angular/core';
 import { errorKey } from '../core/errors';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { VaultService } from '../core/vault.service';
 import { CustomRow, FormModel, buildInput, emptyModel, modelFromView } from '../core/forms';
+import { PasswordSettings } from '../core/password-options';
 import { ItemKind, Summary } from '../core/types';
+import { GeneratedPassword } from '../shared/generated-password';
 import { Icon, KIND_ICONS } from '../shared/icon';
+import { PasswordOptionsPanel, passwordProblem } from '../shared/password-options';
 
 type TextKey = {
   [K in keyof FormModel]: FormModel[K] extends string ? K : never;
@@ -17,7 +21,7 @@ let nextForm = 0;
 
 @Component({
   selector: 'km-item-form',
-  imports: [Icon],
+  imports: [Icon, NgTemplateOutlet, PasswordOptionsPanel, GeneratedPassword],
   template: `
     <form class="item-form" novalidate (submit)="save($event)" [attr.aria-label]="formLabel()">
       <header class="form-head">
@@ -55,9 +59,11 @@ let nextForm = 0;
                 <button type="button" class="btn" [attr.aria-pressed]="showPw()" (click)="showPw.set(!showPw())">
                   <km-icon [name]="showPw() ? 'eyeOff' : 'eye'" /><span>{{ i18n.t(showPw() ? 'secret.hide' : 'form.show') }}</span>
                 </button>
-                <button type="button" class="btn" (click)="generate()"><km-icon name="dice" /><span>{{ i18n.t('form.generate') }}</span></button>
+<button type="button" class="btn" data-testid="open-generator" [attr.aria-expanded]="genOpen()" [attr.aria-controls]="uid + '-gen'"
+                  (click)="toggleGenerator()"><km-icon name="dice" /><span>{{ i18n.t('form.generate') }}</span></button>
               </div>
             </div>
+            <ng-container *ngTemplateOutlet="generator" />
             @if (editing()) {
               <label class="check"><input type="checkbox" (change)="clear('password', $event)" /> {{ i18n.t('form.removePassword') }}</label>
             }
@@ -85,13 +91,18 @@ let nextForm = 0;
           @case ('secret') {
             <div class="field">
               <label class="field-label" [for]="uid + '-secret'">{{ i18n.t('field.secretCredential') }}</label>
-              <input [id]="uid + '-secret'" name="secret" type="password" autocomplete="off" class="mono" [required]="!editing()"
-                [attr.aria-invalid]="!!shownErrors().secret" [attr.aria-describedby]="shownErrors().secret ? uid + '-secret-err' : null"
-                [placeholder]="editing() ? i18n.t('form.unchanged') : ''" [value]="m().secret" (input)="set('secret', $event)" />
+              <div class="input-group">
+                <input [id]="uid + '-secret'" name="secret" type="password" autocomplete="off" class="mono" [required]="!editing()"
+                  [attr.aria-invalid]="!!shownErrors().secret" [attr.aria-describedby]="shownErrors().secret ? uid + '-secret-err' : null"
+                  [placeholder]="editing() ? i18n.t('form.unchanged') : ''" [value]="m().secret" (input)="set('secret', $event)" />
+                <button type="button" class="btn" data-testid="open-generator" [attr.aria-expanded]="genOpen()" [attr.aria-controls]="uid + '-gen'"
+                  (click)="toggleGenerator()"><km-icon name="dice" /><span>{{ i18n.t('form.generate') }}</span></button>
+              </div>
               @if (shownErrors().secret; as e) {
                 <p class="field-error" [id]="uid + '-secret-err'"><km-icon name="alert" />{{ i18n.t(e) }}</p>
               }
             </div>
+            <ng-container *ngTemplateOutlet="generator" />
             <div class="field">
               <label class="field-label" [for]="uid + '-service'">{{ i18n.t('field.service') }}</label>
               <input [id]="uid + '-service'" name="service" [value]="m().service" (input)="set('service', $event)" />
@@ -249,6 +260,30 @@ let nextForm = 0;
         </button>
       </div>
     </form>
+    <ng-template #generator>
+    @if (genOpen()) {
+      <div class="gen-panel" [id]="uid + '-gen'" role="group" [attr.aria-label]="i18n.t('form.generateFor')"
+        data-testid="form-generator" (keydown.enter)="keepEnter($event)">
+        <p class="field-hint">{{ i18n.t('form.generatorHint') }}</p>
+        <km-password-options />
+        @if (candidate(); as c) {
+          <km-generated-password [value]="c" [label]="i18n.t('gen.pw.result')" />
+        }
+        @if (genError(); as e) {
+          <p class="field-error" role="alert"><km-icon name="alert" />{{ i18n.t(e) }}</p>
+        }
+        <div class="tool-actions">
+          <button type="button" class="btn" data-testid="form-generate" [disabled]="!!genProblem()" (click)="generateCandidate()">
+            <km-icon name="dice" /><span>{{ i18n.t('gen.preview') }}</span>
+          </button>
+          <button type="button" class="btn btn-primary" data-testid="form-use-password" [disabled]="!candidate()" (click)="useCandidate()">
+            <km-icon name="check" /><span>{{ i18n.t('form.usePassword') }}</span>
+          </button>
+          <button type="button" class="btn btn-ghost" data-testid="form-generator-cancel" (click)="closeGenerator()">{{ i18n.t('common.cancel') }}</button>
+        </div>
+      </div>
+    }
+    </ng-template>
   `,
 })
 export class ItemForm implements OnInit {
@@ -265,6 +300,12 @@ export class ItemForm implements OnInit {
   protected readonly error = signal<MessageKey | null>(null);
   protected readonly busy = signal(false);
   protected readonly showPw = signal(false);
+  private readonly pwSettings = inject(PasswordSettings);
+  /** Inline generator: a candidate only replaces the field on "Use this password". */
+  protected readonly genOpen = signal(false);
+  protected readonly candidate = signal<string | null>(null);
+  protected readonly genError = signal<MessageKey | null>(null);
+  protected readonly genProblem = computed(() => passwordProblem(this.vault, this.pwSettings.options()));
   /** Field errors appear after the first submit attempt, then update live. */
   private readonly submitted = signal(false);
   protected readonly editing = computed(() => this.editId() !== null);
@@ -340,13 +381,38 @@ export class ItemForm implements OnInit {
     this.m.update((m) => ({ ...m, custom: m.custom.filter((_, n) => n !== i) }));
   }
 
-  protected generate(): void {
+  protected toggleGenerator(): void {
+    if (this.genOpen()) this.closeGenerator();
+    else this.genOpen.set(true);
+  }
+
+  protected closeGenerator(): void {
+    this.genOpen.set(false);
+    this.candidate.set(null);
+    this.genError.set(null);
+  }
+
+  protected generateCandidate(): void {
+    this.genError.set(null);
+    this.candidate.set(null);
     try {
-      const pw = this.vault.generatePassword('default');
-      this.m.update((m) => ({ ...m, password: pw }));
+      this.candidate.set(this.vault.generatePasswordWith(this.pwSettings.options()));
     } catch (e) {
-      this.error.set(errorKey(e));
+      this.genError.set(errorKey(e));
     }
+  }
+
+  protected useCandidate(): void {
+    const value = this.candidate();
+    if (value === null) return;
+    const field = this.kind() === 'secret' ? 'secret' : 'password';
+    this.m.update((m) => ({ ...m, [field]: value }));
+    this.closeGenerator();
+  }
+
+  /** Enter in a settings field must not submit (and save) the item form. */
+  protected keepEnter(ev: Event): void {
+    if ((ev.target as HTMLElement).tagName === 'INPUT') ev.preventDefault();
   }
 
   protected async save(ev: Event): Promise<void> {

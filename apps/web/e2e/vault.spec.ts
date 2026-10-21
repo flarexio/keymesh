@@ -5,6 +5,7 @@
  */
 import { expect, Page, test } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { en } from '../src/app/core/i18n/en';
 import {
   M,
   RFC_URI,
@@ -113,15 +114,15 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
 
   // Generators: values created inside WASM and stored as encrypted items.
   await page.getByRole('button', { name: 'Generators' }).click();
-  await page.getByRole('button', { name: 'Generate & save as Secret' }).first().click();
+  await page.getByRole('button', { name: en['gen.saveAsSecret'] }).first().click();
   await expect(page.locator('#detail-title')).toHaveText('Generated password');
-  await expect(page.locator('.detail')).toContainText('generated locally (not provider-issued)');
+  await expect(page.locator('.detail')).toContainText(en['detail.originGenerated']);
   const genRow = page.locator('km-secret-field', { hasText: 'Secret' });
   await genRow.getByRole('button', { name: 'Reveal' }).click();
   // Revealed: exactly 24 non-space characters (default profile).
   await expect(genRow.getByTestId('secret-value')).toHaveText(/^\s*\S{24}\s*$/);
   await page.getByRole('button', { name: 'Generators' }).click();
-  await page.getByRole('button', { name: 'Generate & save as Secret' }).nth(1).click();
+  await page.getByRole('button', { name: en['gen.saveAsSecret'] }).nth(1).click();
   await expect(page.locator('#detail-title')).toHaveText('Generated secret');
   const hexRow = page.locator('km-secret-field', { hasText: 'Secret' });
   await hexRow.getByRole('button', { name: 'Reveal' }).click();
@@ -140,7 +141,7 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await field(page, 'Username').fill('synth-user-2');
   await page.getByRole('button', { name: 'Save changes' }).click();
   await expect(page.locator('#detail-title')).toHaveText(`${M.loginTitle} edited`);
-  await expect(page.locator('.detail')).toContainText('Revision 2');
+  await expect(page.getByTestId('item-meta')).toHaveAttribute('data-rev', '2');
   const pw2 = page.locator('km-secret-field', { hasText: 'Password' });
   await pw2.getByRole('button', { name: 'Reveal' }).click();
   await expect(pw2).toContainText(M.password);
@@ -188,7 +189,7 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await expect(page.getByRole('button', { name: 'Generators' })).toHaveCount(0);
 
   // Demo unlock (test-provider transition, not app identity).
-  await page.getByRole('button', { name: 'Unlock demo session' }).click();
+  await page.getByRole('button', { name: en['start.locked.unlock'], exact: true }).click();
   await expect(titles(page)).toHaveCount(9);
 
   // A mutation started immediately before lock is rejected, not applied.
@@ -200,14 +201,14 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
     (document.querySelector('[data-testid=lock]') as HTMLButtonElement).click();
   });
   await expect(page.getByRole('heading', { name: 'Vault locked' })).toBeVisible();
-  await page.getByRole('button', { name: 'Unlock demo session' }).click();
+  await page.getByRole('button', { name: en['start.locked.unlock'], exact: true }).click();
   await expect(page.locator('.item-list')).not.toContainText('SYNTHMARK-RACE');
   await expect(titles(page)).toHaveCount(9);
 
   // Persistence across reload (synthetic fixture key reopens).
   await page.reload();
-  await expect(page.getByRole('heading', { name: 'Stored demo vault found' })).toBeVisible();
-  await page.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
+  await expect(page.getByRole('heading', { name: en['start.stored.title'] })).toBeVisible();
+  await page.getByRole('button', { name: en['start.stored.open'] }).click();
   await expect(titles(page)).toHaveCount(9);
 
   // TOTP shows the code for the (controlled) current time.
@@ -247,7 +248,7 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
     ['unknown.keymesh', Buffer.from(backup.toString('utf8').replace('"version": 1', '"version": 9'))],
   ] as const) {
     await input.setInputFiles({ name, mimeType: 'application/octet-stream', buffer });
-    await expect(page.getByTestId('backup-error')).toContainText('Backup rejected, nothing was changed');
+    await expect(page.getByTestId('backup-error')).toContainText(en['errors.backupRejected']);
     expect((await storedBytes(page)).equals(afterDelete), `${name} must not overwrite`).toBe(true);
   }
   await page.getByRole('button', { name: 'Items' }).click();
@@ -280,7 +281,7 @@ test('second tab cannot clobber newer data', async ({ context }) => {
 
   const b = await context.newPage();
   await b.goto('/');
-  await b.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
+  await b.getByRole('button', { name: en['start.stored.open'] }).click();
   await expect(titles(b)).toHaveText(['Note from tab A']);
 
   // A writes; B is told its copy is stale and cannot write over it.
@@ -288,18 +289,18 @@ test('second tab cannot clobber newer data', async ({ context }) => {
   await field(a, 'Title').fill('Second note from tab A');
   await field(a, 'Note').fill('a2');
   await create(a, 'Second note from tab A');
-  await expect(b.getByRole('alert').filter({ hasText: 'changed elsewhere' })).toBeVisible();
+  await expect(b.getByRole('alert').filter({ hasText: 'changed in another tab or window' })).toBeVisible();
   await newItem(b, 'secure_note');
   await field(b, 'Title').fill('Note from stale tab B');
   await field(b, 'Note').fill('b');
   await b.getByRole('button', { name: 'Create' }).click();
-  await expect(b.getByTestId('form-error')).toContainText('changed elsewhere');
+  await expect(b.getByTestId('form-error')).toContainText('changed in another tab or window');
 
   // Storage still has A's data; B reloads and sees it.
-  await b.getByRole('button', { name: 'Reload from storage' }).click();
+  await b.getByRole('button', { name: en['shell.reload'] }).click();
   await expect(titles(b)).toHaveText(['Note from tab A', 'Second note from tab A']);
   await a.reload();
-  await a.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
+  await a.getByRole('button', { name: en['start.stored.open'] }).click();
   await expect(titles(a)).toHaveText(['Note from tab A', 'Second note from tab A']);
 });
 
@@ -312,7 +313,7 @@ test('second tab writing without the broadcast is rejected by compare-and-swap',
     (window as unknown as { BroadcastChannel: unknown }).BroadcastChannel = undefined;
   });
   await b2.goto('/');
-  await b2.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
+  await b2.getByRole('button', { name: en['start.stored.open'] }).click();
 
   await newItem(a, 'secure_note');
   await field(a, 'Title').fill('Written by A');
@@ -323,9 +324,9 @@ test('second tab writing without the broadcast is rejected by compare-and-swap',
   await field(b2, 'Title').fill('Written by stale B');
   await field(b2, 'Note').fill('b');
   await b2.getByRole('button', { name: 'Create' }).click();
-  await expect(b2.getByTestId('form-error')).toContainText('changed elsewhere');
-  await expect(b2.getByRole('alert').filter({ hasText: 'changed elsewhere' }).first()).toBeVisible();
-  await b2.getByRole('button', { name: 'Reload from storage' }).click();
+  await expect(b2.getByTestId('form-error')).toContainText('changed in another tab or window');
+  await expect(b2.getByRole('alert').filter({ hasText: 'changed in another tab or window' }).first()).toBeVisible();
+  await b2.getByRole('button', { name: en['shell.reload'] }).click();
   await expect(titles(b2)).toHaveText(['Written by A']);
 });
 
@@ -350,8 +351,8 @@ test('wrong-key backup is refused and ephemeral vaults are not recoverable after
 
   // After reload the ephemeral key is gone: honest message, no open button.
   await p.reload();
-  await expect(p.getByRole('alert')).toContainText('can no longer be decrypted');
-  await expect(p.getByRole('button', { name: /Open with synthetic fixture key/ })).toHaveCount(0);
+  await expect(p.getByRole('alert')).toContainText('can no longer be opened and cannot be recovered');
+  await expect(p.getByTestId('open-fixture')).toHaveCount(0);
   await eph.close();
 
   // A fixture-key vault refuses the ephemeral backup and keeps its data.
@@ -365,7 +366,7 @@ test('wrong-key backup is refused and ephemeral vaults are not recoverable after
   const before = await storedBytes(q);
   await q.getByRole('button', { name: 'Backup' }).click();
   await q.getByTestId('restore-input').setInputFiles(ephBackup);
-  await expect(q.getByTestId('backup-error')).toContainText('Backup rejected');
+  await expect(q.getByTestId('backup-error')).toContainText(en['errors.backupRejected']);
   expect((await storedBytes(q)).equals(before)).toBe(true);
   await q.getByRole('button', { name: 'Items' }).click();
   await expect(titles(q)).toHaveText(['Fixture note']);
@@ -394,8 +395,8 @@ async function addNote(page: Page, title: string) {
 
 async function openFixture(page: Page) {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
-  await expect(page.getByTestId('key-mode')).toContainText('synthetic-fixture');
+  await page.getByRole('button', { name: en['start.stored.open'] }).click();
+  await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'synthetic-fixture');
 }
 
 /** A tab that never receives cross-tab notifications. */
@@ -438,7 +439,7 @@ test('lock during a pending restore wins: nothing installed or persisted', async
   await expect(page.getByRole('heading', { name: 'Vault locked' })).toBeVisible();
   expect(await page.content()).not.toContain('Kept note');
   expect((await storedBytes(page)).equals(before)).toBe(true);
-  await page.getByRole('button', { name: 'Unlock demo session' }).click();
+  await page.getByRole('button', { name: en['start.locked.unlock'], exact: true }).click();
   await expect(titles(page)).toHaveCount(0);
 });
 
@@ -451,14 +452,14 @@ test('stale tab restore is rejected (notification delivered)', async ({ context 
   await downloadBackup(b, backupPath);
 
   await addNote(a, 'Newer note from A');
-  await expect(b.getByRole('alert').filter({ hasText: 'changed elsewhere' })).toBeVisible();
+  await expect(b.getByRole('alert').filter({ hasText: 'changed in another tab or window' })).toBeVisible();
   const afterA = await storedBytes(a);
   await b.getByRole('button', { name: 'Backup' }).click();
   await b.getByTestId('restore-input').setInputFiles(backupPath);
   await expect(b.getByTestId('backup-error')).toContainText('out of date');
   expect((await storedBytes(a)).equals(afterA)).toBe(true);
   await a.reload();
-  await a.getByRole('button', { name: 'Open with synthetic fixture key (test harness)' }).click();
+  await a.getByRole('button', { name: en['start.stored.open'] }).click();
   await expect(titles(a)).toHaveText(['Newer note from A']);
 });
 
@@ -473,12 +474,12 @@ test('stale tab restore is rejected by compare-and-swap (notification missed)', 
   await addNote(a, 'Newer note from A');
   const afterA = await storedBytes(a);
   // B never heard about A's write and still looks editable.
-  await expect(b.getByRole('alert').filter({ hasText: 'changed elsewhere' })).toHaveCount(0);
+  await expect(b.getByRole('alert').filter({ hasText: 'changed in another tab or window' })).toHaveCount(0);
   await b.getByRole('button', { name: 'Backup' }).click();
   await b.getByTestId('restore-input').setInputFiles(backupPath);
-  await expect(b.getByTestId('backup-error')).toContainText('changed elsewhere');
+  await expect(b.getByTestId('backup-error')).toContainText('changed in another tab or window');
   expect((await storedBytes(a)).equals(afterA)).toBe(true);
-  await expect(b.getByRole('alert').filter({ hasText: 'changed elsewhere' }).first()).toBeVisible();
+  await expect(b.getByRole('alert').filter({ hasText: 'changed in another tab or window' }).first()).toBeVisible();
 });
 
 test('reused revision after a restore cannot be clobbered by a deaf stale tab', async ({ context }, testInfo) => {
@@ -490,14 +491,14 @@ test('reused revision after a restore cannot be clobbered by a deaf stale tab', 
 
   const b = await deafPage(context);
   await openFixture(b); // B holds revision 2, bytes R
-  await expect(b.getByTestId('key-mode')).toContainText('rev 2');
+  await expect(b.getByTestId('key-mode')).toHaveAttribute('data-revision', '2');
 
   await a.getByRole('button', { name: 'Backup' }).click();
   await a.getByTestId('restore-input').setInputFiles(rev1); // back to revision 1
   await expect(a.getByTestId('backup-status')).toHaveText('Backup restored.');
   await a.getByRole('button', { name: 'Items' }).click();
   await addNote(a, 'Y'); // revision 2 again, different bytes
-  await expect(a.getByTestId('key-mode')).toContainText('rev 2');
+  await expect(a.getByTestId('key-mode')).toHaveAttribute('data-revision', '2');
   const afterA = await storedBytes(a);
 
   // Same vault id and revision as B's view — only exact bytes differ.
@@ -505,9 +506,9 @@ test('reused revision after a restore cannot be clobbered by a deaf stale tab', 
   await field(b, 'Title').fill('Z from stale B');
   await field(b, 'Note').fill('z');
   await b.getByRole('button', { name: 'Create' }).click();
-  await expect(b.getByTestId('form-error')).toContainText('changed elsewhere');
+  await expect(b.getByTestId('form-error')).toContainText('changed in another tab or window');
   expect((await storedBytes(a)).equals(afterA)).toBe(true);
-  await b.getByRole('button', { name: 'Reload from storage' }).click();
+  await b.getByRole('button', { name: en['shell.reload'] }).click();
   await expect(titles(b)).toHaveText(['Y']);
 });
 
@@ -529,7 +530,7 @@ test('initial restore into empty storage', async ({ browser }, testInfo) => {
     mimeType: 'application/octet-stream',
     buffer: Buffer.from('garbage'),
   });
-  await expect(q.getByRole('alert')).toContainText('Backup rejected');
+  await expect(q.getByRole('alert')).toContainText(en['errors.backupRejected']);
   expect((await storedBytes(q)).length).toBe(0);
   await q.getByTestId('initial-restore-input').setInputFiles(path);
   await expect(titles(q)).toHaveText(['Restored note']);

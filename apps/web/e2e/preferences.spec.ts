@@ -184,8 +184,17 @@ async function checkAllScreens(page: Page, locale: Locale) {
   await expect(page.locator('form [aria-invalid=true]').first()).toBeVisible();
   await expectSingleLanguage(page, locale, 'form validation');
   await page.getByTestId('nav-generators').click();
-  await page.locator('.tool-card').first().locator('button', { hasText: locale === 'en' ? 'Preview' : '預覽' }).click();
+  await page.getByTestId('generate-password').click();
+  await expect(page.getByTestId('generated-password')).toBeVisible();
+  await page.locator('.more-options summary').first().click();
   await expectSingleLanguage(page, locale, 'generators');
+  await page.locator('[name=pw-lowercase]').uncheck();
+  await page.locator('[name=pw-uppercase]').uncheck();
+  await page.locator('[name=pw-symbols]').uncheck();
+  await page.locator('[name=pw-digits]').uncheck();
+  await expect(page.getByTestId('password-options-error')).toBeVisible();
+  await expectSingleLanguage(page, locale, 'generator settings error');
+  await page.locator('[name=pwPreset]').selectOption('default');
   await page.getByTestId('nav-backup').click();
   await page.getByTestId('restore-input').setInputFiles({
     name: 'garbage.keymesh',
@@ -364,11 +373,14 @@ test('switching language/theme keeps unsaved input, selection, TOTP and keys; va
   await setLocale(page, 'zh-TW');
   await expect(page.locator('#gen-secret-title')).toHaveValue('My synthetic token');
   await expect(page.locator('#gen-pw-title')).toHaveValue(zhTW['gen.pw.defaultTitle']);
-  await page.locator('.tool-card').first().locator('button', { hasText: '預覽' }).click();
-  const preview = await page.getByTestId('password-preview').innerText();
+  await page.getByTestId('generate-password').click();
+  const gen = page.getByTestId('generated-password');
+  await gen.getByRole('button', { name: zhTW['secret.reveal'] }).click();
+  const preview = await page.getByTestId('generated-value').innerText();
   await setLocale(page, 'en');
   await setTheme(page, 'dark');
-  await expect(page.getByTestId('password-preview')).toHaveText(preview);
+  // Compared in-page so a failure never prints the generated value.
+  expect((await page.getByTestId('generated-value').innerText()) === preview).toBe(true);
   await expect(page.locator('#gen-pw-title')).toHaveValue(en['gen.pw.defaultTitle']);
 });
 
@@ -516,7 +528,7 @@ test('corrupt and unavailable preference storage fall back safely', async ({ bro
   await expectTheme(q, 'dark');
   await setLocale(q, 'zh-TW');
   await startFixtureVault(q);
-  await expect(q.locator('[data-testid=key-mode]')).toContainText('synthetic-fixture');
+  await expect(q.locator('[data-testid=key-mode]')).toHaveAttribute('data-key-mode', 'synthetic-fixture');
   await b.close();
   expect(errors).toEqual([]);
 });

@@ -129,8 +129,8 @@ interface PlainField {
           </section>
         }
 
-        <p class="item-meta" data-testid="item-meta">
-          {{ i18n.t('detail.meta', { rev: v.rev, date: i18n.dateTime(v.updated_at * 1000) }) }}
+        <p class="item-meta" data-testid="item-meta" [attr.data-rev]="v.rev">
+          {{ i18n.t('detail.meta', { date: i18n.dateTime(v.updated_at * 1000) }) }}
           @if (v.imported) {
             · {{ i18n.t('detail.imported') }}
           }

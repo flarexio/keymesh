@@ -1,9 +1,12 @@
-import { Component, inject, output, signal } from '@angular/core';
+import { Component, computed, inject, output, signal } from '@angular/core';
 import { errorKey } from '../core/errors';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
+import { PasswordSettings } from '../core/password-options';
 import { VaultService } from '../core/vault.service';
 import { ToastService } from '../shared/feedback';
+import { GeneratedPassword } from '../shared/generated-password';
 import { Icon } from '../shared/icon';
+import { PasswordOptionsPanel, passwordProblem } from '../shared/password-options';
 
 type TitleField = 'pw' | 'secret' | 'key';
 
@@ -16,14 +19,15 @@ const DEFAULT_TITLES: Record<TitleField, MessageKey> = {
 /**
  * Generators run in the Rust core (OS CSPRNG via `crypto.getRandomValues`).
  * "Save" actions generate the value *inside* WASM and store it directly as an
- * encrypted item; the preview is only for copying elsewhere.
+ * encrypted item; a generated password shown here is masked by default and
+ * only for copying elsewhere.
  *
  * Default titles follow the language until the user edits them; edited
  * values are never replaced by a language switch.
  */
 @Component({
   selector: 'km-generators',
-  imports: [Icon],
+  imports: [Icon, PasswordOptionsPanel, GeneratedPassword],
   template: `
     <div class="page">
       <header class="page-head">
@@ -31,26 +35,24 @@ const DEFAULT_TITLES: Record<TitleField, MessageKey> = {
         <p class="lead">{{ i18n.t('gen.lead') }}</p>
       </header>
       <div class="card-grid">
-        <section class="card tool-card" aria-labelledby="gen-pw">
+        <section class="card tool-card tool-card-wide" aria-labelledby="gen-pw">
           <h3 id="gen-pw" class="card-title"><km-icon name="key" />{{ i18n.t('gen.pw.title') }}</h3>
-          <div class="field">
-            <label class="field-label" for="gen-profile">{{ i18n.t('gen.pw.profile') }}</label>
-            <select id="gen-profile" [value]="profile()" (change)="profile.set(value($event))">
-              <option value="default">{{ i18n.t('gen.pw.default') }}</option>
-              <option value="strong">{{ i18n.t('gen.pw.strong') }}</option>
-            </select>
-          </div>
+          <km-password-options />
           <div class="field">
             <label class="field-label" for="gen-pw-title">{{ i18n.t('gen.savedTitle') }}</label>
             <input id="gen-pw-title" [value]="title('pw')" (input)="setTitle('pw', $event)" />
           </div>
-          <div class="tool-actions">
-            <button type="button" class="btn" (click)="previewPassword()">{{ i18n.t('gen.preview') }}</button>
-            <button type="button" class="btn btn-primary" (click)="savePassword()"><km-icon name="plus" /><span>{{ i18n.t('gen.saveAsSecret') }}</span></button>
-          </div>
           @if (shown()['pw']; as v) {
-            <p class="mono preview" data-testid="password-preview">{{ v }}</p>
+            <km-generated-password [value]="v" [label]="i18n.t('gen.pw.result')" />
           }
+          <div class="tool-actions">
+            <button type="button" class="btn" data-testid="generate-password" [disabled]="!!pwProblem()" (click)="previewPassword()">
+              <km-icon name="dice" /><span>{{ i18n.t('gen.preview') }}</span>
+            </button>
+            <button type="button" class="btn btn-primary" data-testid="save-password" [disabled]="!!pwProblem()" (click)="savePassword()"
+              aria-describedby="gen-pw-save-hint"><km-icon name="plus" /><span>{{ i18n.t('gen.saveAsSecret') }}</span></button>
+          </div>
+          <p id="gen-pw-save-hint" class="field-hint">{{ i18n.t('gen.pw.saveHint') }}</p>
         </section>
 
         <section class="card tool-card" aria-labelledby="gen-secret">
@@ -122,7 +124,8 @@ export class Generators {
   readonly created = output<string>();
   protected readonly shown = signal<Record<string, string>>({});
   protected readonly error = signal<MessageKey | null>(null);
-  protected readonly profile = signal('default');
+  private readonly pw = inject(PasswordSettings);
+  protected readonly pwProblem = computed(() => passwordProblem(this.vault, this.pw.options()));
   protected readonly bytes = signal('32');
   protected readonly encoding = signal('hex');
   protected readonly comment = signal('');
@@ -153,8 +156,10 @@ export class Generators {
 
   protected previewPassword(): void {
     this.error.set(null);
+    // Drop the previous value first, so a failure never leaves it on screen.
+    this.shown.update(({ pw: _old, ...rest }) => rest);
     try {
-      const v = this.vault.generatePassword(this.profile() === 'strong' ? 'strong' : 'default');
+      const v = this.vault.generatePasswordWith(this.pw.options());
       this.shown.update((s) => ({ ...s, pw: v }));
     } catch (e) {
       this.report(e);
@@ -183,7 +188,7 @@ export class Generators {
   }
 
   protected savePassword(): Promise<void> {
-    return this.done(this.vault.generatePasswordItem(this.title('pw'), this.profile(), ''), 'gen.pw.saved');
+    return this.done(this.vault.generatePasswordItem(this.title('pw'), this.pw.options(), ''), 'gen.pw.saved');
   }
 
   protected saveSecret(): Promise<void> {

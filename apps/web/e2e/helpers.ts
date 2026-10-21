@@ -2,6 +2,7 @@
  * Shared E2E helpers. SYNTHETIC DATA ONLY; the real build and real WASM core.
  */
 import { expect, Page } from '@playwright/test';
+import { en } from '../src/app/core/i18n/en';
 
 /** Planted markers: must never appear in storage or exported bytes. */
 export const M = {
@@ -60,10 +61,10 @@ export async function browserStorageSummary(page: Page) {
 
 export async function start(page: Page, mode: 'ephemeral' | 'synthetic-fixture') {
   await page.goto('/');
-  await expect(page.getByTestId('demo-banner')).toContainText('NOT PRODUCTION');
+  await expect(page.getByTestId('demo-banner')).toContainText(en['demo.label']);
   await page.locator(`input[name=mode][value=${mode}]`).check();
-  await page.getByRole('button', { name: 'Start demo vault' }).click();
-  await expect(page.getByTestId('key-mode')).toContainText(mode);
+  await page.getByTestId('start-vault').click();
+  await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', mode);
 }
 
 export async function newItem(page: Page, kind: string) {

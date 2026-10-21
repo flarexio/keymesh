@@ -1,6 +1,6 @@
 # Keymesh web UI design notes (M3)
 
-The browser demo aims to look and feel like a calm, trustworthy security tool: warm neutral light surfaces, graphite dark surfaces, one restrained indigo accent, clear hierarchy and no marketing styling. The synthetic-demo warning stays visible in every state.
+The browser demo aims to look and feel like a calm, trustworthy security tool: warm neutral light surfaces, graphite dark surfaces, one restrained indigo accent, clear hierarchy and no marketing styling. The preview warning ("Preview version. Do not store real passwords.") stays visible in every state.
 
 Sources: `apps/web/src/styles/` (`tokens.css`, `base.css`, `layout.css`, `components.css`) and `apps/web/src/app/shared/`.
 
@@ -39,7 +39,8 @@ No remote fonts, images or icon fonts are loaded. Icons are a small local stroke
 - **Buttons:** primary (filled accent, one per area), secondary (outlined), ghost, and destructive (outlined in red; a filled red confirm only inside the confirmation dialog). Icon and text together; icon-only buttons carry an `aria-label` and a `title`.
 - **Segmented controls** (language, appearance) show the selected option as a raised chip with a border and a heavier weight, not by colour alone, and expose `aria-pressed`. Language options are written in their own language: 中文 (locale `zh-TW`, Traditional Chinese, Taiwan) / EN, with accessible names 中文 / English.
 - **Forms:** visible labels bound with `for`/`id`, and hints linked through `aria-describedby`. Validation runs on submit and then live: `aria-invalid`, a red border plus an icon and a message, and focus moves to the first invalid field. Native browser validation bubbles are disabled (`novalidate`) because they would appear in the browser's language, not the app's.
-- **Secrets** are masked by default with explicit Reveal/Hide (`aria-pressed`) and Copy. They are revealed as text content only and hidden again after 30 s or on lock.
+- **Secrets** are masked by default with explicit Reveal/Hide (`aria-pressed`) and Copy. They are revealed as text content only and hidden again after 30 s or on lock. Newly generated passwords follow the same rule.
+- **Password settings** (`shared/password-options.ts`): a preset select (Default, Strong, Custom), a length slider paired with a number box, four type checkboxes, an "Allowed symbols" field shown only while Symbols is on, and "More options" (look-alike characters, one of each type) behind a disclosure. Problems appear as one plain sentence that says what to change; Generate and Save stay disabled until it is fixed. No bit counts or strength meters are shown. In the Login and Secret forms the same panel opens inline from Generate: generate, check, then "Use this password". Cancel leaves the field as it was, and Enter in a settings field never submits the item form.
 - **Destructive actions** (delete item, discard stored vault) use an in-app modal `<dialog>` with a danger icon, a plain-language consequence and Cancel focused first. Escape cancels; locking closes it.
 - **Popups:** the New-item menu is `position: fixed`, placed from its button's viewport rect, so no scrolling/clipping pane can cut it off. It opens down or up (whichever fits), is capped to the viewport with its own scroll, and closes on resize, outside scroll, outside click, Escape or Tab. The confirmation dialog uses the native modal top layer; toasts are viewport-fixed.
 - **Touch:** on `pointer: coarse`, buttons, nav items, menu items and the language/appearance segments are at least 44×44px. That rule sits last in `components.css` so later component rules cannot shrink it; E2E measures it at 320 and 390px in both locales.
@@ -49,6 +50,9 @@ No remote fonts, images or icon fonts are loaded. Icons are a small local stroke
 
 ## Writing and translation
 
+- Write for people managing credentials: name the goal and the result, not the mechanism. Implementation terms (Rust, WASM, IndexedDB, envelopes, compare-and-swap, key-provider names) belong in `docs/ARCHITECTURE.md`, not on screen. Keep technical terms people need to choose or use something: TOTP, Ed25519, OpenSSH, Base32, otpauth://, hex/base64url, `op`.
+- Limitations stay visible and plain: "Preview version. Do not store real passwords." (預覽版本，請勿存放真實密碼。), no recovery, data loss on reload for "This session only", and failed or blocked saves, each with its consequence and next step. Never claim production safety, audits or guaranteed security.
+
 - Catalog keys are grouped by area (`start.*`, `list.*`, `detail.*`, `field.*`, `form.*`, `errors.*`, …). Add a key to `en.ts` first; the build fails until `zh-tw.ts` has it too.
 - zh-TW uses Taiwan terminology: 保險庫, 項目, 金鑰, 登入資訊, 產生器, 匯入, 備份, 還原, 設定, 檔案, 剪貼簿 and so on. A unit test rejects common Simplified-only characters.
-- Technical identifiers stay as they are in both languages: TOTP, Ed25519, OpenSSH, otpauth://, Base32, hex/base64url, WASM, IndexedDB, CLI, `op`. User data is never translated.
+- Technical identifiers stay as they are in both languages: TOTP, Ed25519, OpenSSH, otpauth://, Base32, hex/base64url, CLI, `op`. User data is never translated.

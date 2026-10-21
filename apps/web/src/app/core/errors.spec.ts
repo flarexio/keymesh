@@ -42,6 +42,14 @@ describe('errorKey', () => {
       ['TOTP error: HOTP is not supported', 'errors.totpSetup'],
       ['invalid generator policy: secret size must be 16..=1024 bytes', 'errors.secretSize'],
       ['invalid generator policy: unknown encoding', 'errors.generatorPolicy'],
+      ['invalid generator policy: length must be 8..=128', 'errors.pwLength'],
+      ['invalid generator policy: select at least one character class', 'errors.pwNoClass'],
+      ['invalid generator policy: symbol set is empty', 'errors.pwSymbolsEmpty'],
+      ['invalid generator policy: symbol set is too long (at most 64 characters)', 'errors.pwSymbolsLong'],
+      ['invalid generator policy: symbol set may only contain ASCII punctuation', 'errors.pwSymbolChars'],
+      ['invalid generator policy: character class is empty', 'errors.pwClassEmpty'],
+      ['invalid generator policy: policy entropy below 64 bits', 'errors.pwWeak'],
+      ['invalid generator policy: malformed password options', 'errors.generatorPolicy'],
       ['item not found', 'errors.notFound'],
     ];
     for (const [message, key] of cases) expect(errorKey(new Error(message)), message).toBe(key);

@@ -43,12 +43,12 @@ Traffic is unencrypted. Anyone on the network can read the served app and could 
 
 ```sh
 npm run typecheck      # app, unit-test and e2e TypeScript configs
-npm test               # Vitest: forms, IndexedDB CAS, vault lock/restore races, preferences, i18n catalogs, error mapping
+npm test               # Vitest: forms, IndexedDB CAS, vault lock/restore races, preferences, password settings, i18n catalogs, error mapping
 npx playwright install chromium   # once, user-local
 npm run e2e            # Playwright, headless Chromium, real WASM, no request interception
 ```
 
-`e2e/vault.spec.ts` holds the M2 vault and security regressions. `e2e/preferences.spec.ts` covers language and appearance:
+`e2e/vault.spec.ts` holds the M2 vault and security regressions. `e2e/password-options.spec.ts` covers password settings in both languages: presets → Custom, slider and number input, custom symbols, look-alike exclusion, friendly validation (weak, no type, bad symbols, length), real WASM output checked for exact length, allowed set and one of each type (as booleans, so failures never print a value), apply/cancel in the Login and Secret forms, an encrypted round trip, and phone widths. `e2e/preferences.spec.ts` covers language and appearance:
 - both locales × all three theme preferences under a controlled OS scheme, live OS changes, and reload;
 - unsaved input, TOTP codes and keys preserved across switches, with unchanged vault bytes;
 - keyboard use, narrow viewports (320–390 px), corrupt or blocked preference storage, and CSP;
@@ -73,7 +73,8 @@ Screenshots: `KEYMESH_SCREENSHOT_DIR=/abs/dir npm run e2e` writes desktop screen
 | `public/preferences-boot.js` | Same rules applied before first paint (same-origin script, no inline JS) |
 | `src/app/core/i18n/` | `en.ts` (source, defines `MessageKey`), `zh-tw.ts`, `I18n` service |
 | `src/app/core/errors.ts` | Error → localized message key; unknown errors never shown raw |
-| `src/app/shared/` | Icons, display preferences control, confirmation dialog, toasts |
+| `src/app/core/password-options.ts` | Password settings model, Default/Strong presets, shared session settings |
+| `src/app/shared/` | Icons, display preferences, password settings panel, masked generated value, confirmation dialog, toasts |
 | `src/styles/` | Design tokens and global styles; see `docs/DESIGN.md` |
 
 See `docs/ARCHITECTURE.md` (Browser demo) for key handling, locking, the cross-tab policy and limitations.

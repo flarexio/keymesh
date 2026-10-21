@@ -223,6 +223,19 @@ impl VaultSession {
             .map_err(err)
     }
 
+    /// `options` is JSON `PasswordOptions` (see `passwordPolicySummary`).
+    #[wasm_bindgen(js_name = generatePasswordItemWithOptions)]
+    pub fn generate_password_item_with_options(
+        &mut self,
+        title: &str,
+        options: &str,
+        service: &str,
+    ) -> Result<String, JsError> {
+        self.inner
+            .generate_password_item_with(title, options, service)
+            .map_err(err)
+    }
+
     /// Encrypt the next revision; persist `bytes`, then call `commit`.
     pub fn seal(&mut self, key: &DemoKeyProvider) -> Result<SealedVault, JsError> {
         let (bytes, revision) = self.inner.seal(&key.inner).map_err(err)?;
@@ -250,6 +263,23 @@ pub fn generate_password(profile: &str, length: u32, alphabet: &str) -> Result<S
         .map_err(err)?
         .expose()
         .to_owned())
+}
+
+/// Password from JSON `PasswordOptions` `{length, lowercase, uppercase,
+/// digits, symbols, symbolSet, excludeAmbiguous, requireEachClass}`.
+#[wasm_bindgen(js_name = generatePasswordWithOptions)]
+pub fn generate_password_with_options(options: &str) -> Result<String, JsError> {
+    Ok(bridge::gen_password_with(options)
+        .map_err(err)?
+        .expose()
+        .to_owned())
+}
+
+/// Validate `PasswordOptions` without generating; JSON `{length,
+/// alphabetSize, classes, upperBoundBits}` (bits = theoretical upper bound).
+#[wasm_bindgen(js_name = passwordPolicySummary)]
+pub fn password_policy_summary(options: &str) -> Result<String, JsError> {
+    json(&bridge::password_policy_summary(options).map_err(err)?)
 }
 
 #[wasm_bindgen(js_name = generateRandomSecret)]

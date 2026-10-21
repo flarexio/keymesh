@@ -74,6 +74,14 @@ Public metadata is limited to the header plus item ids and revisions. The item c
 * `uniform_index` uses rejection sampling over u32 draws, so there is no modulo bias.
 * Passwords: profiles `default` (24 characters) and `strong` (32 characters) over lower/upper/digits/symbols with every class required. When classes are required, one character is drawn per class, the rest come from the union, and then an unbiased Fisher–Yates shuffle runs. No retry loop is used. A custom allowlist is deduplicated, and control or whitespace characters are rejected.
 * Policies are rejected when they have empty classes, a length outside 8..=1024, a length shorter than the number of required classes, or an estimated entropy below 64 bits.
+* **User settings (`PasswordOptions`).** `{length, lowercase, uppercase, digits, symbols, symbolSet, excludeAmbiguous, requireEachClass}` becomes a policy through `PasswordPolicy::from_options`. Each selected type stays its own class, so "use each selected type at least once" keeps its meaning (no concatenated allowlist). Everything is validated before any random number is drawn:
+  * length 8..=128 (the UI range, which also bounds the work per request);
+  * at least one type selected;
+  * when symbols are on, the symbol set holds 1–64 characters and only printable ASCII punctuation. Letters, digits, spaces, control characters and other scripts are refused, so the symbol field cannot re-enable a type the user turned off. Duplicates are removed and never add weight. When symbols are off the field is ignored;
+  * "avoid look-alike characters" removes `Il1O0o`; a type left empty is an error;
+  * the 64-bit floor above still applies. Nothing is added or lengthened to make a policy pass: digits-only needs at least 20 characters, lowercase-only at least 14.
+* `PasswordPolicy::summary()` reports length, alphabet size and `length × log2(alphabet)`. That number is only a theoretical upper bound (forcing one character per type makes the output slightly non-uniform). It is used for validation and is deliberately not shown in the UI.
+* WASM: `generatePasswordWithOptions(json)`, `passwordPolicySummary(json)` (validates, no RNG) and `VaultSession.generatePasswordItemWithOptions(title, json, service)` (generated and stored inside WASM). The JSON is strict: unknown, missing or wrongly typed fields and input over 2 KiB are refused.
 * Random secrets default to 32 bytes (256 bits), with an explicit encoding (hex, base64url or base32). They are local random values, not provider-issued credentials.
 * RNG failure returns `Error::Rng`. There is no fallback.
 * Passphrases are **pending**: no reviewed, versioned wordlist is bundled.
@@ -148,7 +156,7 @@ Angular (apps/web)  ── JSON views / masked slots ──▶  keymesh-wasm (wa
 * `get` returns an item view with non-secret fields plus *slots* for secret fields: password, recovery codes, secret, wallet secrets, note body, notes, concealed custom fields, and the TOTP setup secret.
 * A slot's plaintext crosses only through `reveal(id, slot)`, used by the Reveal and Copy buttons. Revealed text is rendered as text content, never as an attribute, and is hidden again after 30 seconds or on lock.
 * Ed25519 seeds are never revealable. Only the public key, in hex and as an OpenSSH line, is exposed, and there is no signing API.
-* Generated passwords, random secrets and Ed25519 keys can be created and stored entirely inside WASM. Password preview, and the Generate button in the login form, return the value to the UI on purpose.
+* Generated passwords, random secrets and Ed25519 keys can be created and stored entirely inside WASM. A password generated on the Generators page, or inside the Login/Secret form, is returned to the UI on purpose. It is shown masked with explicit Reveal/Copy, and it reaches a form field only when the user chooses "Use this password". Cancel discards it and leaves the field unchanged.
 * The core's error messages contain no secret values, and item-input parse errors are reported generically, because serde messages can quote input. The UI never shows raw error text anyway: `apps/web/src/app/core/errors.ts` maps known conditions to localized messages and everything else to a generic "something went wrong" (see *Language and appearance*).
 
 ### Key providers (DEVELOPMENT ONLY)
@@ -204,6 +212,8 @@ The key is never exported to JavaScript and never appears in the URL, storage, c
 * **Appearance:** `system` (default), `light` or `dark`. `system` follows `prefers-color-scheme`, including live OS changes; an explicit choice overrides the OS until `system` is chosen again. Colours are `light-dark()` tokens driven by `color-scheme`, so native controls, scrollbars, dialogs and toasts follow the same theme. Without JavaScript the OS preference applies.
 * **Default language:** the first `navigator.languages` entry that is Chinese (any `zh*` → `zh-TW`) or English; otherwise English.
 * **Persistence:** only an explicit choice is saved, as `{"locale","theme"}` JSON under `localStorage["keymesh.settings.v1"]`. Missing, corrupt or partially invalid values fall back per field; blocked or full storage keeps the choice for the current page and shows a note. `<html lang>`, `data-theme` and the document title are kept in sync.
+* **Password settings** are shared by the Generators page and the Login/Secret forms for the current page session (`PasswordSettings`). They are non-secret but deliberately not persisted. Choosing Default or Strong fills every setting; any later change switches the preset to Custom without re-applying preset rules. Changing settings never generates, regenerates or saves anything.
+* **Product copy.** Normal screens describe what the user can do and what happens, in plain language: they do not mention Rust, WASM, IndexedDB, compare-and-swap, envelopes or key-provider names. The technical facts behind that copy are documented here: the "This session only" vault type is the `ephemeral` provider, "Reopen after reload (test key)" is `synthetic-fixture`, and "Load latest version" is the stale-tab reload. Tests target the stable `data-key-mode`, `data-revision` and `data-rev` attributes instead.
 * See `docs/DESIGN.md` for tokens and UI conventions.
 
 ### Limitations

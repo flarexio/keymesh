@@ -173,6 +173,11 @@
 .tool-card {
   display: grid;
   gap: var(--space-3);
+  min-width: 0;
+}
+
+.tool-card-wide {
+  grid-column: 1 / -1;
 }
 
 .tool-actions {
@@ -1149,6 +1154,99 @@ km-secret-field .field-error {
   }
 }
 
+/* ---- Password settings and generated values ---- */
+
+.pw-options,
+.check-group {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.check-group {
+  gap: var(--space-2);
+}
+
+.check-group > legend {
+  padding: 0;
+  margin-bottom: var(--space-2);
+}
+
+.pw-options-top {
+  display: grid;
+  align-items: start;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  gap: var(--space-4);
+}
+
+.length-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.length-row input[type='range'] {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  accent-color: var(--accent);
+}
+
+.length-row .length-input {
+  flex: none;
+  width: 5.5rem;
+}
+
+.check-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr));
+  gap: var(--space-2) var(--space-4);
+}
+
+.more-options summary {
+  width: fit-content;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.more-options-body {
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+.gen-panel {
+  display: grid;
+  gap: var(--space-4);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+
+/* Label above; value and actions share the next row (wrapping when narrow). */
+.secret-row.generated {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-1) var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.secret-row.generated .secret-label {
+  grid-column: 1 / -1;
+  font-size: var(--text-sm);
+}
+
 /* ---- Narrow ---- */
 
 @media (max-width: 860px) {
@@ -1188,6 +1286,10 @@ km-secret-field .field-error {
     margin-top: var(--space-1);
   }
 
+  .secret-row.generated {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .custom-row {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1225,6 +1327,13 @@ km-secret-field .field-error {
 
   .btn-icon,
   .icon-btn {
+    min-height: 2.75rem;
+  }
+
+  .check,
+  .more-options summary {
+    display: flex;
+    align-items: center;
     min-height: 2.75rem;
   }
 }

@@ -23,12 +23,6 @@ import { Icon } from '../shared/icon';
           @case ('stored') {
             <span class="state-icon"><km-icon name="archive" /></span>
             <h2 id="start-title">{{ i18n.t('start.stored.title') }}</h2>
-            <dl class="meta-grid">
-              <dt>{{ i18n.t('common.revision') }}</dt>
-              <dd class="mono">{{ vault.stored()?.revision }}</dd>
-              <dt>{{ i18n.t('start.stored.keyId') }}</dt>
-              <dd class="mono">{{ vault.stored()?.kek_id }}</dd>
-            </dl>
             @if (vault.storedNeedsLostKey()) {
               <div class="callout callout-danger" role="alert">
                 <km-icon name="alert" />
@@ -85,8 +79,8 @@ import { Icon } from '../shared/icon';
       <aside class="card start-aside" aria-labelledby="limits-title">
         <h3 id="limits-title" class="section-label">{{ i18n.t('start.limits.title') }}</h3>
         <ul class="check-list">
-          <li><km-icon name="check" /><span>{{ i18n.t('start.limits.wasm') }}</span></li>
-          <li><km-icon name="check" /><span>{{ i18n.t('start.limits.storage') }}</span></li>
+          <li><km-icon name="check" /><span>{{ i18n.t('start.limits.local') }}</span></li>
+          <li><km-icon name="check" /><span>{{ i18n.t('start.limits.encrypted') }}</span></li>
           <li class="no"><km-icon name="x" /><span>{{ i18n.t('start.limits.noAuth') }}</span></li>
           <li class="no"><km-icon name="x" /><span>{{ i18n.t('start.limits.noRecovery') }}</span></li>
           <li class="no"><km-icon name="x" /><span>{{ i18n.t('start.limits.noReal') }}</span></li>

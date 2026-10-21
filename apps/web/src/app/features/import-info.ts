@@ -21,7 +21,6 @@ keymesh import-op preview --account "&lt;account&gt;" --ref "op://&lt;vault&gt;/
           <li class="no"><km-icon name="x" /><span>{{ i18n.t('import.noBrowser') }}</span></li>
           <li class="no"><km-icon name="x" /><span>{{ i18n.t('import.noCredentials') }}</span></li>
           <li><km-icon name="info" /><span>{{ i18n.t('import.separate') }}</span></li>
-          <li><km-icon name="info" /><span>{{ i18n.t('import.fixtureOnly') }}</span></li>
         </ul>
       </section>
     </div>

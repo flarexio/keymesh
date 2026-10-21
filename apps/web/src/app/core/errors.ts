@@ -29,6 +29,13 @@ const CORE_PATTERNS: [RegExp, MessageKey][] = [
   [/^TOTP error: (empty Base32 secret|invalid Base32 secret|secret)/, 'errors.totpSecret'],
   [/^TOTP error/, 'errors.totpSetup'],
   [/^invalid generator policy: secret size/, 'errors.secretSize'],
+  [/^invalid generator policy: length must be/, 'errors.pwLength'],
+  [/^invalid generator policy: select at least one character class/, 'errors.pwNoClass'],
+  [/^invalid generator policy: symbol set is empty/, 'errors.pwSymbolsEmpty'],
+  [/^invalid generator policy: symbol set is too long/, 'errors.pwSymbolsLong'],
+  [/^invalid generator policy: symbol set may only contain/, 'errors.pwSymbolChars'],
+  [/^invalid generator policy: character class is empty/, 'errors.pwClassEmpty'],
+  [/^invalid generator policy: policy entropy below/, 'errors.pwWeak'],
   [/^invalid generator policy/, 'errors.generatorPolicy'],
   [/^item not found/, 'errors.notFound'],
 ];

@@ -9,7 +9,8 @@
 use keymesh::crypto::{EphemeralKeyProvider, Key256, KeyProvider};
 use keymesh::ed25519::Ed25519KeyPair;
 use keymesh::generate::{
-    generate_password, generate_secret, PasswordPolicy, PasswordProfile, SecretEncoding,
+    generate_password, generate_secret, PasswordOptions, PasswordPolicy, PasswordProfile,
+    PolicySummary, SecretEncoding,
 };
 use keymesh::model::{
     Contact, CryptoWalletRecord, CustomField, Ed25519KeyRecord, FieldKind, Item, ItemData, ItemId,
@@ -919,6 +920,27 @@ impl Session {
         Ok(self.vm()?.insert(item)?.to_string())
     }
 
+    /// Like [`Session::generate_password_item`], with user settings
+    /// (validated before any random number is drawn).
+    pub fn generate_password_item_with(
+        &mut self,
+        title: &str,
+        options_json: &str,
+        service: &str,
+    ) -> Result<String> {
+        let pw = generate_password(&parse_password_options(options_json)?, &mut OsRandom)?;
+        let data = ItemData::Secret(SecretCredential {
+            secret: pw,
+            format: SecretFormat::Text,
+            origin: SecretOrigin::Generated,
+            username: None,
+            service: text(Some(service.into())),
+            expires_at: None,
+        });
+        let item = self.new_item(title.into(), data)?;
+        Ok(self.vm()?.insert(item)?.to_string())
+    }
+
     /// Seal the next revision without changing the session. The caller
     /// persists the bytes and then calls [`Session::commit`].
     ///
@@ -988,6 +1010,29 @@ pub fn gen_password(profile: &str, length: usize, alphabet: &str) -> Result<Secr
         PasswordPolicy::allowlist(length, alphabet)?
     };
     generate_password(&pol, &mut OsRandom)
+}
+
+/// Largest accepted password-options JSON; bounds parsing work.
+pub const MAX_OPTIONS_JSON: usize = 2048;
+
+/// Strict JSON `PasswordOptions` (camelCase, no unknown or missing fields)
+/// to a validated policy.
+pub fn parse_password_options(json: &str) -> Result<PasswordPolicy> {
+    if json.len() > MAX_OPTIONS_JSON {
+        return Err(Error::Policy("password options too large".into()));
+    }
+    let o: PasswordOptions = serde_json::from_str(json)
+        .map_err(|_| Error::Policy("malformed password options".into()))?;
+    PasswordPolicy::from_options(&o)
+}
+
+pub fn gen_password_with(options_json: &str) -> Result<SecretString> {
+    generate_password(&parse_password_options(options_json)?, &mut OsRandom)
+}
+
+/// Validate settings and describe them; draws no random numbers.
+pub fn password_policy_summary(options_json: &str) -> Result<PolicySummary> {
+    Ok(parse_password_options(options_json)?.summary())
 }
 
 pub fn gen_secret(n_bytes: usize, encoding: &str) -> Result<SecretString> {
@@ -1275,6 +1320,89 @@ mod tests {
         let eb = persist(&mut se, &e);
         assert!(Session::open(&eb, &DemoKey::ephemeral().unwrap()).is_err());
         assert!(Session::open(&eb, &e).is_ok());
+    }
+
+    fn opts(j: serde_json::Value) -> String {
+        let mut base = serde_json::json!({
+            "length": 24, "lowercase": true, "uppercase": true, "digits": true, "symbols": true,
+            "symbolSet": "!#$%&()*+,-./:;<=>?@[]^_{|}~", "excludeAmbiguous": false, "requireEachClass": true
+        });
+        for (k, v) in j.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        base.to_string()
+    }
+
+    #[test]
+    fn password_options_api_is_strict_and_typed() {
+        let pw = gen_password_with(&opts(serde_json::json!({"length": 40, "lowercase": false,
+            "symbolSet": "#@!", "excludeAmbiguous": true})))
+        .unwrap();
+        let s = pw.expose();
+        assert_eq!(s.chars().count(), 40);
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || "#@!".contains(c)));
+        assert!(!s.chars().any(|c| "Il1O0o".contains(c)));
+        // Unknown, missing, wrongly typed or oversized options are refused.
+        let mut extra: serde_json::Value =
+            serde_json::from_str(&opts(serde_json::json!({}))).unwrap();
+        extra["alphabet"] = "ab".into();
+        assert!(gen_password_with(&extra.to_string()).is_err());
+        let mut missing = extra.clone();
+        missing.as_object_mut().unwrap().remove("alphabet");
+        missing.as_object_mut().unwrap().remove("requireEachClass");
+        assert!(gen_password_with(&missing.to_string()).is_err());
+        assert!(gen_password_with(&opts(serde_json::json!({"length": 24.5}))).is_err());
+        assert!(gen_password_with(&opts(serde_json::json!({"length": -1}))).is_err());
+        assert!(gen_password_with(&opts(serde_json::json!({"symbols": "yes"}))).is_err());
+        let huge = opts(serde_json::json!({"symbolSet": "!".repeat(MAX_OPTIONS_JSON)}));
+        assert!(gen_password_with(&huge)
+            .unwrap_err()
+            .to_string()
+            .contains("too large"));
+        assert!(
+            gen_password_with(&opts(serde_json::json!({"symbolSet": "ab"})))
+                .unwrap_err()
+                .to_string()
+                .contains("ASCII punctuation")
+        );
+    }
+
+    #[test]
+    fn password_policy_summary_validates_without_generating() {
+        let s = password_policy_summary(&opts(serde_json::json!({"symbolSet": "!!@@"}))).unwrap();
+        assert_eq!((s.length, s.alphabet_size, s.classes), (24, 64, 4));
+        assert!(
+            password_policy_summary(&opts(serde_json::json!({"length": 8})))
+                .unwrap_err()
+                .to_string()
+                .contains("entropy")
+        );
+    }
+
+    #[test]
+    fn generated_password_item_uses_the_options_and_round_trips() {
+        let (k, mut s) = session();
+        let o = opts(
+            serde_json::json!({"length": 30, "lowercase": false, "uppercase": false,
+            "symbols": false, "digits": true}),
+        );
+        let id = s
+            .generate_password_item_with("Synthetic PIN-like", &o, "svc")
+            .unwrap();
+        let bytes = persist(&mut s, &k);
+        let s2 = Session::open(&bytes, &DemoKey::fixture()).unwrap();
+        let pw = s2.reveal(&id, "secret").unwrap();
+        assert_eq!(pw.chars().count(), 30);
+        assert!(pw.chars().all(|c| c.is_ascii_digit()));
+        // Invalid options change nothing.
+        let before = s2.list("", "").unwrap().len();
+        let mut s3 = s2;
+        assert!(s3
+            .generate_password_item_with("x", &opts(serde_json::json!({"length": 8})), "")
+            .is_err());
+        assert_eq!(s3.list("", "").unwrap().len(), before);
     }
 
     #[test]

@@ -12,7 +12,7 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | AEAD encryption (XChaCha20-Poly1305), versioned envelope, AAD binding | ✅ | KEK → random DEK; per-item records plus an encrypted manifest; see `docs/ARCHITECTURE.md` |
 | Key-provider port | ✅ | Ephemeral (tests) and **synthetic demo** (CLI env var) only |
 | Atomic local persistence, load/edit/save, encrypted backup/restore | ✅ | Fails closed on a wrong key, corruption, truncation or an unknown format; lost-update guard |
-| Password generator (24 default / 32 strong, custom allowlist, unbiased sampling) | ✅ | |
+| Password generator (24 default / 32 strong presets, custom length 8–128, character types, custom ASCII-punctuation symbol set, look-alike exclusion, one-of-each-type; unbiased sampling) | ✅ | Same 64-bit policy floor for custom settings |
 | Random 256-bit secrets (hex / base64url / base32) | ✅ | Local random values, not provider-issued credentials |
 | Passphrase generator | ⏳ pending | No reviewed, versioned wordlist bundled |
 | Ed25519 generation, storage, RFC 8032 vectors, OpenSSH public-key line | ✅ | No signing API; no private-key export formats |
