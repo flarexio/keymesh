@@ -29,6 +29,8 @@ export const DEFAULT_SYMBOLS = '!#$%&()*+,-./:;<=>?@[]^_{|}~';
 export const LENGTH_MIN = 8;
 export const LENGTH_MAX = 128;
 export const SYMBOL_SET_MAX = 64;
+/** Largest symbol text kept in stored settings (and accepted by the input). */
+export const SYMBOL_TEXT_STORE_MAX = 256;
 
 const ALL_TYPES = {
   lowercase: true,
@@ -58,14 +60,13 @@ export function sameOptions(a: PasswordOptions, b: PasswordOptions): boolean {
   return OPTION_KEYS.every((k) => Object.is(a[k], b[k]));
 }
 
-/** ASCII punctuation only, like the core; at most SYMBOL_SET_MAX characters. */
-function validSymbolSet(v: string): boolean {
-  return [...v].length <= SYMBOL_SET_MAX && /^[!-/:-@[-`{-~]*$/.test(v);
-}
-
-/** Exact shape and basic ranges; the core decides whether a policy is usable. */
+/**
+ * Exact shape and basic ranges, plus a bound on the stored symbol text. The
+ * core decides whether a policy is usable; like the core, symbol text is not
+ * judged while Symbols is off (it is kept unchanged for when it is turned on).
+ */
 function wellFormed(o: PasswordOptions): boolean {
-  return clientProblem(o) === null && validSymbolSet(o.symbolSet);
+  return clientProblem(o) === null && [...o.symbolSet].length <= SYMBOL_TEXT_STORE_MAX;
 }
 
 /** Separate from display preferences; never holds generated values. */

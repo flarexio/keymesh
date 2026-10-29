@@ -335,6 +335,48 @@ for (const locale of ['zh-TW', 'en'] as const) {
   });
 }
 
+for (const locale of ['zh-TW', 'en'] as const) {
+  test(`${locale}: hidden symbol text doesn't block saving: invalid or overlong symbols, disable, edit length, reload`, async ({ browser }) => {
+    const t = catalog(locale);
+    const { context, page, errors } = await openVault(browser, locale);
+    await page.getByTestId('nav-generators').click();
+    const card = pwCard(page);
+    const reopen = async () => {
+      await page.reload();
+      await page.getByRole('button', { name: t['start.stored.open'] }).click();
+      await page.getByTestId('nav-generators').click();
+    };
+    for (const [text, key, length] of [
+      ['abc', 'errors.pwSymbolChars', '40'],
+      ['!'.repeat(65), 'errors.pwSymbolsLong', '41'],
+    ] as const) {
+      await card.locator('[name=pw-symbols]').check();
+      await card.locator('[name=pwLength]').fill('32');
+      await card.locator('[name=pwSymbolSet]').fill(text);
+      await expect(card.getByTestId('password-options-error')).toHaveText(t[key]);
+      // Turning Symbols off makes the settings valid (the core ignores unused text).
+      await card.locator('[name=pw-symbols]').uncheck();
+      await card.locator('[name=pwLength]').fill(length);
+      await expect(card.getByTestId('password-options-error')).toHaveCount(0);
+      await page.getByTestId('generate-password').click();
+      const shown = await revealIn(card, t);
+      expect([...shown].length === Number(length) && [...shown].every((c) => /[A-Za-z0-9]/.test(c))).toBe(true);
+
+      await reopen();
+      await expect(card.locator('[name=pwLength]')).toHaveValue(length);
+      await expect(card.locator('[name=pw-symbols]')).not.toBeChecked();
+      // The user's symbol text was kept, not replaced; turning Symbols back on
+      // shows the same problem again.
+      await card.locator('[name=pw-symbols]').check();
+      await expect(card.locator('[name=pwSymbolSet]')).toHaveValue(text);
+      await expect(card.getByTestId('password-options-error')).toHaveText(t[key]);
+      await card.getByRole('button', { name: t['pwopt.symbolReset'] }).click();
+    }
+    expect(errors).toEqual([]);
+    await context.close();
+  });
+}
+
 test('blocked Web Storage: settings work for the page session, no errors', async ({ browser }) => {
   const context = await browser.newContext();
   await context.addInitScript(() => {

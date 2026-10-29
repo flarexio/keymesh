@@ -8,6 +8,7 @@ import {
   PasswordOptions,
   PasswordPreset,
   PasswordSettings,
+  SYMBOL_TEXT_STORE_MAX,
   clientProblem,
 } from '../core/password-options';
 import { VaultService } from '../core/vault.service';
@@ -76,7 +77,7 @@ let nextId = 0;
         <div class="field">
           <label class="field-label" [for]="uid + '-symbols'">{{ i18n.t('pwopt.symbolSet') }}</label>
           <div class="input-group">
-            <input [id]="uid + '-symbols'" name="pwSymbolSet" class="mono" autocomplete="off" spellcheck="false" autocapitalize="off"
+            <input [id]="uid + '-symbols'" name="pwSymbolSet" class="mono" autocomplete="off" spellcheck="false" autocapitalize="off" [maxLength]="symbolTextMax"
               [value]="o().symbolSet" (input)="setSymbols($event)" [attr.aria-describedby]="uid + '-symbols-hint'"
               [attr.aria-invalid]="symbolProblem()" />
             <button type="button" class="btn" [disabled]="o().symbolSet === defaultSymbols" (click)="settings.update({ symbolSet: defaultSymbols })">
@@ -111,6 +112,7 @@ export class PasswordOptionsPanel {
   protected readonly min = LENGTH_MIN;
   protected readonly max = LENGTH_MAX;
   protected readonly defaultSymbols = DEFAULT_SYMBOLS;
+  protected readonly symbolTextMax = SYMBOL_TEXT_STORE_MAX;
   protected readonly o = this.settings.options;
   protected readonly moreOpen = signal(false);
   /** What the user is typing in the number box (may be briefly invalid). */

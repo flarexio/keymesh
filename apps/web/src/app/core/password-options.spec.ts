@@ -10,6 +10,7 @@ import {
   PASSWORD_PRESETS,
   PASSWORD_SETTINGS_KEY,
   PasswordSettings,
+  SYMBOL_TEXT_STORE_MAX,
   clientProblem,
   parsePasswordSettings,
   sameOptions,
@@ -19,7 +20,8 @@ import { PREFERENCE_STORAGE } from './preferences';
 /**
  * Stand-in for the core's policy check (the real one runs in WASM and is
  * exercised end to end): rejects digits-only below 20 characters, like the
- * core, and an enabled empty symbol set.
+ * core, and enabled symbol sets that are empty, too long or not ASCII
+ * punctuation (disabled symbol text is ignored, as in the core).
  */
 function fakeVault() {
   return {
@@ -28,7 +30,12 @@ function fakeVault() {
     checkPasswordOptions(o: { length: number; lowercase: boolean; uppercase: boolean; digits: boolean; symbols: boolean; symbolSet: string }) {
       this.checks++;
       if (!this.coreReady()) throw new Error('core not loaded');
+      // Like the core: symbol text is checked only while Symbols is on.
       if (o.symbols && o.symbolSet === '') throw new Error('invalid generator policy: symbol set is empty');
+      if (o.symbols && [...o.symbolSet].length > 64) throw new Error('invalid generator policy: symbol set is too long');
+      if (o.symbols && !/^[!-/:-@[-`{-~]+$/.test(o.symbolSet)) {
+        throw new Error('invalid generator policy: symbol set may only contain ASCII punctuation');
+      }
       if (o.digits && !o.lowercase && !o.uppercase && !o.symbols && o.length < 20) {
         throw new Error('invalid generator policy: policy entropy below 64 bits');
       }
@@ -234,9 +241,8 @@ describe('PasswordSettings persistence (non-secret settings only)', () => {
       JSON.stringify({ preset: 'custom', options: { ...custom, length: 129 } }),
       JSON.stringify({ preset: 'custom', options: { ...custom, length: '40' } }),
       JSON.stringify({ preset: 'custom', options: { ...custom, digits: 'yes' } }),
-      JSON.stringify({ preset: 'custom', options: { ...custom, symbolSet: 'abc' } }),
-      JSON.stringify({ preset: 'custom', options: { ...custom, symbolSet: '！' } }),
-      JSON.stringify({ preset: 'custom', options: { ...custom, symbolSet: '!'.repeat(65) } }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, symbolSet: 'x'.repeat(SYMBOL_TEXT_STORE_MAX + 1) } }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, symbols: false, symbolSet: 7 } }),
       JSON.stringify({ preset: 'custom', options: { ...custom, lowercase: false, uppercase: false, digits: false, symbols: false } }),
       JSON.stringify({ preset: 'custom', options: { ...custom, password: 'SYNTH' } }),
       JSON.stringify({ preset: 'weird', options: custom }),
@@ -248,6 +254,36 @@ describe('PasswordSettings persistence (non-secret settings only)', () => {
       expect(s.preset()).toBe('default');
       expect(s.options()).toEqual(PASSWORD_PRESETS.default);
     }
+  });
+
+  it('enabled symbol sets the core rejects are ignored on load', () => {
+    for (const symbolSet of ['abc', '！', '!'.repeat(65)]) {
+      const raw = JSON.stringify({ preset: 'custom', options: { ...custom, symbolSet } });
+      storage.data.set(PASSWORD_SETTINGS_KEY, raw);
+      expect(make().options()).toEqual(PASSWORD_PRESETS.default);
+    }
+  });
+
+  it('disabled symbol text is ignored like the core: invalid edit, disable Symbols, edit length, reload', () => {
+    for (const text of ['abc', '!'.repeat(65), 'x'.repeat(SYMBOL_TEXT_STORE_MAX)]) {
+      storage.clear();
+      const s = make();
+      s.update({ length: 32 });
+      s.update({ symbolSet: text }); // rejected while Symbols is on: not saved
+      expect(parsePasswordSettings(storage.getItem(PASSWORD_SETTINGS_KEY))?.options.symbolSet).toBe(PASSWORD_PRESETS.default.symbolSet);
+      s.update({ symbols: false }); // now accepted by the core
+      s.update({ length: 40 });
+      const again = make();
+      expect(again.options()).toMatchObject({ length: 40, symbols: false });
+      expect(again.options().symbolSet).toBe(text); // the user's text is kept, not replaced
+    }
+  });
+
+  it('symbol text longer than the storage bound is not saved (the input enforces the bound)', () => {
+    const s = make();
+    s.update({ length: 30 });
+    s.update({ symbols: false, symbolSet: 'x'.repeat(SYMBOL_TEXT_STORE_MAX + 1), length: 31 });
+    expect(parsePasswordSettings(storage.getItem(PASSWORD_SETTINGS_KEY))?.options.length).toBe(30);
   });
 
   it('a preset label that no longer matches its settings becomes Custom', () => {
