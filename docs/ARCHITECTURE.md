@@ -29,7 +29,7 @@ Native-only parts are behind the default `native` feature. `cargo check --lib --
 KeyProvider (KEK, 256-bit)  ──wraps──▶  per-vault DEK (256-bit, random)  ──encrypts──▶  items + manifest
 ```
 
-* The KEK comes from a `KeyProvider`. M1 ships only `EphemeralKeyProvider` (tests) and `SyntheticDemoKeyProvider` (CLI, key from `KEYMESH_DEMO_KEY`). Neither stores a key next to the vault. **Production unlock (passphrase KDF, OS keystore, hardware) and recovery are not designed yet.**
+* The KEK comes from a `KeyProvider`. M1 ships only `EphemeralKeyProvider` (tests) and `SyntheticDemoKeyProvider` (CLI, key from `KEYMESH_DEMO_KEY`). Neither stores a key next to the vault. **Production unlock and recovery are not implemented.** A proposed design (key slots: Argon2id password, recovery key, optional passkey PRF, later device enrolment; secure-context delivery; no migration of demo vaults) is in `docs/adr/0001-unlock-and-recovery.md`.
 * The DEK is random. `Vault::rotate_data_key` replaces it, and the next save re-encrypts everything.
 * Ed25519 keys stored in the vault are item data. They are never used as or derived from the KEK/DEK.
 
