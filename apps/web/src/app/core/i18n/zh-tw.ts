@@ -273,6 +273,7 @@ export const zhTW: Record<MessageKey, string> = {
   'errors.unexpected': '發生錯誤，未變更任何資料。請再試一次。',
   'errors.cancelled': '保險庫已鎖定或被取代，因此操作已取消。',
   'errors.locked': '保險庫已鎖定。',
+  'errors.lockedAfterSave': '變更儲存後保險庫隨即被鎖定，解鎖後即可看到。',
   'errors.noStoredVault': '找不到已儲存的保險庫。',
   'errors.ephemeralKeyLost': '此保險庫所屬的瀏覽器工作階段已結束，已無法開啟。',
   'errors.restoreNotAllowed': '必須在保險庫已解鎖或儲存空間為空時才能還原。',

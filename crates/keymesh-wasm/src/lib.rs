@@ -319,7 +319,9 @@ pub fn generate_password_with_options(options: &str) -> Result<String, JsError> 
 }
 
 /// Validate `PasswordOptions` without generating; JSON `{length,
-/// alphabetSize, classes, upperBoundBits}` (bits = theoretical upper bound).
+/// alphabetSize, classes, upperBoundBits, minEntropyBits}`. The floor is
+/// checked against `minEntropyBits` (exact min-entropy of the output);
+/// `upperBoundBits` is only a theoretical upper bound.
 #[wasm_bindgen(js_name = passwordPolicySummary)]
 pub fn password_policy_summary(options: &str) -> Result<String, JsError> {
     json(&bridge::password_policy_summary(options).map_err(err)?)

@@ -27,7 +27,8 @@ pub const AMBIGUOUS: &str = "Il1O0o";
 
 pub const MIN_LENGTH: usize = 8;
 pub const MAX_LENGTH: usize = 1024;
-/// Minimum estimated entropy (length × log2(alphabet)) a policy must reach.
+/// Minimum min-entropy (see [`PasswordPolicy::min_entropy_bits`]) a policy
+/// must reach.
 pub const MIN_ENTROPY_BITS: f64 = 64.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,9 +95,42 @@ pub struct PolicySummary {
     pub alphabet_size: usize,
     pub classes: usize,
     /// `length × log2(alphabet_size)`: a theoretical upper bound. Forcing one
-    /// character per class makes the output slightly non-uniform, so this is
-    /// not the exact or guaranteed entropy.
+    /// character per class makes the output non-uniform, so this is not the
+    /// exact or guaranteed entropy and is never used for validation.
     pub upper_bound_bits: f64,
+    /// Exact min-entropy of the generator's output distribution (−log2 of the
+    /// probability of the most likely password); the floor is checked
+    /// against this. A lower bound on Shannon entropy.
+    pub min_entropy_bits: f64,
+}
+
+/// Min-entropy, in bits, of [`generate_password`] for disjoint classes of
+/// `sizes`, `length` characters, and whether one character per class is
+/// forced.
+///
+/// Derivation (one forced draw from each of the k classes, then L−k draws
+/// from the whole alphabet of N characters, then a uniform shuffle): a
+/// password w is produced by exactly those shuffles that put, for every class
+/// i, one of the n_i(w) class-i positions of w first in slot i, and the rest
+/// anywhere: ∏ n_i(w) · (L−k)! of the L! orders. Hence
+///
+/// P(w) = ∏ n_i(w) · (L−k)!/L! · ∏ 1/s_i · N^−(L−k)
+///
+/// which is largest when the counts n_i are as even as possible
+/// (∏ n_i ≤ (q+1)^r · q^(k−r) with L = qk + r). Without forced classes the
+/// output is uniform and the value is L·log2 N.
+pub fn min_entropy_bits(sizes: &[usize], length: usize, require_each_class: bool) -> f64 {
+    let n: usize = sizes.iter().sum();
+    let log2 = |x: usize| (x as f64).log2();
+    if !require_each_class {
+        return length as f64 * log2(n);
+    }
+    let k = sizes.len();
+    let (q, r) = (length / k, length % k);
+    let max_counts = r as f64 * log2(q + 1) + (k - r) as f64 * log2(q);
+    let orders: f64 = (length - k + 1..=length).map(log2).sum();
+    let forced: f64 = sizes.iter().copied().map(log2).sum();
+    orders - max_counts + forced + (length - k) as f64 * log2(n)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,7 +260,9 @@ impl PasswordPolicy {
         if n < 2 {
             return Err(Error::Policy("alphabet needs at least 2 characters".into()));
         }
-        if self.entropy_bits() < MIN_ENTROPY_BITS {
+        // The uniform estimate overstates forced-class output; check the
+        // generator's real worst case instead.
+        if self.min_entropy_bits() < MIN_ENTROPY_BITS {
             return Err(Error::Policy(format!(
                 "policy entropy below {MIN_ENTROPY_BITS} bits"
             )));
@@ -244,7 +280,14 @@ impl PasswordPolicy {
             alphabet_size: self.alphabet_len(),
             classes: self.classes.len(),
             upper_bound_bits: self.entropy_bits(),
+            min_entropy_bits: self.min_entropy_bits(),
         }
+    }
+
+    /// Exact min-entropy of this policy's output; see [`min_entropy_bits`].
+    pub fn min_entropy_bits(&self) -> f64 {
+        let sizes: Vec<usize> = self.classes.iter().map(Vec::len).collect();
+        min_entropy_bits(&sizes, self.length, self.require_each_class)
     }
 
     /// Upper-bound estimate assuming uniform selection from the alphabet.
@@ -517,7 +560,15 @@ mod tests {
             ..all.clone()
         })
         .contains("entropy"));
-        assert!(PasswordPolicy::from_options(&PasswordOptions { length: 10, ..all }).is_ok());
+        // Ten characters of all four types reach a 63.6-bit upper bound only
+        // via the uniform estimate; the real output has less (min-entropy
+        // 63.58 bits), so it is refused. Eleven passes (70.2 bits).
+        assert!(policy_err(&PasswordOptions {
+            length: 10,
+            ..all.clone()
+        })
+        .contains("entropy"));
+        assert!(PasswordPolicy::from_options(&PasswordOptions { length: 11, ..all }).is_ok());
     }
 
     #[test]
@@ -613,5 +664,159 @@ mod tests {
     #[test]
     fn passphrase_is_explicitly_pending() {
         assert!(generate_passphrase().is_err());
+    }
+
+    /// Exact distribution of `generate_password` for tiny policies, by
+    /// enumerating every pre-shuffle draw and every (uniform) permutation.
+    fn brute_force_max_probability(sizes: &[usize], length: usize, require: bool) -> f64 {
+        use std::collections::HashMap;
+        // Characters are (class, index) pairs; the alphabet is all of them.
+        let all: Vec<(usize, usize)> = sizes
+            .iter()
+            .enumerate()
+            .flat_map(|(c, &n)| (0..n).map(move |i| (c, i)))
+            .collect();
+        let k = if require { sizes.len() } else { 0 };
+        let mut prefixes: Vec<(Vec<(usize, usize)>, f64)> = vec![(vec![], 1.0)];
+        for slot in 0..length {
+            let mut next = Vec::new();
+            for (seq, p) in &prefixes {
+                let choices: Vec<(usize, usize)> = match sizes.get(slot) {
+                    Some(&n) if slot < k => (0..n).map(|i| (slot, i)).collect(),
+                    _ => all.clone(),
+                };
+                for ch in &choices {
+                    let mut s2 = seq.clone();
+                    s2.push(*ch);
+                    next.push((s2, p / choices.len() as f64));
+                }
+            }
+            prefixes = next;
+        }
+        fn perms(n: usize) -> Vec<Vec<usize>> {
+            if n == 0 {
+                return vec![vec![]];
+            }
+            let mut out = Vec::new();
+            for p in perms(n - 1) {
+                for i in 0..=p.len() {
+                    let mut q = p.clone();
+                    q.insert(i, n - 1);
+                    out.push(q);
+                }
+            }
+            out
+        }
+        let ps = perms(length);
+        let mut dist: HashMap<Vec<(usize, usize)>, f64> = HashMap::new();
+        for (seq, p) in &prefixes {
+            for perm in &ps {
+                let out: Vec<_> = perm.iter().map(|&i| seq[i]).collect();
+                *dist.entry(out).or_default() += p / ps.len() as f64;
+            }
+        }
+        let total: f64 = dist.values().sum();
+        assert!((total - 1.0).abs() < 1e-9);
+        dist.values().copied().fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn min_entropy_formula_matches_the_exact_output_distribution() {
+        for (sizes, length, require) in [
+            (vec![1, 2], 4, true),
+            (vec![1, 1], 3, true),
+            (vec![2, 3], 4, true),
+            (vec![1, 1, 3], 5, true),
+            (vec![1, 4], 5, true),
+            (vec![2, 3], 4, false),
+            (vec![3], 4, true),
+        ] {
+            let exact = -brute_force_max_probability(&sizes, length, require).log2();
+            let formula = min_entropy_bits(&sizes, length, require);
+            assert!(
+                (exact - formula).abs() < 1e-9,
+                "{sizes:?} L={length} require={require}: exact {exact} vs {formula}"
+            );
+            let n: usize = sizes.iter().sum();
+            // Never above the uniform upper bound.
+            assert!(formula <= length as f64 * (n as f64).log2() + 1e-9);
+        }
+    }
+
+    #[test]
+    fn floor_uses_min_entropy_not_the_uniform_upper_bound() {
+        // Reviewer's case: 11 characters, all four types, symbols "!" only.
+        // Upper bound 65.75 bits, but the most likely outputs carry < 64.
+        let o = PasswordOptions {
+            length: 11,
+            symbol_set: "!".into(),
+            ..PasswordOptions::preset(PasswordProfile::Default)
+        };
+        let s = PolicySummary {
+            length: 11,
+            alphabet_size: 63,
+            classes: 4,
+            upper_bound_bits: 11.0 * 63f64.log2(),
+            min_entropy_bits: min_entropy_bits(&[26, 26, 10, 1], 11, true),
+        };
+        assert!(s.upper_bound_bits > 64.0 && s.min_entropy_bits < 64.0);
+        assert!(policy_err(&o).contains("entropy"));
+        // Same settings without "one of each type": uniform, 65.75 bits, allowed.
+        let p = PasswordPolicy::from_options(&PasswordOptions {
+            require_each_class: false,
+            ..o.clone()
+        })
+        .unwrap();
+        assert!((p.min_entropy_bits() - 11.0 * 63f64.log2()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn highly_skewed_classes_need_more_length() {
+        // Lowercase plus a single required symbol: the forced symbol adds no
+        // randomness and its position little, so the floor needs extra length.
+        let skew = |n| PasswordOptions {
+            lowercase: true,
+            symbols: true,
+            symbol_set: "!".into(),
+            require_each_class: true,
+            ..custom(n)
+        };
+        let accepted: Vec<usize> = (8..=20)
+            .filter(|&n| PasswordPolicy::from_options(&skew(n)).is_ok())
+            .collect();
+        let first = accepted[0];
+        let p = PasswordPolicy::from_options(&skew(first)).unwrap();
+        assert!(p.min_entropy_bits() >= MIN_ENTROPY_BITS);
+        let below = min_entropy_bits(&[26, 1], first - 1, true);
+        assert!(below < MIN_ENTROPY_BITS);
+        // The old uniform estimate would have accepted the shorter length.
+        assert!((first - 1) as f64 * 27f64.log2() >= MIN_ENTROPY_BITS);
+        // Every accepted options policy meets the floor by min-entropy.
+        for n in 8..=40 {
+            for set in ["!", "!@", "!@#$%^&*"] {
+                for (lo, up, dg) in [
+                    (true, false, false),
+                    (true, true, false),
+                    (false, false, true),
+                    (true, true, true),
+                ] {
+                    let o = PasswordOptions {
+                        lowercase: lo,
+                        uppercase: up,
+                        digits: dg,
+                        symbols: true,
+                        symbol_set: set.into(),
+                        require_each_class: true,
+                        ..custom(n)
+                    };
+                    if let Ok(p) = PasswordPolicy::from_options(&o) {
+                        assert!(p.min_entropy_bits() >= MIN_ENTROPY_BITS);
+                        assert!(
+                            p.summary().min_entropy_bits <= p.summary().upper_bound_bits + 1e-9
+                        );
+                    }
+                }
+            }
+        }
     }
 }

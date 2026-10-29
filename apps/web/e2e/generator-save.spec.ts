@@ -62,6 +62,35 @@ async function unlockAgain(page: Page) {
   await expect(page.getByTestId('lock')).toBeVisible();
 }
 
+/**
+ * Hold the vault object store with a readwrite transaction on a second
+ * connection, so the app's next write really waits inside IndexedDB.
+ */
+async function blockStorage(page: Page) {
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        const r = indexedDB.open('keymesh-demo', 1);
+        r.onsuccess = () => {
+          const db = r.result;
+          const w = window as unknown as { __kmHold: boolean };
+          w.__kmHold = true;
+          const tx = db.transaction('vault', 'readwrite');
+          const spin = () => {
+            if (w.__kmHold) tx.objectStore('vault').get('primary').onsuccess = spin;
+          };
+          spin();
+          tx.oncomplete = () => db.close();
+          resolve();
+        };
+      }),
+  );
+}
+
+async function releaseStorage(page: Page) {
+  await page.evaluate(() => ((window as unknown as { __kmHold: boolean }).__kmHold = false));
+}
+
 async function localEntries(page: Page) {
   return page.evaluate(() => Object.fromEntries(Object.keys(localStorage).map((k) => [k, localStorage.getItem(k) ?? ''])));
 }
@@ -206,6 +235,100 @@ for (const locale of ['zh-TW', 'en'] as const) {
       await page.getByTestId('nav-generators').click();
       await expect(card.locator('[name=pwPreset]')).toHaveValue('default');
       await expect(card.locator('[name=pwLength]')).toHaveValue('24');
+    }
+    expect(errors).toEqual([]);
+    await context.close();
+  });
+}
+
+for (const locale of ['zh-TW', 'en'] as const) {
+  test(`${locale}: lock while Save waits for storage: nothing is written, no success, item absent`, async ({ browser }) => {
+    const t = catalog(locale);
+    const { context, page, errors } = await openVault(browser, locale);
+    await page.getByTestId('nav-generators').click();
+    const title = `Synthetic pending ${locale}`;
+    await page.locator('#gen-pw-title').fill(title);
+    await page.getByTestId('generate-password').click();
+    await expect(pwCard(page).getByTestId('generated-password')).toBeVisible();
+    const before = await storedBytes(page);
+
+    await blockStorage(page);
+    await page.getByTestId('save-password').click();
+    await expect(page.getByTestId('save-password')).toHaveText(t['gen.saving']);
+    await page.getByTestId('lock').click();
+    await expect(page.getByTestId('unlock')).toBeVisible();
+    await releaseStorage(page);
+
+    // The waiting write was cancelled at the storage boundary.
+    await expect.poll(async () => (await storedBytes(page)).equals(before)).toBe(true);
+    await page.waitForTimeout(300);
+    expect((await storedBytes(page)).equals(before)).toBe(true);
+    await expect(page.getByText(t['gen.pw.saved'])).toHaveCount(0);
+    await unlockAgain(page);
+    await expect(titles(page).filter({ hasText: title })).toHaveCount(0);
+    await page.getByTestId('nav-generators').click();
+    await expect(page.getByTestId('generated-password')).toHaveCount(0);
+    expect(errors).toEqual([]);
+    await context.close();
+  });
+
+  test(`${locale}: only settings the core accepts persist; rejected stored settings fall back`, async ({ browser }) => {
+    const t = catalog(locale);
+    const { context, page, errors } = await openVault(browser, locale);
+    await page.getByTestId('nav-generators').click();
+    const card = pwCard(page);
+    const reopen = async () => {
+      await page.reload();
+      await page.getByRole('button', { name: t['start.stored.open'] }).click();
+      await page.getByTestId('nav-generators').click();
+    };
+    const stored = async () => JSON.parse((await localEntries(page))[SETTINGS_KEY] ?? 'null');
+
+    // Digits only, 24 characters: accepted by the core and saved.
+    for (const f of ['lowercase', 'uppercase', 'symbols']) await card.locator(`[name=pw-${f}]`).uncheck();
+    await expect(card.getByTestId('password-options-error')).toHaveCount(0);
+    expect((await stored()).options).toMatchObject({ length: 24, digits: true, lowercase: false, symbols: false });
+
+    // Weak (digits only, 8): shown with the core's message, kept on screen, not saved.
+    await card.locator('[name=pwLength]').fill('8');
+    await expect(card.getByTestId('password-options-error')).toHaveText(t['errors.pwWeak']);
+    expect((await stored()).options.length).toBe(24);
+    // Symbols on (default set) is accepted and saved; emptying the set is not.
+    await card.locator('[name=pwLength]').fill('24');
+    await card.locator('[name=pw-symbols]').check();
+    await expect.poll(async () => (await stored()).options.symbols).toBe(true);
+    await card.locator('[name=pwSymbolSet]').fill('');
+    await expect(card.getByTestId('password-options-error')).toHaveText(t['errors.pwSymbolsEmpty']);
+    expect((await stored()).options.symbolSet).not.toBe('');
+    // All four types with symbol set "!" at 24 is accepted ...
+    await card.locator('[name=pwSymbolSet]').fill('!');
+    for (const f of ['lowercase', 'uppercase']) await card.locator(`[name=pw-${f}]`).check();
+    const accepted = { length: 24, lowercase: true, uppercase: true, digits: true, symbols: true, symbolSet: '!' };
+    expect((await stored()).options).toMatchObject(accepted);
+    // ... but at 11 it is the reviewer's case: a 65.75-bit upper bound and
+    // under 64 bits of min-entropy. Refused by the core, not saved.
+    await card.locator('[name=pwLength]').fill('11');
+    await expect(card.getByTestId('password-options-error')).toHaveText(t['errors.pwWeak']);
+    expect((await stored()).options).toMatchObject(accepted);
+
+    // Reload: the last accepted settings, not the rejected edit.
+    await reopen();
+    await expect(card.locator('[name=pwLength]')).toHaveValue('24');
+    await expect(card.locator('[name=pwSymbolSet]')).toHaveValue('!');
+    for (const f of ['lowercase', 'uppercase', 'digits', 'symbols']) await expect(card.locator(`[name=pw-${f}]`)).toBeChecked();
+    await expect(card.getByTestId('password-options-error')).toHaveCount(0);
+
+    // Well-formed stored settings that the core rejects fall back to defaults.
+    for (const options of [
+      { length: 8, lowercase: false, uppercase: false, digits: true, symbols: false, symbolSet: '!', excludeAmbiguous: false, requireEachClass: true },
+      { length: 24, lowercase: true, uppercase: false, digits: false, symbols: true, symbolSet: '', excludeAmbiguous: false, requireEachClass: true },
+      { length: 11, lowercase: true, uppercase: true, digits: true, symbols: true, symbolSet: '!', excludeAmbiguous: false, requireEachClass: true },
+    ]) {
+      await page.evaluate(([k, v]) => localStorage.setItem(k, v), [SETTINGS_KEY, JSON.stringify({ preset: 'custom', options })]);
+      await reopen();
+      await expect(card.locator('[name=pwPreset]')).toHaveValue('default');
+      await expect(card.locator('[name=pwLength]')).toHaveValue('24');
+      await expect(card.getByTestId('password-options-error')).toHaveCount(0);
     }
     expect(errors).toEqual([]);
     await context.close();

@@ -9,7 +9,10 @@
  * - Lock wins: every asynchronous operation captures the lock generation
  *   (`epoch`) when it is *invoked* and re-checks it before it starts and after
  *   every `await`. Work invoked before a lock never installs state or reveals
- *   data afterwards, and is not persisted where cancellation is still possible.
+ *   data afterwards. The guard also reaches the storage write, which re-checks
+ *   it right before `put`: a write still waiting is cancelled and storage stays
+ *   unchanged. Only a write that already committed lands; it is reported as
+ *   `StaleWorkError(committed = true)`, never as success.
  */
 import { Injectable, InjectionToken, computed, inject, signal } from '@angular/core';
 import { CLOCK } from './clock';
@@ -63,10 +66,18 @@ export class VaultError extends Error {
   }
 }
 
-/** Work invoked before a lock (or reload/restore/discard); never applied. */
+/**
+ * Work invoked before a lock (or reload/restore/discard); never applied to
+ * the session. `committed`: its encrypted write had already been stored
+ * before the lock (unlocking shows it); otherwise nothing was written.
+ */
 export class StaleWorkError extends Error {
-  constructor() {
-    super('The operation was cancelled because the vault was locked or replaced.');
+  constructor(readonly committed = false) {
+    super(
+      committed
+        ? 'The vault was locked after the change was stored.'
+        : 'The operation was cancelled because the vault was locked or replaced.',
+    );
     this.name = 'StaleWorkError';
   }
 }
@@ -122,6 +133,8 @@ export class VaultService {
   readonly version = signal(0);
   readonly unlocked = computed(() => this.status() === 'unlocked');
   readonly maxBytes = signal(64 * 1024 * 1024);
+  /** The compiled core is loaded (policy checks and generators available). */
+  readonly coreReady = signal(false);
 
   constructor() {
     // Any write elsewhere: compare exact bytes (revisions can repeat after a
@@ -133,6 +146,7 @@ export class VaultService {
     try {
       this.core = await this.loadCore();
       this.maxBytes.set(this.core.maxEnvelopeBytes());
+      this.coreReady.set(true);
       await this.run(async (guard) => {
         const rec = await this.store.read();
         guard();
@@ -240,8 +254,7 @@ export class VaultService {
       const revision = sealed.revision;
       sealed.free();
       try {
-        guard();
-        await this.store.create(this.record(bytes));
+        await this.store.create(this.record(bytes), guard);
       } catch (e) {
         s.free();
         key.free();
@@ -252,7 +265,7 @@ export class VaultService {
         s.free();
         this.key = key;
         this.keyMode.set(key.mode as KeyMode);
-        throw new StaleWorkError();
+        throw new StaleWorkError(true);
       }
       s.commit(revision);
       this.install(s, key, bytes);
@@ -309,7 +322,7 @@ export class VaultService {
     const expected = this.snapshot;
     this.lock();
     return this.run(async (guard) => {
-      await this.store.compareAndClear(expected);
+      await this.store.compareAndClear(expected, guard);
       guard();
       this.key?.free();
       this.key = null;
@@ -432,14 +445,15 @@ export class VaultService {
         throw e;
       }
       try {
-        await this.store.compareAndSwap(expected, this.record(bytes));
+        await this.store.compareAndSwap(expected, this.record(bytes), guard);
       } catch (e) {
-        if (!this.isStale(guard)) this.status.set('stale');
+        // Cancelled before the write (lock): storage unchanged, nothing to mark.
+        if (!(e instanceof StaleWorkError) && !this.isStale(guard)) this.status.set('stale');
         throw e;
       }
-      // Locked while writing: the ciphertext is stored (unlock re-reads it),
-      // but the freed session is never touched again.
-      guard();
+      // Locked after the write committed: the ciphertext is stored (unlock
+      // re-reads it), but the freed session is never touched again.
+      if (this.isStale(guard)) throw new StaleWorkError(true);
       s.commit(revision);
       this.snapshot = bytes;
       this.revision.set(revision);
@@ -504,8 +518,7 @@ export class VaultService {
         if (key !== this.key) key.free();
       };
       try {
-        guard();
-        await this.store.compareAndSwap(expected, this.record(bytes));
+        await this.store.compareAndSwap(expected, this.record(bytes), guard);
       } catch (e) {
         drop();
         if (e instanceof ConflictError && !this.isStale(guard) && status === 'unlocked') {
@@ -514,10 +527,10 @@ export class VaultService {
         throw e;
       }
       if (this.isStale(guard)) {
-        // Lock won while the (already verified) backup was being written:
+        // Lock won after the (already verified) backup was written:
         // nothing is installed; unlocking later reads the stored envelope.
         drop();
-        throw new StaleWorkError();
+        throw new StaleWorkError(true);
       }
       this.install(candidate, key, bytes);
       this.broadcast();

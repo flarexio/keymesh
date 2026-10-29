@@ -42,7 +42,7 @@ const CORE_PATTERNS: [RegExp, MessageKey][] = [
 ];
 
 export function errorKey(e: unknown): MessageKey {
-  if (e instanceof StaleWorkError) return 'errors.cancelled';
+  if (e instanceof StaleWorkError) return e.committed ? 'errors.lockedAfterSave' : 'errors.cancelled';
   if (e instanceof LockedError) return 'errors.locked';
   if (e instanceof VaultError) return `errors.${e.code}`;
   if (e instanceof ConflictError) return e.code === 'staleTab' ? 'errors.staleTab' : 'errors.conflict';

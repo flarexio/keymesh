@@ -48,7 +48,7 @@ AAD  = "keymesh.vault" ‖ v2 ‖ "dek" ‖ alg ‖ vault_id ‖ slot.id ‖ slo
   * A random 256-bit recovery key, shown once and never stored by Keymesh. `KEK = HKDF-SHA256(recovery_key, info="keymesh recovery v2" ‖ vault_id)`. No password stretching is needed because the key is full-entropy.
   * The user must confirm it was saved (for example by re-entering a few groups) before the vault holds data.
 * **`webauthn-prf`** (Stage 2, optional).
-  * A passkey's PRF output (WebAuthn Level 3 `prf` extension, which is CTAP2 `hmac-secret` underneath), using a per-slot salt. `KEK = HKDF-SHA256(prf_output, info="keymesh webauthn-prf v2" ‖ vault_id ‖ credential_id)`.
+  * A passkey's PRF output (WebAuthn Level 3 `prf` extension), using a per-slot salt. The extension is *modelled on* CTAP2 `hmac-secret`, but clients and authenticators may implement it by other means, so Keymesh relies only on the WebAuthn-level behaviour: the same credential and salt give the same output, and evaluation needs a user gesture on that authenticator. `KEK = HKDF-SHA256(prf_output, info="keymesh webauthn-prf v2" ‖ vault_id ‖ credential_id)`.
   * It is a convenience unlock, not a replacement for password and recovery, because not every authenticator or browser supports PRF.
 * **`device`** (Stage 3, multi-device).
   * Each device holds an X25519 key pair in platform or OS storage where available. An already unlocked device wraps the DEK to the new device with HPKE (RFC 9180, base mode). Enrolment therefore needs an existing unlock: that is the local recovery-authorization rule.
@@ -56,7 +56,21 @@ AAD  = "keymesh.vault" ‖ v2 ‖ "dek" ‖ alg ‖ vault_id ‖ slot.id ‖ slo
 Slot changes:
 
 * Adding or removing a slot needs the vault to be unlocked.
-* Removing a slot after suspected compromise also rotates the DEK (`Vault::rotate_data_key` exists) and re-wraps it for every remaining slot. Old ciphertext copies (backups, other devices) still open with the old DEK under the old slots, and the UI must say so.
+* Removing a slot that is merely unused (for example a passkey the user no longer has) only deletes its entry; no rotation is needed. Older ciphertext copies (backups, other devices) still carry that slot, and the UI must say so.
+* **Rotation after suspected compromise** (a lost device, an exposed password or recovery key) replaces the DEK (`Vault::rotate_data_key` exists) and re-encrypts every item. Holding the DEK does **not** give the other slots' KEKs, so each remaining slot must be re-established for the new DEK:
+
+  | Slot | What re-establishing it needs |
+  |---|---|
+  | `password` | The user re-enters the password (or sets a new one). Argon2id runs again with a new salt |
+  | `recovery` | The user re-enters the existing recovery key, or Keymesh generates a new one, shows it once and requires confirmation (re-entering some groups). A replaced recovery key stops working for the new DEK |
+  | `webauthn-prf` | A fresh PRF evaluation, which needs a user gesture on that authenticator |
+  | `device` | Only the device's public key: HPKE wraps to a public key, so other enrolled devices need no secret from them. The lost device's slot is dropped |
+
+  **Staging.** The rotation first collects every KEK it can, before anything is written. Slots that cannot be re-established in that session (the authenticator isn't present, the user skips the password) are listed and explicitly **invalidated**, never silently kept with the old DEK. The user confirms the resulting slot list. A rotation that would leave no confirmed recovery path is refused unless the user explicitly accepts "no recovery" after a plain warning.
+
+  **Atomicity.** The new envelope (new DEK, re-encrypted items, new slot list) is built fully in memory and written in one step: an atomic file replace on native, one IndexedDB compare-and-swap transaction in the browser. Either the old or the new envelope is stored, never a mix. Cancelling, a lock, or a failure before that write leaves the old envelope and all old slots intact.
+
+  **Device-loss consequences.** Rotation protects only revisions written afterwards. A lost device keeps whatever ciphertext and old slots it had, protected only by those slots (an offline guessing target for a weak password). If the recovery key could have been exposed with it (for example, written down and kept with the device), replace the recovery key as part of the same rotation. Devices whose slots were dropped must enrol again from an unlocked device.
 
 Rejected or deferred alternatives:
 
@@ -74,11 +88,11 @@ Rejected or deferred alternatives:
 
 | Situation | Path | Result |
 |---|---|---|
-| Forgot password, has recovery key | Unlock with the recovery slot, set a new password (replaces the `password` slot), show a new recovery key if the old one was exposed | Full access |
-| Lost one device, another device is unlocked | Remove the lost device's slot, rotate the DEK and re-wrap the remaining slots | Full access. The lost device keeps the ciphertext it had, protected only by its slots (an offline guessing target for a weak password) |
+| Forgot password, has recovery key | Unlock with the recovery slot and wrap the same DEK under a new password (replaces the `password` slot; no rotation needed). If the old password may be known to someone else, run a rotation (§3) instead | Full access |
+| Lost one device, another device is unlocked | Rotation (§3): drop the lost device's slot, re-establish the others (password re-entry, PRF gesture, recovery key re-entry or replacement with confirmation, other devices via public keys), invalidate any that can't be re-established, then write once | Full access with the confirmed slots. The lost device keeps the ciphertext it had, protected only by its old slots (an offline guessing target for a weak password) |
 | Lost every device, has the recovery key and a ciphertext copy (backup file or future sync) | Open the backup with the recovery slot | Full access to that backup's revision |
 | Lost every unlock method | None | **Data is unrecoverable.** The UI and docs must say this plainly when the vault is created |
-| Passkey removed or provider changed | Use the password or recovery slot, then remove the stale `webauthn-prf` slot | Full access |
+| Passkey removed or provider changed | Use the password or recovery slot, then remove the stale `webauthn-prf` slot (rotate only if the passkey may be in someone else's hands) | Full access |
 
 Keymesh never promises recovery that needs material it does not have. There is no "contact support" path, because no one else holds a key.
 

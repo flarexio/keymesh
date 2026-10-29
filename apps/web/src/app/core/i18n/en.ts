@@ -270,6 +270,7 @@ export const en = {
   'errors.unexpected': 'Something went wrong and nothing was changed. Please try again.',
   'errors.cancelled': 'The operation was cancelled because the vault was locked or replaced.',
   'errors.locked': 'The vault is locked.',
+  'errors.lockedAfterSave': 'The vault was locked right after your change was saved. Unlock to see it.',
   'errors.noStoredVault': 'No saved vault was found.',
   'errors.ephemeralKeyLost': 'This vault was created for a browser session that has ended. It can no longer be opened.',
   'errors.restoreNotAllowed': 'Restore needs an unlocked vault or empty storage.',

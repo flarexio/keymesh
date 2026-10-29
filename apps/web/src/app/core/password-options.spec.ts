@@ -3,7 +3,9 @@
  * preset → custom transitions and client-side checks. Generation itself is
  * only ever done by the Rust core.
  */
+import { signal } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
+import { VaultService } from './vault.service';
 import {
   PASSWORD_PRESETS,
   PASSWORD_SETTINGS_KEY,
@@ -13,6 +15,26 @@ import {
   sameOptions,
 } from './password-options';
 import { PREFERENCE_STORAGE } from './preferences';
+
+/**
+ * Stand-in for the core's policy check (the real one runs in WASM and is
+ * exercised end to end): rejects digits-only below 20 characters, like the
+ * core, and an enabled empty symbol set.
+ */
+function fakeVault() {
+  return {
+    coreReady: signal(true),
+    checks: 0,
+    checkPasswordOptions(o: { length: number; lowercase: boolean; uppercase: boolean; digits: boolean; symbols: boolean; symbolSet: string }) {
+      this.checks++;
+      if (!this.coreReady()) throw new Error('core not loaded');
+      if (o.symbols && o.symbolSet === '') throw new Error('invalid generator policy: symbol set is empty');
+      if (o.digits && !o.lowercase && !o.uppercase && !o.symbols && o.length < 20) {
+        throw new Error('invalid generator policy: policy entropy below 64 bits');
+      }
+    },
+  };
+}
 
 /** In-memory Web Storage; `blocked` makes every access throw. */
 class MemoryStorage implements Storage {
@@ -45,7 +67,12 @@ class MemoryStorage implements Storage {
 describe('PasswordSettings', () => {
   let s: PasswordSettings;
   beforeEach(() => {
-    TestBed.configureTestingModule({ providers: [{ provide: PREFERENCE_STORAGE, useValue: null }] });
+    TestBed.configureTestingModule({
+      providers: [
+        { provide: PREFERENCE_STORAGE, useValue: null },
+        { provide: VaultService, useValue: fakeVault() },
+      ],
+    });
     s = TestBed.inject(PasswordSettings);
   });
 
@@ -105,14 +132,74 @@ describe('sameOptions', () => {
 
 describe('PasswordSettings persistence (non-secret settings only)', () => {
   let storage: MemoryStorage;
+  let vault: ReturnType<typeof fakeVault>;
   const make = () => {
     TestBed.resetTestingModule();
-    TestBed.configureTestingModule({ providers: [{ provide: PREFERENCE_STORAGE, useValue: storage }] });
+    TestBed.configureTestingModule({
+      providers: [
+        { provide: PREFERENCE_STORAGE, useValue: storage },
+        { provide: VaultService, useValue: vault },
+      ],
+    });
     return TestBed.inject(PasswordSettings);
   };
   const custom = { ...PASSWORD_PRESETS.default, length: 40, lowercase: false, symbolSet: '-_', excludeAmbiguous: true };
 
-  beforeEach(() => (storage = new MemoryStorage()));
+  beforeEach(() => {
+    storage = new MemoryStorage();
+    vault = fakeVault();
+  });
+
+  const digitsOnly = (length: number) => ({
+    ...PASSWORD_PRESETS.default,
+    length,
+    lowercase: false,
+    uppercase: false,
+    symbols: false,
+  });
+
+  it('settings the core rejects stay in memory; the last accepted ones stay stored', () => {
+    const s = make();
+    s.update(digitsOnly(24)); // accepted by the core
+    s.update({ length: 8 }); // weak: core rejects it
+    expect(s.options().length).toBe(8); // the user's edit is kept on screen
+    expect(parsePasswordSettings(storage.getItem(PASSWORD_SETTINGS_KEY))?.options).toEqual(digitsOnly(24));
+    s.update({ symbols: true, symbolSet: '' }); // enabled but empty symbol set
+    expect(parsePasswordSettings(storage.getItem(PASSWORD_SETTINGS_KEY))?.options).toEqual(digitsOnly(24));
+    expect(make().options()).toEqual(digitsOnly(24));
+  });
+
+  it('stored settings the core rejects are ignored on load (defaults)', () => {
+    storage.data.set(PASSWORD_SETTINGS_KEY, JSON.stringify({ preset: 'custom', options: digitsOnly(8) }));
+    const s = make();
+    expect(s.preset()).toBe('default');
+    expect(s.options()).toEqual(PASSWORD_PRESETS.default);
+    // The rejected entry is not rewritten by loading.
+    expect(JSON.parse(storage.getItem(PASSWORD_SETTINGS_KEY)!).options.length).toBe(8);
+  });
+
+  it('before the core is ready nothing is restored or saved; then stored settings apply once', () => {
+    storage.data.set(PASSWORD_SETTINGS_KEY, JSON.stringify({ preset: 'custom', options: custom }));
+    vault.coreReady.set(false);
+    const s = make();
+    expect(s.options()).toEqual(PASSWORD_PRESETS.default);
+    vault.coreReady.set(true);
+    TestBed.tick();
+    expect(s.preset()).toBe('custom');
+    expect(s.options()).toEqual(custom);
+  });
+
+  it('a change made before the core is ready is kept, not replaced by the stored settings', () => {
+    storage.data.set(PASSWORD_SETTINGS_KEY, JSON.stringify({ preset: 'custom', options: custom }));
+    vault.coreReady.set(false);
+    const s = make();
+    s.setPreset('strong');
+    // Not validated yet: not saved over the stored entry.
+    expect(JSON.parse(storage.getItem(PASSWORD_SETTINGS_KEY)!).options).toEqual(custom);
+    vault.coreReady.set(true);
+    TestBed.tick();
+    expect(s.options()).toEqual(PASSWORD_PRESETS.strong);
+  });
 
   it('loading writes nothing; a change is saved under its own key and restored', () => {
     const s = make();

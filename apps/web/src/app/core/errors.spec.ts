@@ -12,6 +12,7 @@ describe('errorKey', () => {
   it('maps app errors by class and code', () => {
     expect(errorKey(new LockedError())).toBe('errors.locked');
     expect(errorKey(new StaleWorkError())).toBe('errors.cancelled');
+    expect(errorKey(new StaleWorkError(true))).toBe('errors.lockedAfterSave');
     expect(errorKey(new ConflictError())).toBe('errors.conflict');
     expect(errorKey(new ConflictError('x', 'staleTab'))).toBe('errors.staleTab');
     expect(errorKey(new VaultError('backupRejected', 'Backup rejected: decryption failed'))).toBe(

@@ -1461,6 +1461,16 @@ mod tests {
     fn password_policy_summary_validates_without_generating() {
         let s = password_policy_summary(&opts(serde_json::json!({"symbolSet": "!!@@"}))).unwrap();
         assert_eq!((s.length, s.alphabet_size, s.classes), (24, 64, 4));
+        assert!(s.min_entropy_bits >= 64.0 && s.min_entropy_bits < s.upper_bound_bits);
+        let j = serde_json::to_value(&s).unwrap();
+        assert!(j["minEntropyBits"].is_f64() && j["upperBoundBits"].is_f64());
+        // Reviewer's case: upper bound above 64, real output below; refused.
+        assert!(password_policy_summary(&opts(
+            serde_json::json!({"length": 11, "symbolSet": "!"})
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("entropy"));
         assert!(
             password_policy_summary(&opts(serde_json::json!({"length": 8})))
                 .unwrap_err()

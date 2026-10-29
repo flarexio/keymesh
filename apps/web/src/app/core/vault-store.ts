@@ -9,6 +9,12 @@
  * succeeds only if the stored envelope is exactly the snapshot the writer last
  * saw, so another tab (or an older restore) can never be silently clobbered.
  * There is no unconditional write path.
+ *
+ * Writes take an optional cancellation `guard` (it throws once the caller's
+ * work is stale, e.g. the vault was locked). It is checked after the database
+ * opens and again after the current record is read, right before `put`; a
+ * cancelled write aborts its transaction and leaves storage unchanged. Once
+ * `put` is issued the write can no longer be cancelled.
  */
 
 export interface StoredVault {
@@ -44,6 +50,31 @@ function done(tx: IDBTransaction): Promise<void> {
     tx.onabort = () => reject(tx.error ?? new ConflictError());
     tx.onerror = () => reject(tx.error ?? new Error('IndexedDB transaction failed'));
   });
+}
+
+/** Throws when the caller's work must not continue (see class docs). */
+export type Guard = () => void;
+const noGuard: Guard = () => undefined;
+
+/** Completion of `tx`, observed from the start so an abort is never unhandled. */
+function settled(tx: IDBTransaction): Promise<void> {
+  const p = done(tx);
+  p.catch(() => undefined);
+  return p;
+}
+
+/** Run `step`; if it throws, abort `tx` (nothing is written) and rethrow. */
+function abortUnless(tx: IDBTransaction, step: () => unknown): void {
+  try {
+    step();
+  } catch (e) {
+    try {
+      tx.abort();
+    } catch {
+      // already finished or aborted
+    }
+    throw e;
+  }
 }
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -92,9 +123,9 @@ export class VaultStore {
   }
 
   /** First save of a new vault. Never replaces an existing record. */
-  async create(v: StoredVault): Promise<void> {
+  async create(v: StoredVault, guard?: Guard): Promise<void> {
     try {
-      await this.compareAndSwap(null, v);
+      await this.compareAndSwap(null, v, guard);
     } catch (e) {
       if (e instanceof ConflictError) {
         throw new ConflictError('A stored demo vault already exists. Discard it first.');
@@ -109,11 +140,14 @@ export class VaultStore {
    * Comparing exact bytes, not revision numbers, keeps this safe when a
    * restored backup reuses an older revision. On mismatch nothing is written.
    */
-  async compareAndSwap(expected: Uint8Array | null, next: StoredVault): Promise<void> {
+  async compareAndSwap(expected: Uint8Array | null, next: StoredVault, guard: Guard = noGuard): Promise<void> {
     const db = await this.open();
+    guard();
     const tx = db.transaction('vault', 'readwrite');
+    const finished = settled(tx);
     const os = tx.objectStore('vault');
     const cur = await req(os.get(KEY));
+    abortUnless(tx, guard);
     const matches =
       expected === null
         ? cur === undefined
@@ -122,16 +156,19 @@ export class VaultStore {
       tx.abort();
       throw new ConflictError();
     }
-    os.put(next, KEY);
-    await done(tx);
+    abortUnless(tx, () => os.put(next, KEY));
+    await finished;
   }
 
   /** Delete the record only if it is exactly `expected` (null: already empty). */
-  async compareAndClear(expected: Uint8Array | null): Promise<void> {
+  async compareAndClear(expected: Uint8Array | null, guard: Guard = noGuard): Promise<void> {
     const db = await this.open();
+    guard();
     const tx = db.transaction('vault', 'readwrite');
+    const finished = settled(tx);
     const os = tx.objectStore('vault');
     const cur = await req(os.get(KEY));
+    abortUnless(tx, guard);
     const matches =
       expected === null ? cur === undefined : isStored(cur) && sameBytes(cur.bytes, expected);
     if (!matches) {
@@ -139,7 +176,7 @@ export class VaultStore {
       throw new ConflictError('The stored vault changed elsewhere; reload before discarding.');
     }
     if (cur !== undefined) os.delete(KEY);
-    await done(tx);
+    await finished;
   }
 
   /** Test helper / explicit reset. */

@@ -1,6 +1,7 @@
-import { Injectable, inject, signal } from '@angular/core';
+import { Injectable, effect, inject, signal } from '@angular/core';
 import { MessageKey } from './i18n/i18n.service';
 import { PREFERENCE_STORAGE } from './preferences';
+import { VaultService } from './vault.service';
 
 /**
  * Password settings, mirrored 1:1 by the core's `PasswordOptions` (strict
@@ -62,8 +63,8 @@ function validSymbolSet(v: string): boolean {
   return [...v].length <= SYMBOL_SET_MAX && /^[!-/:-@[-`{-~]*$/.test(v);
 }
 
-/** Settings that may be stored: usable and of the exact shape. */
-function storable(o: PasswordOptions): boolean {
+/** Exact shape and basic ranges; the core decides whether a policy is usable. */
+function wellFormed(o: PasswordOptions): boolean {
   return clientProblem(o) === null && validSymbolSet(o.symbolSet);
 }
 
@@ -76,9 +77,10 @@ export interface StoredPasswordSettings {
 }
 
 /**
- * Strict parse: exactly the known fields with valid values, else null (the
- * caller then uses the defaults). A preset whose settings no longer match it
- * is read as Custom.
+ * Strict parse: exactly the known fields with well-formed values, else null
+ * (the caller then uses the defaults). A preset whose settings no longer
+ * match it is read as Custom. Policy validity is decided by the core, not
+ * here (see `PasswordSettings`).
  */
 export function parsePasswordSettings(raw: string | null): StoredPasswordSettings | null {
   if (!raw) return null;
@@ -96,7 +98,7 @@ export function parsePasswordSettings(raw: string | null): StoredPasswordSetting
   if (typeof o['length'] !== 'number' || typeof o['symbolSet'] !== 'string') return null;
   if (!FLAGS.every((f) => typeof o[f] === 'boolean')) return null;
   const options = Object.fromEntries(OPTION_KEYS.map((k) => [k, o[k]])) as unknown as PasswordOptions;
-  if (!storable(options)) return null;
+  if (!wellFormed(options)) return null;
   let preset = v['preset'] as PasswordPreset;
   if (preset !== 'custom' && !sameOptions(options, PASSWORD_PRESETS[preset])) preset = 'custom';
   return { preset, options };
@@ -104,19 +106,36 @@ export function parsePasswordSettings(raw: string | null): StoredPasswordSetting
 
 /**
  * Settings shared by the generator page and the item forms. They are not
- * secret: the last usable settings are kept in Web Storage (when available)
- * under their own key. Generated values are never stored.
+ * secret: the last settings the core accepts are kept in Web Storage (when
+ * available) under their own key. Generated values are never stored.
+ *
+ * Validity is the core's policy check (`passwordPolicySummary`, no RNG), the
+ * same one generation uses, so there is no second policy in TypeScript.
+ * Until the core is loaded nothing is restored or saved; stored settings are
+ * then applied once, unless the user already changed something.
  */
 @Injectable({ providedIn: 'root' })
 export class PasswordSettings {
   private readonly storage = inject(PREFERENCE_STORAGE);
-  private readonly initial = this.read();
-  readonly options = signal<PasswordOptions>(this.initial?.options ?? { ...PASSWORD_PRESETS.default });
-  readonly preset = signal<PasswordPreset>(this.initial?.preset ?? 'default');
+  private readonly vault = inject(VaultService);
+  readonly options = signal<PasswordOptions>({ ...PASSWORD_PRESETS.default });
+  readonly preset = signal<PasswordPreset>('default');
   /** False when settings cannot be saved (storage blocked or full). */
   readonly persistent = signal(this.storage !== null);
+  private restored = false;
+  private touched = false;
+
+  constructor() {
+    this.restore();
+    if (!this.restored) {
+      effect(() => {
+        if (this.vault.coreReady()) this.restore();
+      });
+    }
+  }
 
   setPreset(p: PasswordPreset): void {
+    this.touched = true;
     this.preset.set(p);
     if (p !== 'custom') this.options.set({ ...PASSWORD_PRESETS[p] });
     this.save();
@@ -124,9 +143,30 @@ export class PasswordSettings {
 
   /** Any change by the user means Custom; preset rules are not re-applied. */
   update(patch: Partial<PasswordOptions>): void {
+    this.touched = true;
     this.options.update((o) => ({ ...o, ...patch }));
     this.preset.set('custom');
     this.save();
+  }
+
+  /** Accepted by the core's policy check (false while the core isn't loaded). */
+  private usable(o: PasswordOptions): boolean {
+    if (!wellFormed(o) || !this.vault.coreReady()) return false;
+    try {
+      this.vault.checkPasswordOptions(o);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private restore(): void {
+    if (this.restored || !this.vault.coreReady()) return;
+    this.restored = true;
+    const stored = this.read();
+    if (this.touched || !stored || !this.usable(stored.options)) return;
+    this.options.set(stored.options);
+    this.preset.set(stored.preset);
   }
 
   private read(): StoredPasswordSettings | null {
@@ -137,10 +177,10 @@ export class PasswordSettings {
     }
   }
 
-  /** Only usable settings are saved; while typing, the last good ones stay. */
+  /** Only settings the core accepts are saved; otherwise the last good ones stay. */
   private save(): void {
     const options = this.options();
-    if (!this.storage || !storable(options)) return;
+    if (!this.storage || !this.usable(options)) return;
     const value: StoredPasswordSettings = { preset: this.preset(), options };
     try {
       this.storage.setItem(PASSWORD_SETTINGS_KEY, JSON.stringify(value));
