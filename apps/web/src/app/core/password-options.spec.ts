@@ -4,12 +4,48 @@
  * only ever done by the Rust core.
  */
 import { TestBed } from '@angular/core/testing';
-import { PASSWORD_PRESETS, PasswordSettings, clientProblem } from './password-options';
+import {
+  PASSWORD_PRESETS,
+  PASSWORD_SETTINGS_KEY,
+  PasswordSettings,
+  clientProblem,
+  parsePasswordSettings,
+  sameOptions,
+} from './password-options';
+import { PREFERENCE_STORAGE } from './preferences';
+
+/** In-memory Web Storage; `blocked` makes every access throw. */
+class MemoryStorage implements Storage {
+  data = new Map<string, string>();
+  blocked = false;
+  full = false;
+  get length() {
+    return this.data.size;
+  }
+  clear() {
+    this.data.clear();
+  }
+  key(i: number) {
+    return [...this.data.keys()][i] ?? null;
+  }
+  getItem(k: string) {
+    if (this.blocked) throw new DOMException('blocked', 'SecurityError');
+    return this.data.get(k) ?? null;
+  }
+  setItem(k: string, v: string) {
+    if (this.blocked) throw new DOMException('blocked', 'SecurityError');
+    if (this.full) throw new DOMException('full', 'QuotaExceededError');
+    this.data.set(k, v);
+  }
+  removeItem(k: string) {
+    this.data.delete(k);
+  }
+}
 
 describe('PasswordSettings', () => {
   let s: PasswordSettings;
   beforeEach(() => {
-    TestBed.configureTestingModule({});
+    TestBed.configureTestingModule({ providers: [{ provide: PREFERENCE_STORAGE, useValue: null }] });
     s = TestBed.inject(PasswordSettings);
   });
 
@@ -54,5 +90,99 @@ describe('clientProblem', () => {
     expect(clientProblem({ ...base, symbolSet: '!'.repeat(65) })).toBe('errors.pwSymbolsLong');
     expect(clientProblem({ ...base, symbols: false, symbolSet: '!'.repeat(65) })).toBeNull();
     expect(clientProblem(base)).toBeNull();
+  });
+});
+
+describe('sameOptions', () => {
+  it('compares every setting', () => {
+    const a = PASSWORD_PRESETS.default;
+    expect(sameOptions(a, { ...a })).toBe(true);
+    for (const patch of [{ length: 25 }, { symbols: false }, { symbolSet: '!' }, { excludeAmbiguous: true }, { requireEachClass: false }]) {
+      expect(sameOptions(a, { ...a, ...patch })).toBe(false);
+    }
+  });
+});
+
+describe('PasswordSettings persistence (non-secret settings only)', () => {
+  let storage: MemoryStorage;
+  const make = () => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({ providers: [{ provide: PREFERENCE_STORAGE, useValue: storage }] });
+    return TestBed.inject(PasswordSettings);
+  };
+  const custom = { ...PASSWORD_PRESETS.default, length: 40, lowercase: false, symbolSet: '-_', excludeAmbiguous: true };
+
+  beforeEach(() => (storage = new MemoryStorage()));
+
+  it('loading writes nothing; a change is saved under its own key and restored', () => {
+    const s = make();
+    expect(storage.length).toBe(0);
+    s.update(custom);
+    expect([...storage.data.keys()]).toEqual([PASSWORD_SETTINGS_KEY]);
+    expect(JSON.parse(storage.getItem(PASSWORD_SETTINGS_KEY)!)).toEqual({ preset: 'custom', options: custom });
+    const again = make();
+    expect(again.preset()).toBe('custom');
+    expect(again.options()).toEqual(custom);
+    again.setPreset('strong');
+    expect(make().preset()).toBe('strong');
+    expect(make().options()).toEqual(PASSWORD_PRESETS.strong);
+  });
+
+  it('an unusable intermediate value is never saved; the last valid settings are kept', () => {
+    const s = make();
+    s.update({ length: 40 });
+    s.update({ length: NaN }); // number box cleared while typing
+    expect(parsePasswordSettings(storage.getItem(PASSWORD_SETTINGS_KEY))?.options.length).toBe(40);
+    s.update({ symbolSet: 'abc' });
+    expect(parsePasswordSettings(storage.getItem(PASSWORD_SETTINGS_KEY))?.options.symbolSet).toBe(PASSWORD_PRESETS.default.symbolSet);
+  });
+
+  it('malformed or tampered settings are ignored entirely (defaults)', () => {
+    const bad = [
+      'not json',
+      'null',
+      '[]',
+      JSON.stringify({ preset: 'custom' }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, length: 7 } }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, length: 129 } }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, length: '40' } }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, digits: 'yes' } }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, symbolSet: 'abc' } }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, symbolSet: '！' } }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, symbolSet: '!'.repeat(65) } }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, lowercase: false, uppercase: false, digits: false, symbols: false } }),
+      JSON.stringify({ preset: 'custom', options: { ...custom, password: 'SYNTH' } }),
+      JSON.stringify({ preset: 'weird', options: custom }),
+    ];
+    for (const raw of bad) {
+      storage.data.set(PASSWORD_SETTINGS_KEY, raw);
+      expect(parsePasswordSettings(raw)).toBeNull();
+      const s = make();
+      expect(s.preset()).toBe('default');
+      expect(s.options()).toEqual(PASSWORD_PRESETS.default);
+    }
+  });
+
+  it('a preset label that no longer matches its settings becomes Custom', () => {
+    storage.data.set(PASSWORD_SETTINGS_KEY, JSON.stringify({ preset: 'strong', options: custom }));
+    const s = make();
+    expect(s.preset()).toBe('custom');
+    expect(s.options()).toEqual(custom);
+  });
+
+  it('blocked or full storage falls back to in-memory settings', () => {
+    storage.data.set(PASSWORD_SETTINGS_KEY, JSON.stringify({ preset: 'custom', options: custom }));
+    storage.blocked = true;
+    const s = make();
+    expect(s.options()).toEqual(PASSWORD_PRESETS.default);
+    expect(() => s.update({ length: 30 })).not.toThrow();
+    expect(s.options().length).toBe(30);
+    expect(s.persistent()).toBe(false);
+    storage.blocked = false;
+    storage.full = true;
+    const t = make();
+    t.update({ length: 50 });
+    expect(t.options().length).toBe(50);
+    expect(t.persistent()).toBe(false);
   });
 });

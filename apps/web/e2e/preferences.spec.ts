@@ -290,10 +290,15 @@ for (const locale of ['zh-TW', 'en'] as const) {
       await page.screenshot({ path: shotPath(testInfo, `keymesh-${locale}-${pref}-${resolved}.png`) });
     }
 
-    // Only the non-secret settings key, holding only the two preferences.
-    const stored = await page.evaluate((k) => ({ keys: Object.keys(localStorage), value: localStorage.getItem(k) }), SETTINGS_KEY);
-    expect(stored.keys).toEqual([SETTINGS_KEY]);
+    // Only non-secret settings: the two preferences, plus the password
+    // settings this run changed (shape only, never a generated value).
+    const stored = await page.evaluate((k) => ({ keys: Object.keys(localStorage).sort(), value: localStorage.getItem(k), pw: localStorage.getItem('keymesh.password-settings.v1') }), SETTINGS_KEY);
+    expect(stored.keys).toEqual(['keymesh.password-settings.v1', SETTINGS_KEY]);
     expect(JSON.parse(stored.value!)).toEqual({ locale, theme: 'dark' });
+    expect(Object.keys(JSON.parse(stored.pw!)).sort()).toEqual(['options', 'preset']);
+    expect(Object.keys(JSON.parse(stored.pw!).options).sort()).toEqual(
+      ['digits', 'excludeAmbiguous', 'length', 'lowercase', 'requireEachClass', 'symbolSet', 'symbols', 'uppercase'],
+    );
 
     const origin = new URL(page.url()).origin;
     expect(requests.filter((u) => !u.startsWith(origin) && !u.startsWith('blob:'))).toEqual([]);

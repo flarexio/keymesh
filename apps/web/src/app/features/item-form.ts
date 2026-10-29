@@ -1,10 +1,11 @@
 import { NgTemplateOutlet } from '@angular/common';
-import { Component, OnInit, computed, inject, input, output, signal } from '@angular/core';
+import { Component, OnDestroy, OnInit, computed, inject, input, output, signal } from '@angular/core';
 import { errorKey } from '../core/errors';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { VaultService } from '../core/vault.service';
 import { CustomRow, FormModel, buildInput, emptyModel, modelFromView } from '../core/forms';
-import { PasswordSettings } from '../core/password-options';
+import { GeneratedDraft } from '../core/generated-draft';
+import { PasswordSettings, sameOptions } from '../core/password-options';
 import { ItemKind, Summary } from '../core/types';
 import { GeneratedPassword } from '../shared/generated-password';
 import { Icon, KIND_ICONS } from '../shared/icon';
@@ -266,8 +267,10 @@ let nextForm = 0;
         data-testid="form-generator" (keydown.enter)="keepEnter($event)">
         <p class="field-hint">{{ i18n.t('form.generatorHint') }}</p>
         <km-password-options />
-        @if (candidate(); as c) {
+        @if (candidate.current(); as c) {
           <km-generated-password [value]="c" [label]="i18n.t('gen.pw.result')" />
+        } @else if (candidate.outdated()) {
+          <div class="callout callout-info" data-testid="generated-outdated"><km-icon name="info" /><p>{{ i18n.t('gen.outdated') }}</p></div>
         }
         @if (genError(); as e) {
           <p class="field-error" role="alert"><km-icon name="alert" />{{ i18n.t(e) }}</p>
@@ -276,7 +279,7 @@ let nextForm = 0;
           <button type="button" class="btn" data-testid="form-generate" [disabled]="!!genProblem()" (click)="generateCandidate()">
             <km-icon name="dice" /><span>{{ i18n.t('gen.preview') }}</span>
           </button>
-          <button type="button" class="btn btn-primary" data-testid="form-use-password" [disabled]="!candidate()" (click)="useCandidate()">
+          <button type="button" class="btn btn-primary" data-testid="form-use-password" [disabled]="!candidate.current()" (click)="useCandidate()">
             <km-icon name="check" /><span>{{ i18n.t('form.usePassword') }}</span>
           </button>
           <button type="button" class="btn btn-ghost" data-testid="form-generator-cancel" (click)="closeGenerator()">{{ i18n.t('common.cancel') }}</button>
@@ -286,7 +289,7 @@ let nextForm = 0;
     </ng-template>
   `,
 })
-export class ItemForm implements OnInit {
+export class ItemForm implements OnInit, OnDestroy {
   private readonly vault = inject(VaultService);
   protected readonly i18n = inject(I18n);
   readonly kind = input.required<ItemKind>();
@@ -301,9 +304,12 @@ export class ItemForm implements OnInit {
   protected readonly busy = signal(false);
   protected readonly showPw = signal(false);
   private readonly pwSettings = inject(PasswordSettings);
-  /** Inline generator: a candidate only replaces the field on "Use this password". */
+  /**
+   * Inline generator: only "Use this password" changes the field, and only
+   * with the value on screen, generated with the current settings.
+   */
   protected readonly genOpen = signal(false);
-  protected readonly candidate = signal<string | null>(null);
+  protected readonly candidate = new GeneratedDraft(this.pwSettings.options, sameOptions);
   protected readonly genError = signal<MessageKey | null>(null);
   protected readonly genProblem = computed(() => passwordProblem(this.vault, this.pwSettings.options()));
   /** Field errors appear after the first submit attempt, then update live. */
@@ -388,26 +394,31 @@ export class ItemForm implements OnInit {
 
   protected closeGenerator(): void {
     this.genOpen.set(false);
-    this.candidate.set(null);
+    this.candidate.clear();
     this.genError.set(null);
   }
 
   protected generateCandidate(): void {
     this.genError.set(null);
-    this.candidate.set(null);
+    this.candidate.clear();
+    const options = this.pwSettings.options();
     try {
-      this.candidate.set(this.vault.generatePasswordWith(this.pwSettings.options()));
+      this.candidate.set(this.vault.generatePasswordWith(options), options);
     } catch (e) {
       this.genError.set(errorKey(e));
     }
   }
 
   protected useCandidate(): void {
-    const value = this.candidate();
+    const value = this.candidate.current();
     if (value === null) return;
     const field = this.kind() === 'secret' ? 'secret' : 'password';
     this.m.update((m) => ({ ...m, [field]: value }));
     this.closeGenerator();
+  }
+
+  ngOnDestroy(): void {
+    this.candidate.clear();
   }
 
   /** Enter in a settings field must not submit (and save) the item form. */

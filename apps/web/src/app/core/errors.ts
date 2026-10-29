@@ -24,6 +24,7 @@ const CORE_PATTERNS: [RegExp, MessageKey][] = [
   [/^validation failed: contact has no name or contact details/, 'errors.contactEmpty'],
   [/^validation failed: (secret is required|secret is empty)/, 'errors.secretRequired'],
   [/^validation failed: recovery code is empty/, 'errors.recoveryCodeEmpty'],
+  [/^validation failed: (generated value is no longer available|unknown preview)/, 'errors.previewGone'],
   [/^validation failed: custom field needs a value/, 'errors.customValue'],
   [/^validation failed: vault is locked/, 'errors.locked'],
   [/^TOTP error: (empty Base32 secret|invalid Base32 secret|secret)/, 'errors.totpSecret'],

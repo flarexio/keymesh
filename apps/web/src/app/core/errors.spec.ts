@@ -37,6 +37,7 @@ describe('errorKey', () => {
       ['validation failed: url contains whitespace', 'errors.invalidUrl'],
       ['validation failed: contact has no name or contact details', 'errors.contactEmpty'],
       ['validation failed: secret is required', 'errors.secretRequired'],
+      ['validation failed: generated value is no longer available', 'errors.previewGone'],
       ['validation failed: custom field needs a value', 'errors.customValue'],
       ['TOTP error: invalid Base32 secret', 'errors.totpSecret'],
       ['TOTP error: HOTP is not supported', 'errors.totpSetup'],

@@ -236,6 +236,49 @@ impl VaultSession {
             .map_err(err)
     }
 
+    /// Generate a password with `options` (JSON `PasswordOptions`) and keep
+    /// it as the current preview; returns the value to show.
+    #[wasm_bindgen(js_name = previewPassword)]
+    pub fn preview_password(&mut self, options: &str) -> Result<String, JsError> {
+        Ok(self
+            .inner
+            .preview_password(options)
+            .map_err(err)?
+            .as_str()
+            .to_owned())
+    }
+
+    /// Generate an encoded random secret and keep it as the current preview.
+    #[wasm_bindgen(js_name = previewSecret)]
+    pub fn preview_secret(&mut self, n_bytes: u32, encoding: &str) -> Result<String, JsError> {
+        Ok(self
+            .inner
+            .preview_secret(n_bytes as usize, encoding)
+            .map_err(err)?
+            .as_str()
+            .to_owned())
+    }
+
+    /// Store exactly the shown preview (`kind`: "password" | "secret") as a
+    /// generated Secret item; refused if it was replaced or already saved.
+    #[wasm_bindgen(js_name = savePreview)]
+    pub fn save_preview(
+        &mut self,
+        kind: &str,
+        shown: &str,
+        title: &str,
+        service: &str,
+    ) -> Result<String, JsError> {
+        self.inner
+            .save_preview(kind, shown, title, service)
+            .map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = discardPreviews)]
+    pub fn discard_previews(&mut self) {
+        self.inner.discard_previews();
+    }
+
     /// Encrypt the next revision; persist `bytes`, then call `commit`.
     pub fn seal(&mut self, key: &DemoKeyProvider) -> Result<SealedVault, JsError> {
         let (bytes, revision) = self.inner.seal(&key.inner).map_err(err)?;

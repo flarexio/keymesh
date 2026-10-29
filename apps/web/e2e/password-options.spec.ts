@@ -163,7 +163,9 @@ for (const locale of ['zh-TW', 'en'] as const) {
     await expect(error).toHaveText(t['errors.pwWeak']);
     await expect(generate).toBeDisabled();
     await expect(save).toBeDisabled();
-    await expect(page.getByTestId('generated-password')).toBeVisible(); // settings changes don't regenerate
+    // Settings changes never regenerate; the old value is withdrawn as outdated.
+    await expect(page.getByTestId('generated-password')).toHaveCount(0);
+    await expect(page.getByTestId('generated-outdated')).toHaveText(t['gen.outdated']);
     await setLength(page, 22); // 8 digits left: 22 × 3 = 66 bits
     await expect(error).toHaveCount(0);
     await generate.click();
@@ -207,18 +209,22 @@ for (const locale of ['zh-TW', 'en'] as const) {
     await expect(opts(page).locator('[name=pw-uppercase]')).not.toBeChecked();
     await page.locator(`[data-testid=language-switch] [data-locale="${locale}"]`).click();
 
-    // Save generates a new value inside the core with these settings; after
-    // an encrypted round trip (lock, decrypt from storage) it is unchanged.
+    // Save stores exactly the shown preview; after an encrypted round trip
+    // (lock, decrypt from storage) it is unchanged.
     await preset.selectOption('default');
     await setChecks(page, { lowercase: false, uppercase: false, symbols: false });
     await setLength(page, 30);
+    await expect(save).toBeDisabled();
+    await generate.click();
+    const previewed = await revealGenerated(page, t);
+    expect(verdict(previewed, 30, [DIGITS])).toEqual(ok(1));
     await save.click();
     await expect(page.locator('#detail-title')).toHaveText(t['gen.pw.defaultTitle']);
     const stored = await revealStored(page, t, t['field.secret']);
-    expect(verdict(stored, 30, [DIGITS])).toEqual(ok(1));
+    expect(stored === previewed).toBe(true);
     await lockAndUnlock(page);
     await page.locator('.item-list button', { hasText: t['gen.pw.defaultTitle'] }).click();
-    expect((await revealStored(page, t, t['field.secret'])) === stored).toBe(true);
+    expect((await revealStored(page, t, t['field.secret'])) === previewed).toBe(true);
 
     // Locking discards a generated value that was on screen.
     await page.getByTestId('nav-generators').click();
@@ -256,7 +262,17 @@ for (const locale of ['zh-TW', 'en'] as const) {
     await expect(form).toBeVisible();
     await panel.locator('[name=pwSymbolSet]').fill('-_');
     await panel.getByTestId('form-generate').click();
+    const first = await revealGenerated(page, t);
+    expect(verdict(first, 50, [LOWER, UPPER, DIGITS, '-_'])).toEqual(ok(4));
+    // Changing a setting withdraws it: it can't be used for the new settings.
+    await panel.locator('[name=pwLength]').fill('51');
+    await expect(panel.getByTestId('generated-outdated')).toHaveText(t['gen.outdated']);
+    await expect(panel.getByTestId('generated-password')).toHaveCount(0);
+    await expect(panel.getByTestId('form-use-password')).toBeDisabled();
+    await panel.locator('[name=pwLength]').fill('50');
+    await panel.getByTestId('form-generate').click();
     const candidate = await revealGenerated(page, t);
+    expect(candidate === first).toBe(false);
     expect(verdict(candidate, 50, [LOWER, UPPER, DIGITS, '-_'])).toEqual(ok(4));
     await expect(form.locator('[name=password]')).toHaveValue('SYNTH-prior-pw');
 

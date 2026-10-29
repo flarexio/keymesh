@@ -5,7 +5,9 @@
  */
 import { TestBed } from '@angular/core/testing';
 import { IDBFactory } from 'fake-indexeddb';
-import { CORE_LOADER, StaleWorkError, VAULT_STORE, VaultService } from './vault.service';
+import { CORE_LOADER, LockedError, StaleWorkError, VAULT_STORE, VaultService } from './vault.service';
+import { errorKey } from './errors';
+import { PASSWORD_PRESETS } from './password-options';
 import { ConflictError, StoredVault, VaultStore } from './vault-store';
 import { FIXTURE_KEY_ID } from './types';
 import type { Core } from './wasm';
@@ -55,6 +57,22 @@ class FakeSession {
   list() {
     return JSON.stringify(this.items.map((t) => ({ id: t, kind: 'secure_note', title: t, subtitle: null, tags: [] })));
   }
+  /** Mirrors the core's preview slots: exact match, consumed on save. */
+  previews: Record<string, string> = {};
+  savePreviewCalls = 0;
+  previewPassword() {
+    return (this.previews['password'] = `pv-${++counter}`);
+  }
+  savePreview(kind: string, shown: string, title: string) {
+    this.savePreviewCalls++;
+    if (this.previews[kind] !== shown) throw new Error('validation failed: generated value is no longer available');
+    delete this.previews[kind];
+    this.items.push(title);
+    return title;
+  }
+  discardPreviews() {
+    this.previews = {};
+  }
   createItem(json: string) {
     const t = (JSON.parse(json) as { title: string }).title;
     this.items.push(t);
@@ -87,7 +105,6 @@ const fakeCore = {
   },
   VaultSession: FakeSession,
   generatePassword: () => 'x',
-  generateRandomSecret: () => 'x',
 } as unknown as Core;
 
 /** Store whose compareAndSwap can be paused before it reaches IndexedDB. */
@@ -277,5 +294,56 @@ describe('VaultService lock / restore / concurrency', () => {
     hold.resolve();
     await expect(open).rejects.toBeInstanceOf(StaleWorkError);
     expect(vault.status()).toBe('locked');
+  });
+  describe('saving a generated preview', () => {
+    it('stores exactly the shown value once; a duplicate save is refused and writes nothing', async () => {
+      await unlockedWith(3);
+      const shown = vault.previewPassword(PASSWORD_PRESETS.default);
+      await expect(vault.savePreview('password', shown, 'gen')).resolves.toBe('gen');
+      expect(store.writes).toBe(1);
+      expect(vault.revision()).toBe(4);
+      const dup = vault.savePreview('password', shown, 'gen');
+      await expect(dup).rejects.toThrow(/no longer available/);
+      expect(errorKey(await dup.catch((e) => e))).toBe('errors.previewGone');
+      expect(store.writes).toBe(1);
+      expect(vault.revision()).toBe(4);
+    });
+
+    it('a save invoked before a lock never reaches the core or storage', async () => {
+      await unlockedWith(3);
+      const session = sessions[sessions.length - 1];
+      const shown = vault.previewPassword(PASSWORD_PRESETS.default);
+      const save = vault.savePreview('password', shown, 'gen');
+      vault.lock();
+      await expect(save).rejects.toBeInstanceOf(StaleWorkError);
+      expect(session.savePreviewCalls).toBe(0);
+      expect(store.writes).toBe(0);
+      expect(() => vault.previewPassword(PASSWORD_PRESETS.default)).toThrow(LockedError);
+    });
+
+    it('lock during the write: success is never reported and the freed session is not committed', async () => {
+      await unlockedWith(3);
+      const session = sessions[sessions.length - 1];
+      const shown = vault.previewPassword(PASSWORD_PRESETS.default);
+      const hold = deferred();
+      store.gate = hold.promise;
+      const save = vault.savePreview('password', shown, 'gen');
+      for (let i = 0; i < 50 && session.pending === null; i++) await new Promise((r) => setTimeout(r, 0));
+      vault.lock();
+      store.gate = null;
+      hold.resolve();
+      await expect(save).rejects.toBeInstanceOf(StaleWorkError);
+      expect(session.revision()).toBe(3); // never committed
+      expect(vault.status()).toBe('locked');
+      expect(vault.items()).toEqual([]);
+    });
+
+    it('a stale tab cannot save a preview', async () => {
+      await unlockedWith(3);
+      const shown = vault.previewPassword(PASSWORD_PRESETS.default);
+      vault.status.set('stale');
+      await expect(vault.savePreview('password', shown, 'gen')).rejects.toBeInstanceOf(ConflictError);
+      expect(store.writes).toBe(0);
+    });
   });
 });

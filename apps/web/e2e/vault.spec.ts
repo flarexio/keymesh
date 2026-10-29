@@ -112,9 +112,10 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   );
   expect(attrs.some((v) => v.includes('SYNTHMARK-PW') || v.includes('SYNTHMARK-CUSTOM'))).toBe(false);
 
-  // Generators: values created inside WASM and stored as encrypted items.
+  // Generators: values created inside WASM; Save stores the shown preview.
   await page.getByRole('button', { name: 'Generators' }).click();
-  await page.getByRole('button', { name: en['gen.saveAsSecret'] }).first().click();
+  await page.getByTestId('generate-password').click();
+  await page.getByTestId('save-password').click();
   await expect(page.locator('#detail-title')).toHaveText('Generated password');
   await expect(page.locator('.detail')).toContainText(en['detail.originGenerated']);
   const genRow = page.locator('km-secret-field', { hasText: 'Secret' });
@@ -122,7 +123,8 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   // Revealed: exactly 24 non-space characters (default profile).
   await expect(genRow.getByTestId('secret-value')).toHaveText(/^\s*\S{24}\s*$/);
   await page.getByRole('button', { name: 'Generators' }).click();
-  await page.getByRole('button', { name: en['gen.saveAsSecret'] }).nth(1).click();
+  await page.getByTestId('generate-secret').click();
+  await page.getByTestId('save-secret').click();
   await expect(page.locator('#detail-title')).toHaveText('Generated secret');
   const hexRow = page.locator('km-secret-field', { hasText: 'Secret' });
   await hexRow.getByRole('button', { name: 'Reveal' }).click();
