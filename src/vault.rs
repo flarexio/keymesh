@@ -159,10 +159,80 @@ enum ParsedFile {
     V2(VaultFileV2, SlotSet),
 }
 
+/// Walks a JSON document from its original bytes and fails on any object
+/// that repeats a member name, at any depth. `serde_json::Value` keeps only
+/// the last of duplicate names, so this must run on the raw text first.
+struct NoDuplicates;
+
+impl<'de> serde::de::DeserializeSeed<'de> for NoDuplicates {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> std::result::Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for NoDuplicates {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<(), A::Error> {
+        while seq.next_element_seed(NoDuplicates)?.is_some() {}
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<(), A::Error> {
+        let mut names = std::collections::BTreeSet::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if !names.insert(name) {
+                return Err(serde::de::Error::custom("duplicate member name"));
+            }
+            map.next_value_seed(NoDuplicates)?;
+        }
+        Ok(())
+    }
+}
+
+fn reject_duplicate_members(bytes: &[u8]) -> Result<()> {
+    use serde::de::DeserializeSeed;
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    NoDuplicates
+        .deserialize(&mut de)
+        .and_then(|()| de.end())
+        .map_err(|_| {
+            Error::Format("not a keymesh vault (malformed or duplicate JSON members)".into())
+        })
+}
+
 /// Parse and validate the unencrypted envelope without decrypting. Every
 /// bound (version, algorithm, ids, key slots and their KDF cost) is checked
-/// here, before any key derivation.
+/// here, before any key derivation. Duplicate JSON member names anywhere in
+/// the envelope are refused first, so every reader sees one unambiguous value.
 fn parse_any(bytes: &[u8]) -> Result<ParsedFile> {
+    reject_duplicate_members(bytes)?;
     // Check format/version before strict parsing so future versions produce a
     // clear "unknown format" error rather than a schema error.
     let probe: serde_json::Value = serde_json::from_slice(bytes)
@@ -457,6 +527,13 @@ impl Vault {
     }
 
     /// Install a pending recovery code once the user entered it back.
+    ///
+    /// The pending wrapper must belong to THIS vault: it is unwrapped with
+    /// this vault's id and the confirmed code, and the result must equal this
+    /// vault's DEK (constant time). A pending code made for another vault (or
+    /// any wrapper that does not open to this DEK) is refused and nothing
+    /// changes. A pending code stays valid across a password change of the
+    /// same vault, because the DEK is unchanged.
     pub fn finish_recovery_change(
         &mut self,
         pending: PendingRecovery,
@@ -464,6 +541,14 @@ impl Vault {
     ) -> Result<()> {
         if !pending.code.ct_eq(confirmation) {
             return Err(Error::validation("recovery code does not match"));
+        }
+        let wrong_vault = || Error::validation("this recovery code was made for another vault");
+        let dek = pending
+            .slot
+            .unwrap(&self.vault_id, confirmation.secret())
+            .map_err(|_| wrong_vault())?;
+        if !bool::from(dek.as_bytes().ct_eq(self.dek.as_bytes())) {
+            return Err(wrong_vault());
         }
         let next = self.slots()?.replace(pending.slot)?;
         if let Keys::Slots {
@@ -1450,5 +1535,148 @@ mod tests {
         j["items"][0]["sealed"] = j["items"][1]["sealed"].clone();
         j["items"][1]["sealed"] = a;
         assert!(Vault::open_with_password(&bytes_of(&j), PW).is_err());
+    }
+
+    // --- review fixes: recovery binding, duplicate JSON members --------------
+
+    #[test]
+    fn v2_pending_recovery_from_another_vault_is_refused_and_changes_nothing() {
+        let (mut a, code_a, _) = protected();
+        let (setup, key) = shared();
+        let other = ProtectedSetup {
+            vault_id: data_encoding::HEXLOWER.encode(&[0x22; 16]),
+            password: setup.password.clone(),
+        };
+        let (mut b, code_b) = Vault::create_protected(&other, key, &mut OsRandom).unwrap();
+        b.confirm_recovery(&code_b).unwrap();
+        let pending = a
+            .begin_recovery_change(Authority::Recovery(&code_a), &mut OsRandom)
+            .unwrap();
+        let confirmation = RecoveryCode::parse(&pending.code().to_text()).unwrap();
+        let before = b.slots().unwrap().clone();
+        assert!(b.finish_recovery_change(pending, &confirmation).is_err());
+        assert_eq!(b.slots().unwrap(), &before, "recovery slot untouched");
+        let (bytes, _) = b.seal_next_protected(&mut OsRandom).unwrap();
+        assert!(
+            Vault::open_with_recovery(&bytes, &code_b).is_ok(),
+            "old code still works"
+        );
+        assert!(Vault::open_with_recovery(&bytes, &confirmation).is_err());
+        // An unconfirmed receiving vault is not marked confirmed by a foreign pending.
+        let (mut c, _code_c) = Vault::create_protected(&other, key, &mut OsRandom).unwrap();
+        let pending = a
+            .begin_recovery_change(Authority::Recovery(&code_a), &mut OsRandom)
+            .unwrap();
+        let confirmation = RecoveryCode::parse(&pending.code().to_text()).unwrap();
+        assert!(c.finish_recovery_change(pending, &confirmation).is_err());
+        assert!(!c.recovery_confirmed());
+        // The same pending still works in its own vault.
+        let pending = a
+            .begin_recovery_change(Authority::Recovery(&code_a), &mut OsRandom)
+            .unwrap();
+        let confirmation = RecoveryCode::parse(&pending.code().to_text()).unwrap();
+        a.finish_recovery_change(pending, &confirmation).unwrap();
+        let (bytes, _) = a.seal_next_protected(&mut OsRandom).unwrap();
+        assert!(Vault::open_with_recovery(&bytes, &confirmation).is_ok());
+    }
+
+    #[test]
+    fn v2_pending_recovery_stays_valid_across_a_password_change() {
+        // Same vault, same DEK: a password rewrap in between does not
+        // invalidate a pending recovery code (documented semantics).
+        let (mut v, code, _) = protected();
+        let pending = v
+            .begin_recovery_change(Authority::Recovery(&code), &mut OsRandom)
+            .unwrap();
+        let confirmation = RecoveryCode::parse(&pending.code().to_text()).unwrap();
+        let setup = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let k = setup.derive("synthetic interim passphrase").unwrap();
+        v.change_password(Authority::Recovery(&code), &setup, &k, &mut OsRandom)
+            .unwrap();
+        v.finish_recovery_change(pending, &confirmation).unwrap();
+        let (bytes, _) = v.seal_next_protected(&mut OsRandom).unwrap();
+        assert!(Vault::open_with_recovery(&bytes, &confirmation).is_ok());
+        assert!(Vault::open_with_recovery(&bytes, &code).is_err());
+    }
+
+    /// Insert raw text (duplicate members cannot be built with `Value`).
+    fn raw_dup(bytes: &[u8], find: &str, replace: &str) -> Vec<u8> {
+        let s = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(s.contains(find), "fixture shape: {find}");
+        s.replacen(find, replace, 1).into_bytes()
+    }
+
+    #[test]
+    fn v2_duplicate_json_members_are_rejected_at_every_level() {
+        let (_v, code, bytes) = protected();
+        let cases = [
+            (
+                "top-level version",
+                "\"version\": 2,",
+                "\"version\": 999, \"version\": 2,",
+            ),
+            (
+                "top-level revision",
+                "\"revision\": 1,",
+                "\"revision\": 1, \"revision\": 1,",
+            ),
+            (
+                "slot kind",
+                "\"kind\": \"password\",",
+                "\"kind\": \"recovery\", \"kind\": \"password\",",
+            ),
+            (
+                "kdf m_kib",
+                "\"m_kib\": 65536,",
+                "\"m_kib\": 4294967295, \"m_kib\": 65536,",
+            ),
+            (
+                "kdf tag",
+                "\"alg\": \"argon2id\",",
+                "\"alg\": \"argon2id\", \"alg\": \"argon2id\",",
+            ),
+            (
+                "wrapped nonce",
+                "\"wrapped\": {",
+                "\"wrapped\": { \"ct\": \"AAAA\",",
+            ),
+            ("item rev", "\"rev\": 1,", "\"rev\": 1, \"rev\": 1,"),
+        ];
+        for (name, find, replace) in cases {
+            let dup = raw_dup(&bytes, find, replace);
+            assert!(
+                matches!(read_header(&dup), Err(Error::Format(_))),
+                "{name}: header"
+            );
+            assert!(
+                matches!(password_request(&dup), Err(Error::Format(_))),
+                "{name}: request"
+            );
+            let r = Vault::open_with_password(&dup, PW);
+            assert!(matches!(r, Err(Error::Format(_))), "{name}: {r:?}");
+            assert!(
+                Vault::open_with_recovery(&dup, &code).is_err(),
+                "{name}: recovery"
+            );
+        }
+        // The untouched envelope still opens (no false positives on valid input).
+        assert!(Vault::open_with_password(&bytes, PW).is_ok());
+    }
+
+    #[test]
+    fn v1_duplicate_json_members_are_rejected_and_valid_v1_still_opens() {
+        let p = provider();
+        let (_v, bytes) = sample(&p);
+        for (find, replace) in [
+            ("\"version\": 1,", "\"version\": 2, \"version\": 1,"),
+            ("\"kek_id\": ", "\"kek_id\": \"x\", \"kek_id\": "),
+        ] {
+            let dup = raw_dup(&bytes, find, replace);
+            assert!(
+                matches!(Vault::decrypt(&dup, &p), Err(Error::Format(_))),
+                "{find}"
+            );
+        }
+        assert_eq!(Vault::decrypt(&bytes, &p).unwrap().len(), 2);
     }
 }

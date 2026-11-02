@@ -112,11 +112,12 @@ Which metadata is authenticated, and when:
 
 ## 6. Validation and failure handling
 
-Everything below is checked when the file is parsed, before any key derivation. Order: bounded read (64 MiB, the same as v1), JSON, format, version, then per-version strict schema (`deny_unknown_fields`).
+Everything below is checked when the file is parsed, before any key derivation. Order: bounded read (64 MiB, the same as v1), then a strict pass over the original bytes that **refuses any repeated JSON member name at any depth** (header, slots, KDF objects including the `alg` tag, wrappers, items), then format, version, and per-version strict schema (`deny_unknown_fields`). Every reader therefore sees one unambiguous value; first-wins and last-wins parsers cannot disagree.
 
 | Input | Handling |
 |---|---|
 | Unknown `version`, unknown `aead` | `Format` error |
+| A repeated member name anywhere (e.g. `"version": 999, "version": 2`, or a hostile `m_kib` followed by a bounded one) | `Format` error, before any other check; v1 files follow the same rule |
 | v2 file relabelled `version: 1` (or the reverse) | `Format` error: the v1 schema has no `slots`, and the v2 schema has no `kek_id`/`wrapped_dek` |
 | v1 file opened with a password, v2 file opened with a demo key | `Format` error ("demo vault without a password" / "opens with its password or recovery code") |
 | Slot count outside 1..=8, not exactly one `password` and one `recovery`, duplicate slot id | `Format` error |
@@ -188,7 +189,7 @@ Choice: **m = 64 MiB, t = 3, p = 1, 16-byte salt, 32-byte output.**
 | Unlock | password | Opens a session |
 | Reset password | recovery code (the core unwraps the recovery slot) | New password slot with a fresh id and salt; same DEK |
 | Change password | current password: its Argon2 key must unwrap the current slot to the in-memory DEK (constant-time compare) | Same as reset |
-| New recovery code | current password | New code shown once; installed only after it is typed back; same DEK |
+| New recovery code | current password | New code shown once; installed only after it is typed back. Installing also unwraps the new slot with **this** vault's id and the typed code and requires the DEK it yields to equal this vault's DEK (constant-time), so a pending code made for another vault is refused and nothing changes. A pending code stays valid across a password change of the same vault (same DEK) |
 | Restore from backup | that backup's password (stored as is) or its recovery code plus a new password (stored as a new revision) | Allowed into empty storage, or over the unlocked vault this tab last saw (compare-and-swap) |
 
 Changing a password or recovery code is a **rewrap, not a rotation**:
@@ -213,6 +214,10 @@ Changing a password or recovery code is a **rewrap, not a rotation**:
 * The atomic replace is a temp file, fsync, rename, then a directory fsync.
 * **Before replacing:** the file is re-read, and the save is refused unless its SHA-256 equals the bytes this process last read or wrote.
 * **This is a check, then a rename, not a lock:** Keymesh assumes a single writer per vault file and does not implement file locking. Two processes saving in the same instant can still race.
+* **Before vs after the rename:**
+  * Everything that can fail deterministically happens before the rename: writing and syncing the temp file, and opening the directory for the final sync. A failure there leaves the old file, and memory, untouched.
+  * If the directory sync fails **after** the rename, the result is `Error::DurabilityUncertain`. The new file is in place, the in-memory revision and snapshot are reconciled to it, and the caller is told the change is in effect: treat the new password or code as active, keep the old one until the vault opens with the new one, and make a fresh backup.
+  * The CLI exits with status 3 for this case; durability is not claimed.
 * Every CLI command opens the vault itself, running Argon2id each time; there is no agent or key cache.
 * Credentials come from the terminal without echo, or with `--password-stdin` one line each. They never come from arguments or the environment.
 

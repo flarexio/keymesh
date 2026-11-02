@@ -11,12 +11,15 @@
 import { createServer as createHttp } from 'node:http';
 import { createServer as createHttps } from 'node:https';
 import { isIP } from 'node:net';
-import { readFile, stat } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
-import { extname, join, normalize, resolve } from 'node:path';
+import { readFile, realpath, stat } from 'node:fs/promises';
+import { readFileSync, realpathSync } from 'node:fs';
+import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = resolve(fileURLToPath(new URL('../dist/web/browser', import.meta.url)));
+// STATIC_ROOT overrides the build directory (used by scripts/serve.test.mjs).
+const root = resolve(process.env.STATIC_ROOT?.trim() || fileURLToPath(new URL('../dist/web/browser', import.meta.url)));
+// Containment is checked against the real (symlink-resolved) root.
+const realRoot = realpathSync(root);
 const port = Number(process.argv[2] ?? process.env.PORT ?? 4310);
 const host = process.env.HOST?.trim() || '127.0.0.1';
 if (!isIP(host) || /^(0\.0\.0\.0|::|0*:(0*:)*0*)$/.test(host)) {
@@ -51,18 +54,45 @@ const security = {
   ...(tls ? { 'Strict-Transport-Security': 'max-age=31536000' } : {}),
 };
 
+/** True if `p` is the root itself or strictly below it (separator-aware). */
+function inside(p) {
+  const rel = relative(realRoot, p);
+  return rel === '' || (rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel));
+}
+
+function fail(res, status) {
+  res.writeHead(status, security);
+  res.end(status === 400 ? 'bad request' : 'not found');
+}
+
+/**
+ * Serves only regular files whose real path (after resolving symlinks) lies
+ * inside the build root. Malformed percent-encoding, NUL and backslashes are
+ * 400; anything resolving outside the root is 404 (never the SPA shell);
+ * missing paths inside the root get index.html (client-side routes).
+ */
 async function handler(req, res) {
+  let path;
   try {
-    const path = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname);
-    let file = normalize(join(root, path));
-    if (!file.startsWith(root)) throw new Error('outside root');
-    if (!(await stat(file).catch(() => null))?.isFile()) file = join(root, 'index.html');
+    path = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname);
+  } catch {
+    return fail(res, 400);
+  }
+  if (path.includes('\0') || path.includes('\\')) return fail(res, 400);
+  const candidate = resolve(realRoot, '.' + path);
+  if (!inside(candidate)) return fail(res, 404);
+  try {
+    let file = join(realRoot, 'index.html');
+    if ((await stat(candidate).catch(() => null))?.isFile()) {
+      const real = await realpath(candidate);
+      if (!inside(real)) return fail(res, 404);
+      file = real;
+    }
     const body = await readFile(file);
     res.writeHead(200, { 'Content-Type': types[extname(file)] ?? 'application/octet-stream', ...security });
     res.end(body);
   } catch {
-    res.writeHead(404, security);
-    res.end('not found');
+    fail(res, 404);
   }
 }
 

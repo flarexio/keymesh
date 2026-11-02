@@ -49,6 +49,12 @@ type View = 'create' | 'unlock' | 'reset';
           <span class="state-icon"><km-icon name="lock" /></span>
           <h2 id="protected-title">{{ i18n.t('protected.unlock.title') }}</h2>
           <p class="lead">{{ i18n.t('protected.unlock.lead') }}</p>
+          @if (vault.protectedReloaded()) {
+            <div class="callout callout-warn" role="status" data-testid="protected-reloaded">
+              <km-icon name="info" />
+              <p>{{ i18n.t('protected.reloaded') }}</p>
+            </div>
+          }
           <form class="form-stack" (submit)="unlock($event)">
             <km-secret-input label="protected.password" name="password" autocomplete="current-password" testid="unlock-password" [(value)]="password" />
             <div class="form-actions">

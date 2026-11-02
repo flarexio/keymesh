@@ -331,6 +331,7 @@ export const zhTW: Record<MessageKey, string> = {
   'protected.unlock.title': '解鎖保險庫',
   'protected.unlock.lead': '輸入主密碼，開啟儲存在此瀏覽器中的保險庫。',
   'protected.unlock.button': '解鎖',
+  'protected.reloaded': '此保險庫已在其他分頁或視窗中變更，因此已鎖定。請解鎖以載入最新版本。',
   'protected.unlocking': '正在解鎖…',
   'protected.forgot': '忘記密碼？',
   'protected.reset.title': '使用復原碼重設',

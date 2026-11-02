@@ -48,6 +48,7 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 - **Rewrap, not rotation:** changing the password or recovery code doesn't revoke older backups or data already read. Compromise rotation is not implemented.
 - **Weak passwords stay guessable offline:** anyone with the file can try passwords at about one Argon2id (64 MiB, t=3) per guess. Use a long passphrase; the recovery code itself cannot be guessed.
 - **Single writer:** `save` refuses unless the file is byte for byte what was loaded, but there is no file lock. Two writers racing during the save can still conflict.
+- **Durability:** if the system can't sync the directory after the new file is in place, the CLI exits with status 3 and says the change is in effect but durability is unconfirmed. A failure before that point leaves the old file untouched.
 - **Whole-file rollback** to an older valid vault file can't be detected without external state.
 - **Size limit:** vault files are limited to 64 MiB for both reading and writing. A save that would exceed it is refused and leaves the old file intact.
 - **Browser key handling (M2):** the demo key provider lives in WASM memory only.

@@ -15,6 +15,9 @@
 //! * `backup` and `restore` verify the source decrypts before writing.
 //! * Reads and writes share one size bound ([`MAX_VAULT_BYTES`]); an oversize
 //!   vault is refused before anything is written.
+//! * A failure reported before the rename means the old file is untouched; a
+//!   directory-sync failure after it is [`Error::DurabilityUncertain`]: the
+//!   change is in effect and in-memory state already matches it.
 
 use crate::crypto::KeyProvider;
 use crate::error::{Error, Result};
@@ -55,6 +58,12 @@ fn check_write_size(bytes: &[u8], limit: u64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection: make the post-rename directory sync fail.
+    static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn parent_dir(path: &Path) -> PathBuf {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -64,8 +73,22 @@ fn parent_dir(path: &Path) -> PathBuf {
 
 /// Atomically write `bytes` to `path`. With `no_clobber`, fails if `path`
 /// already exists.
+///
+/// Outcome contract:
+/// * `Err(Error::Io | ..)`: **nothing was replaced**; the old file (if any) is
+///   untouched. Everything that can fail deterministically (creating, writing
+///   and syncing the temp file, and opening the directory for the final sync)
+///   happens before the rename.
+/// * `Err(Error::DurabilityUncertain)`: the rename **already happened** (the
+///   new bytes are in place), but syncing the directory failed, so durability
+///   across a crash is not confirmed. Callers must treat the write as
+///   committed (see [`committed`]).
 pub fn atomic_write(path: &Path, bytes: &[u8], no_clobber: bool) -> Result<()> {
     let dir = parent_dir(path);
+    // Opened up front: a directory we cannot open for syncing fails here,
+    // before the target is replaced.
+    #[cfg(unix)]
+    let dir_handle = fs::File::open(&dir)?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".keymesh-")
         .suffix(".tmp")
@@ -83,11 +106,35 @@ pub fn atomic_write(path: &Path, bytes: &[u8], no_clobber: bool) -> Result<()> {
     } else {
         tmp.persist(path).map_err(|e| e.error)?;
     }
+    // From here on the new file is in place.
     #[cfg(unix)]
-    {
-        fs::File::open(&dir)?.sync_all()?;
-    }
+    sync_dir(&dir_handle).map_err(|e| Error::DurabilityUncertain(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_SYNC.with(|f| f.get()) {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
+    dir.sync_all()
+}
+
+/// After [`atomic_write`] for `vault`'s sealed `revision`: on success or on
+/// a post-rename durability failure the bytes are on disk, so memory is
+/// reconciled to them (revision and exact-byte snapshot) before the
+/// durability error, if any, is returned. A pre-rename failure leaves memory
+/// unchanged, matching the untouched file.
+fn committed(vault: &mut Vault, revision: u64, bytes: &[u8], write: Result<()>) -> Result<()> {
+    match write {
+        Ok(()) => vault.mark_written(revision, bytes),
+        Err(e @ Error::DurabilityUncertain(_)) => {
+            vault.mark_written(revision, bytes)?;
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub fn create(
@@ -117,9 +164,8 @@ pub(crate) fn create_limited(
     }
     let (bytes, rev) = vault.seal_next(provider, rng)?;
     check_write_size(&bytes, limit)?;
-    atomic_write(path, &bytes, true)?;
-    vault.mark_written(rev, &bytes)?;
-    Ok(())
+    let write = atomic_write(path, &bytes, true);
+    committed(vault, rev, &bytes, write)
 }
 
 pub fn load(path: &Path, provider: &dyn KeyProvider) -> Result<Vault> {
@@ -153,9 +199,8 @@ pub(crate) fn save_limited(
     check_unchanged(path, vault, limit)?;
     let (bytes, rev) = vault.seal_next(provider, rng)?;
     check_write_size(&bytes, limit)?;
-    atomic_write(path, &bytes, false)?;
-    vault.mark_written(rev, &bytes)?;
-    Ok(())
+    let write = atomic_write(path, &bytes, false);
+    committed(vault, rev, &bytes, write)
 }
 
 /// The file must still be exactly what `vault` last read or wrote.
@@ -192,8 +237,8 @@ pub fn create_protected(path: &Path, vault: &mut Vault, rng: &mut dyn RandomSour
     }
     let (bytes, rev) = vault.seal_next_protected(rng)?;
     check_write_size(&bytes, MAX_VAULT_BYTES)?;
-    atomic_write(path, &bytes, true)?;
-    vault.mark_written(rev, &bytes)
+    let write = atomic_write(path, &bytes, true);
+    committed(vault, rev, &bytes, write)
 }
 
 /// Bounded read of an envelope (for password/recovery unlock).
@@ -205,8 +250,8 @@ pub fn save_protected(path: &Path, vault: &mut Vault, rng: &mut dyn RandomSource
     check_unchanged(path, vault, MAX_VAULT_BYTES)?;
     let (bytes, rev) = vault.seal_next_protected(rng)?;
     check_write_size(&bytes, MAX_VAULT_BYTES)?;
-    atomic_write(path, &bytes, false)?;
-    vault.mark_written(rev, &bytes)
+    let write = atomic_write(path, &bytes, false);
+    committed(vault, rev, &bytes, write)
 }
 
 /// Write `vault` (already opened, e.g. from a backup with its recovery code
@@ -220,8 +265,8 @@ pub fn write_protected_to(
 ) -> Result<()> {
     let (bytes, rev) = vault.seal_next_protected(rng)?;
     check_write_size(&bytes, MAX_VAULT_BYTES)?;
-    atomic_write(dest, &bytes, !overwrite)?;
-    vault.mark_written(rev, &bytes)
+    let write = atomic_write(dest, &bytes, !overwrite);
+    committed(vault, rev, &bytes, write)
 }
 
 /// Write backup bytes the caller already opened to `dest` (restore).
@@ -572,5 +617,230 @@ mod tests {
             })
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    // --- persistence outcome: before vs after the replacing rename ------------
+
+    use crate::keyslot::{Authority, PasswordSetup};
+
+    /// Turns on the test-only post-rename directory-sync fault for its scope.
+    struct DirSyncFault;
+    impl DirSyncFault {
+        fn on() -> Self {
+            FAIL_DIR_SYNC.with(|f| f.set(true));
+            DirSyncFault
+        }
+    }
+    impl Drop for DirSyncFault {
+        fn drop(&mut self) {
+            FAIL_DIR_SYNC.with(|f| f.set(false));
+        }
+    }
+
+    const PW2: &str = "synthetic storage passphrase two";
+
+    /// Open `path` with PW and change its password to PW2 in memory.
+    fn with_new_password(path: &Path) -> Vault {
+        let bytes = read_envelope(path).unwrap();
+        let mut v = Vault::open_with_password(&bytes, PW).unwrap();
+        let cur = v.password_setup().unwrap().derive(PW).unwrap();
+        let setup = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let new = setup.derive(PW2).unwrap();
+        v.change_password(Authority::PasswordKey(&cur), &setup, &new, &mut OsRandom)
+            .unwrap();
+        v
+    }
+
+    fn digest(path: &Path) -> [u8; 32] {
+        Sha256::digest(fs::read(path).unwrap()).into()
+    }
+
+    #[cfg(unix)]
+    struct DirMode(PathBuf);
+    #[cfg(unix)]
+    impl DirMode {
+        fn set(dir: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+            DirMode(dir.to_path_buf())
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for DirMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// A directory that can be written and searched but not opened (mode
+    /// 0300): the failure must happen BEFORE the file is replaced.
+    #[cfg(unix)]
+    #[test]
+    fn unopenable_directory_fails_before_replacing_and_keeps_old_credentials() {
+        if is_root() {
+            return; // root ignores directory permissions
+        }
+        let (d, path, p) = setup();
+        let original = protected_file(&path);
+        let mut v = with_new_password(&path);
+        let r = {
+            let _mode = DirMode::set(d.path(), 0o300);
+            save_protected(&path, &mut v, &mut OsRandom)
+        };
+        assert!(matches!(r, Err(Error::Io(_))), "{r:?}");
+        assert_eq!(fs::read(&path).unwrap(), original, "file not replaced");
+        assert_eq!(v.revision(), 1, "memory not advanced");
+        assert!(
+            Vault::open_with_password(&original, PW).is_ok(),
+            "old password still opens"
+        );
+        assert!(Vault::open_with_password(&original, PW2).is_err());
+        // Same boundary for create and the v1 demo save.
+        let fresh = d.path().join("fresh.keymesh");
+        let (mut n, code) = Vault::create_with_password(PW, &mut OsRandom).unwrap();
+        n.confirm_recovery(&code).unwrap();
+        let demo = d.path().join("demo.keymesh");
+        let mut dv = Vault::create(&p, &mut OsRandom).unwrap();
+        create(&demo, &mut dv, &p, &mut OsRandom).unwrap();
+        let demo_before = fs::read(&demo).unwrap();
+        dv.insert(note("x")).unwrap();
+        {
+            let _mode = DirMode::set(d.path(), 0o300);
+            assert!(matches!(
+                create_protected(&fresh, &mut n, &mut OsRandom),
+                Err(Error::Io(_))
+            ));
+            assert!(matches!(
+                save(&demo, &mut dv, &p, &mut OsRandom),
+                Err(Error::Io(_))
+            ));
+        }
+        assert!(!fresh.exists());
+        assert_eq!(n.revision(), 0);
+        assert_eq!(fs::read(&demo).unwrap(), demo_before);
+        assert_eq!(dv.revision(), 1);
+        let leftovers = fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "no temp files left");
+    }
+
+    #[test]
+    fn dir_sync_failure_after_a_credential_save_is_reported_as_committed() {
+        let (_d, path, _p) = setup();
+        let original = protected_file(&path);
+        let mut v = with_new_password(&path);
+        let r = {
+            let _f = DirSyncFault::on();
+            save_protected(&path, &mut v, &mut OsRandom)
+        };
+        assert!(matches!(r, Err(Error::DurabilityUncertain(_))), "{r:?}");
+        // The replacement happened: the NEW password is the one that opens it.
+        let now = fs::read(&path).unwrap();
+        assert_ne!(now, original);
+        assert!(Vault::open_with_password(&now, PW2).is_ok());
+        assert!(Vault::open_with_password(&now, PW).is_err());
+        // Memory is reconciled to the committed file, so work can continue.
+        assert_eq!(v.revision(), 2);
+        assert_eq!(v.snapshot_digest(), Some(digest(&path)));
+        v.insert(note("after")).unwrap();
+        save_protected(&path, &mut v, &mut OsRandom).unwrap();
+        assert_eq!(v.revision(), 3);
+        // The message tells the caller the change is in effect.
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("in effect") && msg.contains("treat the new one as active"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn dir_sync_failure_after_create_recover_restore_and_backup_is_committed() {
+        let (d, path, p) = setup();
+        let (mut n, code) = Vault::create_with_password(PW, &mut OsRandom).unwrap();
+        n.confirm_recovery(&code).unwrap();
+        {
+            let _f = DirSyncFault::on();
+            assert!(matches!(
+                create_protected(&path, &mut n, &mut OsRandom),
+                Err(Error::DurabilityUncertain(_))
+            ));
+        }
+        assert!(path.exists());
+        assert_eq!(n.revision(), 1);
+        assert_eq!(n.snapshot_digest(), Some(digest(&path)));
+        save_protected(&path, &mut n, &mut OsRandom).unwrap();
+
+        // Recover into a new file (recovery code + new password).
+        let bytes = read_envelope(&path).unwrap();
+        let mut r = Vault::open_with_recovery(&bytes, &code).unwrap();
+        let setup = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let key = setup.derive(PW2).unwrap();
+        r.change_password(Authority::Recovery(&code), &setup, &key, &mut OsRandom)
+            .unwrap();
+        let dest = d.path().join("recovered.keymesh");
+        {
+            let _f = DirSyncFault::on();
+            assert!(matches!(
+                write_protected_to(&dest, &mut r, &mut OsRandom, false),
+                Err(Error::DurabilityUncertain(_))
+            ));
+        }
+        assert!(Vault::open_with_password(&fs::read(&dest).unwrap(), PW2).is_ok());
+        assert_eq!(r.snapshot_digest(), Some(digest(&dest)));
+
+        // Restore / backup copies (no in-memory state to reconcile).
+        let bak = d.path().join("copy.keymesh");
+        let restored = d.path().join("restored.keymesh");
+        {
+            let _f = DirSyncFault::on();
+            assert!(matches!(
+                write_backup(&bak, &bytes),
+                Err(Error::DurabilityUncertain(_))
+            ));
+            assert!(matches!(
+                restore_verified(&bytes, &restored, false),
+                Err(Error::DurabilityUncertain(_))
+            ));
+        }
+        assert_eq!(fs::read(&bak).unwrap(), bytes);
+        assert_eq!(fs::read(&restored).unwrap(), bytes);
+
+        // v1 demo create/save follow the same rule.
+        let demo = d.path().join("demo.keymesh");
+        let mut dv = Vault::create(&p, &mut OsRandom).unwrap();
+        {
+            let _f = DirSyncFault::on();
+            assert!(matches!(
+                create(&demo, &mut dv, &p, &mut OsRandom),
+                Err(Error::DurabilityUncertain(_))
+            ));
+        }
+        assert_eq!(dv.revision(), 1);
+        dv.insert(note("demo")).unwrap();
+        {
+            let _f = DirSyncFault::on();
+            assert!(matches!(
+                save(&demo, &mut dv, &p, &mut OsRandom),
+                Err(Error::DurabilityUncertain(_))
+            ));
+        }
+        assert_eq!(dv.revision(), 2);
+        assert_eq!(load(&demo, &p).unwrap().len(), 1);
+        save(&demo, &mut dv, &p, &mut OsRandom).unwrap();
     }
 }

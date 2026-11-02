@@ -681,4 +681,70 @@ describe('VaultService password vault', () => {
       expect(await stored(prot)).toEqual(Array.from(other));
     });
   });
+  describe('stale reload keeps the password vault (never opens the demo)', () => {
+    beforeEach(() => setup());
+
+    async function staleAfterExternalChange(): Promise<Uint8Array> {
+      await unlocked(3);
+      const cur = (await prot.read())!.bytes;
+      const external = v2(9);
+      await prot.compareAndSwap(cur, rec(external));
+      // A write from this tab now hits the CAS and marks it stale.
+      const p = vault.changePassword(GOOD_PW, NEW_PW);
+      await until(() => kdf.calls.length > 0, 'KDF call');
+      kdf.release(0);
+      await until(() => kdf.calls.length > 1, 'second KDF call');
+      kdf.release(1);
+      await expect(p).rejects.toBeInstanceOf(ConflictError);
+      expect(vault.status()).toBe('stale');
+      kdf.calls = [];
+      kdf.returned = [];
+      return external;
+    }
+
+    it('with a demo vault stored: reload returns to password entry, demo untouched and not opened', async () => {
+      const demoBytes = new Uint8Array([1, 4, 77, 1]);
+      await demo.create({ bytes: demoBytes, vaultId: 'd', kekId: 'synthetic-fixture-v1', revision: 4 });
+      const external = await staleAfterExternalChange();
+      const opened = sessions.length;
+      demo.writes = 0;
+      prot.writes = 0;
+      await vault.reload();
+      expect(vault.status()).not.toBe('unlocked');
+      expect(vault.keyMode()).not.toBe('synthetic-fixture');
+      expect(vault.isProtected()).toBe(false);
+      expect(sessions.length).toBe(opened); // nothing decrypted
+      expect(vault.protectedStored()?.revision).toBe(external[1]);
+      expect(await stored(demo)).toEqual(Array.from(demoBytes));
+      expect(demo.writes).toBe(0);
+      expect(prot.writes).toBe(0); // reload never writes
+      // Unlocking now opens the CURRENT protected snapshot.
+      const u = vault.unlockWithPassword(GOOD_PW);
+      await until(() => kdf.calls.length > 0, 'KDF call');
+      kdf.release(0);
+      await u;
+      expect(vault.keyMode()).toBe('protected');
+      expect(vault.revision()).toBe(external[1]);
+    });
+
+    it('without a demo vault: reload succeeds and leaves the password vault locked', async () => {
+      const external = await staleAfterExternalChange();
+      prot.writes = 0;
+      await expect(vault.reload()).resolves.toBeUndefined();
+      expect(vault.status()).toBe('empty');
+      expect(vault.protectedStored()?.revision).toBe(external[1]);
+      expect(vault.protectedReloaded()).toBe(true);
+      expect(prot.writes).toBe(0); // reload never writes
+      expect(await demo.read()).toBeNull();
+    });
+
+    it('if the password vault was deleted elsewhere, reload shows no stored password vault', async () => {
+      await unlocked(3);
+      const cur = (await prot.read())!.bytes;
+      await prot.compareAndClear(cur);
+      await vault.reload();
+      expect(vault.protectedStored()).toBeNull();
+      expect(vault.status()).not.toBe('unlocked');
+    });
+  });
 });

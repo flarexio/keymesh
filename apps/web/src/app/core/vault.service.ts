@@ -186,6 +186,8 @@ export class VaultService {
   readonly confirmingNewVault = signal(false);
   /** A password/recovery operation (KDF) is running. */
   readonly credentialBusy = signal(false);
+  /** A password vault was locked by "Load latest version"; unlock to continue. */
+  readonly protectedReloaded = signal(false);
   /** The open session is a password vault. */
   readonly isProtected = computed(() => this.keyMode() === 'protected');
   readonly keyMode = signal<KeyMode | null>(null);
@@ -301,6 +303,7 @@ export class VaultService {
       this.key = key;
     }
     this.active = key ? 'demo' : 'protected';
+    this.protectedReloaded.set(false);
     this.snapshot = bytes;
     this.setStoredInfo(bytes);
     this.keyMode.set(key ? (key.mode as KeyMode) : 'protected');
@@ -1029,9 +1032,27 @@ export class VaultService {
     });
   }
 
-  /** Re-read storage after a conflict; unsaved in-memory changes are dropped. */
+  /**
+   * Re-read storage after a conflict; unsaved in-memory changes are dropped.
+   * The vault keeps its identity: a demo vault is reopened with its key, a
+   * password vault is locked and its current stored copy re-read, so the
+   * user unlocks it again with a credential. A password-vault conflict never
+   * opens (or touches) the demo vault.
+   */
   async reload(): Promise<void> {
+    const wasProtected = this.active === 'protected';
     this.lock();
-    await this.openStored();
+    if (!wasProtected) {
+      await this.openStored();
+      return;
+    }
+    this.protectedReloaded.set(true);
+    await this.run(async (guard) => {
+      this.requireSecure();
+      const rec = await this.protStore.read();
+      guard();
+      this.protSnap = rec?.bytes ?? null;
+      this.protectedStored.set(rec ? this.info(rec.bytes) : null);
+    });
   }
 }

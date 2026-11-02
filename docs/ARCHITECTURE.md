@@ -190,6 +190,7 @@ The key is never exported to JavaScript and never appears in the URL, storage, c
 * **One credential operation at a time:** a second one is refused (`busy`), not queued.
 * **Lock cancels:** `lock()` terminates the worker and frees an unconfirmed new vault. Every step re-checks the lock generation after the KDF, after IndexedDB and after file reads.
 * **Create:** a password → `VaultSession.createProtected` (in memory) → the recovery code is shown → the user types it back → the core verifies it by unwrapping the recovery slot → seal → compare-and-swap into empty storage → open.
+* **Stale password vault:** "Load latest version" locks the password vault, re-reads only its own database and returns to password entry, with a notice. It never opens or touches the demo vault. Unlocking then opens the current stored copy.
 * **Other flows:** unlock; reset with the recovery code; restore a v2 backup with its password (stored unchanged) or its recovery code plus a new password; change password; new recovery code; delete from this browser. All writes use the same exact-byte compare-and-swap. Failed credential writes roll the core back (`rollback`).
 * **Product copy mapping:** "Password vault" is envelope v2; "Demo vault" is v1 with the ephemeral or fixture key; "Securing your vault…" is the Argon2id step; "Password vaults need a secure connection" means a non-secure context.
 

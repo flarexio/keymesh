@@ -9,6 +9,12 @@
 //!   chars, synthetic demo key provider). The file's version decides which
 //!   unlock applies; a demo vault is never converted into a protected one.
 //!
+//! Exit status: 0 success; 1 failure (a failed save never replaces the vault
+//! file; `import-op apply` may still have saved before reporting failed
+//! targets); 3 the change was
+//! written and is in effect but the directory sync failed, so durability is
+//! unconfirmed (see `Error::DurabilityUncertain`).
+//!
 //! Secrets are never taken from command-line arguments: the password and
 //! recovery code are read from the terminal without echo, or with
 //! `--password-stdin` one line each from stdin (the first lines), followed by
@@ -924,6 +930,13 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
+        // Exit 3: the file WAS replaced (the change is in effect) but its
+        // durability is unconfirmed; distinct from ordinary failures (exit 1),
+        // where a failed save left the vault file untouched.
+        Err(e @ Error::DurabilityUncertain(_)) => {
+            eprintln!("warning: {e}");
+            ExitCode::from(3)
+        }
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE

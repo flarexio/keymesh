@@ -24,6 +24,12 @@ Passing A or B does not imply C:
 * `TLS_CERT=<pem> TLS_KEY=<pem>` switches to HTTPS, with a minimum of TLS 1.2 and `Strict-Transport-Security: max-age=31536000` (no `includeSubDomains`/`preload`).
 * `HOST` must still be one literal IP. Wildcards (`0.0.0.0`, `::`) are refused, and the default is `127.0.0.1`.
 * Certificate and key paths are never logged.
+* **Static-root containment:**
+  * Only regular files whose real path, with symlinks resolved, lies inside the build root are served.
+  * The check is separator-aware, so siblings that merely share the root's name prefix are excluded.
+  * Malformed percent-encoding, NUL and backslashes are refused with 400. Anything resolving outside the root is a 404, never the SPA shell.
+  * Covered by `npm run test:serve` (127.0.0.1:4313, temporary synthetic tree).
+  * Servers already running keep the handler they started with until they are restarted. The two HTTP previews were not restarted, because that is not authorised.
 * Keys must stay outside the repository; `*.pem` and `*.key` are git-ignored.
 
 **Same-origin delivery, with the CSP preserved:**

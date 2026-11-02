@@ -328,6 +328,7 @@ export const en = {
   'protected.unlock.title': 'Unlock your vault',
   'protected.unlock.lead': 'Enter your master password to open the vault saved in this browser.',
   'protected.unlock.button': 'Unlock',
+  'protected.reloaded': 'This vault was changed in another tab or window, so it was locked. Unlock it to load the latest version.',
   'protected.unlocking': 'Unlocking…',
   'protected.forgot': 'Forgot your password?',
   'protected.reset.title': 'Reset with your recovery code',

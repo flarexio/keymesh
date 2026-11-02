@@ -354,3 +354,32 @@ fn demo_and_password_vaults_stay_separate() {
         .unwrap();
     assert!(!o.status.success(), "no password, no access");
 }
+
+/// A directory that can be written and searched but not opened (mode 0300):
+/// `passwd` must fail BEFORE replacing the file, so the old password keeps
+/// working and the new one does not.
+#[cfg(unix)]
+#[test]
+fn passwd_that_cannot_sync_the_directory_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root ignores directory permissions
+    }
+    let c = Ctx::new();
+    let sub = c.path("locked-dir");
+    std::fs::create_dir(&sub).unwrap();
+    let v = sub.join("vault.keymesh");
+    c.init(&v, PW);
+    let before = std::fs::read(&v).unwrap();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let o = c.run_at(&v, &["passwd"], &format!("{PW}\n{PW2}\n"));
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!o.status.success());
+    assert_eq!(std::fs::read(&v).unwrap(), before, "file not replaced");
+    list(&c, &v, PW); // old password still opens (ok_at asserts success)
+    assert!(!c
+        .run_at(&v, &["list"], &format!("{PW2}\n"))
+        .status
+        .success());
+}

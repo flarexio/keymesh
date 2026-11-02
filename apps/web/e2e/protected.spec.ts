@@ -277,6 +277,9 @@ test('hostile or broken backups are refused and leave the stored vault usable', 
     ['removed recovery slot', JSON.stringify({ ...base, slots: [base.slots[0]] })],
     ['unknown version', JSON.stringify({ ...base, version: 3 })],
     ['relabelled as demo', JSON.stringify({ ...base, version: 1 })],
+    // Raw duplicate members (cannot be built with JSON.stringify).
+    ['duplicate version member', vectors.envelope.json.replace('"version": 2,', '"version": 999, "version": 2,')],
+    ['duplicate KDF member', vectors.envelope.json.replace('"m_kib": 65536,', '"m_kib": 4294967295, "m_kib": 65536,')],
   ];
   for (const [name, content] of variants) {
     const path = testInfo.outputPath(`${name.replace(/\W+/g, '-')}.keymesh`);
@@ -490,3 +493,61 @@ test('a demo vault stays a demo vault next to a password vault (no conversion)',
   await page.getByTestId('unlock').click();
   await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'ephemeral');
 });
+
+for (const withDemo of [true, false]) {
+  test(`stale password vault: "Load latest version" returns to password entry and never opens the demo (demo ${withDemo ? 'present' : 'absent'})`, async ({ context }, testInfo) => {
+    const a = await context.newPage();
+    const consoleLines: string[] = [];
+    a.on('console', (m) => consoleLines.push(m.text()));
+    let demoBefore: Buffer = Buffer.alloc(0);
+    if (withDemo) {
+      await a.goto('/');
+      await a.locator('input[name=mode][value=synthetic-fixture]').check();
+      await a.getByTestId('start-vault').click();
+      await expect(a.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'synthetic-fixture');
+      await a.getByTestId('lock').click();
+      demoBefore = await storedBytes(a);
+      expect(demoBefore.length).toBeGreaterThan(0);
+    }
+    const code = await createVault(a);
+    await a.getByTestId('nav-backup').click();
+
+    // Tab B replaces the password vault with a different valid backup.
+    const b = await context.newPage();
+    await b.goto('/');
+    await unlock(b, PW);
+    await expect(b.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected', { timeout: 30_000 });
+    await b.getByTestId('nav-backup').click();
+    const path = testInfo.outputPath('replacement.keymesh');
+    await writeFile(path, vectors.envelope.json);
+    await b.getByTestId('protected-restore-input').setInputFiles(path);
+    await b.getByTestId('restore-password').fill(vectors.envelope.password);
+    await b.getByTestId('protected-restore').click();
+    await expect(b.getByTestId('backup-status')).toContainText(en['backup.restored'], { timeout: 30_000 });
+    const current = await storedBytes(b, PDB);
+
+    // Tab A is stale; its reload must stay on the password vault.
+    await expect(a.locator('.callout.stale')).toBeVisible({ timeout: 30_000 });
+    await a.locator('.callout.stale button').click();
+    await expect(a.getByTestId('unlock-password')).toBeVisible();
+    await expect(a.getByTestId('protected-reloaded')).toContainText(en['protected.reloaded']);
+    await expect(a.getByTestId('key-mode')).toHaveCount(0); // nothing is open
+    await expect(a.getByTestId('start-error')).toHaveCount(0);
+    expect((await storedBytes(a)).equals(demoBefore), 'demo vault untouched').toBe(true);
+    expect((await storedBytes(a, PDB)).equals(current), 'stale tab wrote nothing').toBe(true);
+
+    // The old password no longer opens the CURRENT copy; the new copy's does.
+    await unlock(a, PW);
+    await expect(a.getByTestId('protected-error')).toContainText(en['errors.wrongPassword'], { timeout: 30_000 });
+    await unlock(a, vectors.envelope.password);
+    await expect(a.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected', { timeout: 30_000 });
+    await expect(titles(a)).toHaveText(vectors.envelope.titles);
+    await assertNothingLeaked(a, [PW, code, vectors.envelope.recovery_code], consoleLines);
+    if (withDemo) {
+      // The demo is still there and still a demo, opened only on request.
+      await a.getByTestId('lock').click();
+      await a.locator('[data-testid=unlock], [data-testid=open-fixture]').click();
+      await expect(a.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'synthetic-fixture');
+    }
+  });
+}

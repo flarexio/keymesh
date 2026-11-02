@@ -46,6 +46,18 @@ pub enum Error {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The new file already replaced the old one, but the system could not
+    /// confirm it is durable (the directory sync failed). The caller must
+    /// treat the change as committed: memory is reconciled to the new file,
+    /// and new credentials may already be the only ones that open it.
+    #[error(
+        "the change was written and is now in effect, but the system could not confirm it is \
+         safely on disk ({0}); if it changed a password or recovery code, treat the new one as \
+         active and keep the previous one until the vault opens with the new one; then make a \
+         fresh backup"
+    )]
+    DurabilityUncertain(String),
 }
 
 impl Error {

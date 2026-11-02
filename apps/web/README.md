@@ -46,6 +46,7 @@ Traffic is unencrypted. Anyone on the network can read the served app and could 
 ```sh
 TLS_CERT=/outside/repo/fullchain.pem TLS_KEY=/outside/repo/key.pem node scripts/serve.mjs 4443   # loopback by default
 npm run tls-check   # throwaway CA on 127.0.0.1:4311: chain, hostname, TLS floor, headers, secure-context flow
+npm run test:serve  # static-root containment (prefix siblings, symlinks, bad encodings) on 127.0.0.1:4313
 ```
 
 `tls-check` proves TLS mechanics on loopback only. A certificate that client devices actually trust, and permission to run an HTTPS listener on a private address, are open decisions (`docs/DELIVERY.md` §4).
