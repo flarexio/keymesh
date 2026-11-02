@@ -113,8 +113,31 @@ export class VaultStore {
     return this.db;
   }
 
+  /**
+   * Open for reading without creating the database: if it does not exist yet
+   * the upgrade is aborted (nothing is created) and the result is null.
+   */
+  private openExisting(): Promise<IDBDatabase | null> {
+    if (this.db) return this.db;
+    return new Promise((resolve, reject) => {
+      let missing = false;
+      const r = this.factory.open(this.name, 1);
+      r.onupgradeneeded = () => {
+        missing = true;
+        r.transaction?.abort();
+      };
+      r.onsuccess = () => {
+        this.db ??= Promise.resolve(r.result);
+        resolve(r.result);
+      };
+      r.onerror = () => (missing ? resolve(null) : reject(r.error ?? new Error('cannot open IndexedDB')));
+      r.onblocked = () => reject(new Error('IndexedDB is blocked'));
+    });
+  }
+
   async read(): Promise<StoredVault | null> {
-    const db = await this.open();
+    const db = await this.openExisting();
+    if (!db) return null;
     const tx = db.transaction('vault', 'readonly');
     const v = await req(tx.objectStore('vault').get(KEY));
     if (v === undefined) return null;

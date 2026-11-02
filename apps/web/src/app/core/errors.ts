@@ -12,6 +12,14 @@ import { ConflictError } from './vault-store';
 /** Core (Rust/WASM) error text → key. Matched on fixed English fragments. */
 const CORE_PATTERNS: [RegExp, MessageKey][] = [
   [/^decryption failed/, 'errors.decrypt'],
+  [/^validation failed: password is (too short|empty)/, 'errors.passwordShort'],
+  [/^validation failed: password is too long/, 'errors.passwordLong'],
+  [/^validation failed: password is too common/, 'errors.passwordCommon'],
+  [/^validation failed: recovery code is not valid/, 'errors.recoveryInvalid'],
+  [/^unsupported or unknown format: unsupported recovery code version/, 'errors.recoveryInvalid'],
+  [/^validation failed: recovery code does not match/, 'errors.recoveryMismatch'],
+  [/^unsupported or unknown format: this is a demo vault/, 'errors.demoBackup'],
+  [/^unsupported or unknown format: this vault opens with its password/, 'errors.protectedBackup'],
   [/^unsupported or unknown format: vault (would )?exceeds? the maximum/, 'errors.vaultTooLarge'],
   [/^unsupported or unknown format/, 'errors.format'],
   [/^vault integrity check failed/, 'errors.integrity'],

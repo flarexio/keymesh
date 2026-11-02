@@ -11,6 +11,7 @@ import {
   RFC_URI,
   assertNoMarkers,
   browserStorageSummary,
+  createAllKinds,
   category,
   confirmDialog,
   create,
@@ -21,62 +22,6 @@ import {
   storedBytes,
   titles,
 } from './helpers';
-
-async function createAllKinds(page: Page) {
-  // Login with secrets, notes, recovery code and a concealed custom field.
-  await newItem(page, 'login');
-  await field(page, 'Title').fill(M.loginTitle);
-  await field(page, 'Username').fill('synth-user');
-  await field(page, 'Password').fill(M.password);
-  await field(page, 'URLs').fill(M.url);
-  await field(page, 'Recovery codes').fill(M.recovery);
-  await field(page, 'Tags').fill('synthetic, e2e');
-  await field(page, 'Notes').fill(M.notes);
-  await page.getByRole('button', { name: 'Add custom field' }).click();
-  await field(page, 'Label').fill('backup pin');
-  await field(page, 'Value').fill(M.customSecret);
-  await field(page, 'Concealed').check();
-  await create(page, M.loginTitle);
-
-  await newItem(page, 'secret');
-  await field(page, 'Title').fill('Synthetic API credential');
-  await field(page, 'Secret / API credential').fill(M.secret);
-  await field(page, 'Service').fill('api.example.test');
-  await create(page, 'Synthetic API credential');
-
-  await newItem(page, 'contact');
-  await field(page, 'Title').fill('Synthetic contact');
-  await field(page, 'Full name').fill(M.contactName);
-  await field(page, 'Organization').fill('Example Org');
-  await field(page, 'Emails').fill(`work | ${M.email}\nhome@example.test`);
-  await field(page, 'Phones').fill('+1 555 0100\nmobile | +1 555 0199');
-  await create(page, 'Synthetic contact');
-  await expect(page.locator('.detail')).toContainText(M.email);
-  await expect(page.locator('.detail')).toContainText('+1 555 0199');
-
-  await newItem(page, 'crypto_wallet');
-  await field(page, 'Title').fill('Synthetic wallet');
-  await field(page, 'Network').fill('testnet');
-  await field(page, 'Wallet addresses').fill('synthetic-addr-1');
-  await field(page, 'Recovery phrase').fill(M.walletPhrase);
-  await create(page, 'Synthetic wallet');
-
-  await newItem(page, 'secure_note');
-  await field(page, 'Title').fill('Synthetic note');
-  await field(page, 'Note').fill(M.noteBody);
-  await create(page, 'Synthetic note');
-
-  await newItem(page, 'totp');
-  await field(page, 'Title').fill('Synthetic TOTP');
-  await field(page, 'otpauth:// URI or Base32 secret').fill(RFC_URI);
-  await create(page, 'Synthetic TOTP');
-
-  await newItem(page, 'ed25519_key');
-  await field(page, 'Title').fill('Synthetic Ed25519');
-  await field(page, 'Comment').fill('synthetic@e2e');
-  await create(page, 'Synthetic Ed25519');
-  await expect(page.locator('.detail')).toContainText('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5');
-}
 
 test('full vault flow: create, generate, edit, search, lock, unlock, persist, backup, restore', async ({
   page,

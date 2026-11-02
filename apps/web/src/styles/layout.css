@@ -562,3 +562,11 @@ html:lang(en) .eyebrow {
     gap: var(--space-1);
   }
 }
+
+/* ---- Start: password vault + demo ---- */
+
+.start-main {
+  display: grid;
+  gap: var(--space-6);
+  min-width: 0;
+}

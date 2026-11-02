@@ -5,7 +5,7 @@
  */
 import { TestBed } from '@angular/core/testing';
 import { IDBFactory } from 'fake-indexeddb';
-import { CORE_LOADER, LockedError, StaleWorkError, VAULT_STORE, VaultService } from './vault.service';
+import { CORE_LOADER, LockedError, PROTECTED_VAULT_STORE, StaleWorkError, VAULT_STORE, VaultService } from './vault.service';
 import { errorKey } from './errors';
 import { PASSWORD_PRESETS } from './password-options';
 import { ConflictError, StoredVault, VaultStore } from './vault-store';
@@ -157,6 +157,7 @@ describe('VaultService lock / restore / concurrency', () => {
     TestBed.configureTestingModule({
       providers: [
         { provide: VAULT_STORE, useValue: store },
+        { provide: PROTECTED_VAULT_STORE, useValue: new VaultStore(new IDBFactory(), 'keymesh-vault') },
         { provide: CORE_LOADER, useValue: () => Promise.resolve(fakeCore) },
       ],
     });

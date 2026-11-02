@@ -69,7 +69,7 @@ const TABS: { id: Tab; label: MessageKey; icon: IconName }[] = [
           <span class="status-dot" [class.warn]="vault.status() === 'stale'" aria-hidden="true"></span>
           <span>
             <span class="status-line">{{ i18n.t(vault.status() === 'stale' ? 'shell.statusStale' : 'shell.statusOpen') }}</span>
-            <span class="status-meta">{{ i18n.t(vault.keyMode() === 'synthetic-fixture' ? 'vault.type.fixture' : 'vault.type.ephemeral') }}</span>
+            <span class="status-meta">{{ i18n.t(vault.keyMode() === 'protected' ? 'vault.type.protected' : vault.keyMode() === 'synthetic-fixture' ? 'vault.type.fixture' : 'vault.type.ephemeral') }}</span>
           </span>
         </div>
       </aside>

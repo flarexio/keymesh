@@ -1,8 +1,18 @@
 /**
- * Vault session lifecycle for the browser demo.
+ * Vault session lifecycle in the browser.
  *
- * - The key provider is DEVELOPMENT ONLY and lives in WASM memory; its key is
- *   never visible to JavaScript, the URL, storage or logs.
+ * Two separate vaults, each in its own IndexedDB database:
+ * - **Demo vault** (envelope v1): a DEVELOPMENT ONLY key provider (public
+ *   fixture key or a memory-only ephemeral key) that lives in WASM memory;
+ *   its key is never visible to JavaScript, the URL, storage or logs.
+ * - **Password vault** (envelope v2; experimental until independently
+ *   reviewed): a master password and a recovery code, each wrapping the
+ *   vault's random data key. Only available in a secure context (HTTPS or
+ *   this device); on a plain-HTTP address every password-vault operation is
+ *   refused and the demo stays usable. Argon2id runs in a worker
+ *   (`KDF_RUNNER`); one credential operation runs at a time, and a lock
+ *   terminates it. A demo vault is never converted into a password vault.
+ *
  * - Every mutation runs inside the Rust core, is sealed there and persisted
  *   to IndexedDB with an exact-snapshot compare-and-swap; the session revision
  *   only advances after the write succeeded.
@@ -16,6 +26,7 @@
  */
 import { Injectable, InjectionToken, computed, inject, signal } from '@angular/core';
 import { CLOCK } from './clock';
+import { KDF_RUNNER, KdfBusyError, KdfCancelledError } from './kdf';
 import { ConflictError, StoredVault, VaultStore } from './vault-store';
 import type { PasswordOptions } from './password-options';
 import { Core, loadCore } from './wasm';
@@ -39,7 +50,8 @@ export type Status =
   | 'stale' // storage changed elsewhere; reload required
   | 'failed';
 
-export type KeyMode = 'ephemeral' | 'synthetic-fixture';
+export type KeyMode = 'ephemeral' | 'synthetic-fixture' | 'protected';
+export type DemoKeyMode = Exclude<KeyMode, 'protected'>;
 
 export class LockedError extends Error {
   constructor() {
@@ -54,7 +66,15 @@ export type VaultErrorCode =
   | 'ephemeralKeyLost'
   | 'restoreNotAllowed'
   | 'backupTooLarge'
-  | 'backupRejected';
+  | 'backupRejected'
+  | 'insecureContext'
+  | 'protectedExists'
+  | 'noPendingVault'
+  | 'wrongPassword'
+  | 'wrongRecovery'
+  | 'demoBackup'
+  | 'protectedBackup'
+  | 'busy';
 
 export class VaultError extends Error {
   constructor(
@@ -88,6 +108,21 @@ export const VAULT_STORE = new InjectionToken<VaultStore>('keymesh.vault-store',
   factory: () => new VaultStore(indexedDB),
 });
 
+/** Password-vault (v2) envelopes; never shared with the demo database. */
+export const PROTECTED_VAULT_STORE = new InjectionToken<VaultStore>('keymesh.protected-vault-store', {
+  providedIn: 'root',
+  factory: () => new VaultStore(indexedDB, 'keymesh-vault'),
+});
+
+/**
+ * Whether the page is a secure context (W3C Secure Contexts: HTTPS, or
+ * loopback). Plain HTTP on a LAN/VPN address is not.
+ */
+export const SECURE_CONTEXT = new InjectionToken<boolean>('keymesh.secure-context', {
+  providedIn: 'root',
+  factory: () => globalThis.isSecureContext === true,
+});
+
 /** Loads the compiled core; tests may substitute a controllable fake. */
 export const CORE_LOADER = new InjectionToken<() => Promise<Core>>('keymesh.core-loader', {
   providedIn: 'root',
@@ -109,20 +144,50 @@ type Guard = () => void;
 @Injectable({ providedIn: 'root' })
 export class VaultService {
   private readonly clock = inject(CLOCK);
-  private readonly store = inject(VAULT_STORE);
+  private readonly demoStore = inject(VAULT_STORE);
+  private readonly protStore = inject(PROTECTED_VAULT_STORE);
+  private readonly kdf = inject(KDF_RUNNER);
+  /** Secure context: password vaults are allowed. */
+  readonly secure = inject(SECURE_CONTEXT);
   private readonly loadCore = inject(CORE_LOADER);
   private core: Core | null = null;
   private key: DemoKeyProvider | null = null;
   private session: VaultSession | null = null;
-  /** Exact stored envelope this tab last read or wrote (CAS snapshot). */
-  private snapshot: Uint8Array | null = null;
+  /** Which vault the open session (or the next operation) belongs to. */
+  private active: 'demo' | 'protected' = 'demo';
+  /** Exact stored envelopes this tab last read or wrote (CAS snapshots). */
+  private demoSnap: Uint8Array | null = null;
+  private protSnap: Uint8Array | null = null;
+  /** A new password vault waiting for its recovery code to be confirmed. */
+  private creating: VaultSession | null = null;
+  private credentialOp = false;
+
+  private get store(): VaultStore {
+    return this.active === 'protected' ? this.protStore : this.demoStore;
+  }
+  private get snapshot(): Uint8Array | null {
+    return this.active === 'protected' ? this.protSnap : this.demoSnap;
+  }
+  private set snapshot(v: Uint8Array | null) {
+    if (this.active === 'protected') this.protSnap = v;
+    else this.demoSnap = v;
+  }
   private epoch = 0;
   private queue: Promise<unknown> = Promise.resolve();
   private channel: BroadcastChannel | null =
     typeof BroadcastChannel === 'undefined' ? null : new BroadcastChannel('keymesh-vault');
 
   readonly status = signal<Status>('loading');
+  /** Demo vault stored in this browser. */
   readonly stored = signal<EnvelopeInfo | null>(null);
+  /** Password vault stored in this browser (only read in a secure context). */
+  readonly protectedStored = signal<EnvelopeInfo | null>(null);
+  /** A new password vault is waiting for recovery-code confirmation. */
+  readonly confirmingNewVault = signal(false);
+  /** A password/recovery operation (KDF) is running. */
+  readonly credentialBusy = signal(false);
+  /** The open session is a password vault. */
+  readonly isProtected = computed(() => this.keyMode() === 'protected');
   readonly keyMode = signal<KeyMode | null>(null);
   readonly error = signal<string | null>(null);
   readonly query = signal('');
@@ -148,7 +213,13 @@ export class VaultService {
       this.maxBytes.set(this.core.maxEnvelopeBytes());
       this.coreReady.set(true);
       await this.run(async (guard) => {
-        const rec = await this.store.read();
+        if (this.secure) {
+          const prot = await this.protStore.read();
+          guard();
+          this.protSnap = prot?.bytes ?? null;
+          this.protectedStored.set(prot ? this.info(prot.bytes) : null);
+        }
+        const rec = await this.demoStore.read();
         guard();
         this.showStored(rec);
       });
@@ -176,8 +247,9 @@ export class VaultService {
     return this.session;
   }
 
+  /** Demo vault state after a read (start screen). */
   private showStored(rec: StoredVault | null): void {
-    this.snapshot = rec?.bytes ?? null;
+    this.demoSnap = rec?.bytes ?? null;
     this.stored.set(rec ? this.info(rec.bytes) : null);
     this.status.set(rec ? (this.key ? 'locked' : 'stored') : 'empty');
   }
@@ -186,7 +258,7 @@ export class VaultService {
     return JSON.parse(this.c().inspectEnvelope(bytes)) as EnvelopeInfo;
   }
 
-  private provider(mode: KeyMode): DemoKeyProvider {
+  private provider(mode: DemoKeyMode): DemoKeyProvider {
     return mode === 'ephemeral'
       ? this.c().DemoKeyProvider.ephemeral()
       : this.c().DemoKeyProvider.syntheticFixture();
@@ -207,19 +279,31 @@ export class VaultService {
 
   private record(bytes: Uint8Array): StoredVault {
     const info = this.info(bytes);
-    return { bytes, vaultId: info.vault_id, kekId: info.kek_id, revision: info.revision };
+    return { bytes, vaultId: info.vault_id, kekId: info.kek_id ?? 'v2-key-slots', revision: info.revision };
   }
 
-  /** Install a decrypted session. Invalidates work invoked before it. */
-  private install(s: VaultSession, key: DemoKeyProvider, bytes: Uint8Array): void {
+  private setStoredInfo(bytes: Uint8Array): void {
+    (this.active === 'protected' ? this.protectedStored : this.stored).set(this.info(bytes));
+  }
+
+  /**
+   * Install a decrypted session (`key` null: password vault). Invalidates
+   * work invoked before it.
+   */
+  private install(s: VaultSession, key: DemoKeyProvider | null, bytes: Uint8Array): void {
     this.epoch++;
     this.session?.free();
     this.session = s;
-    if (this.key && this.key !== key) this.key.free();
-    this.key = key;
+    // A password session leaves the demo key alone (an ephemeral demo vault
+    // stays openable after the password vault is locked).
+    if (key) {
+      if (this.key && this.key !== key) this.key.free();
+      this.key = key;
+    }
+    this.active = key ? 'demo' : 'protected';
     this.snapshot = bytes;
-    this.stored.set(this.info(bytes));
-    this.keyMode.set(key.mode as KeyMode);
+    this.setStoredInfo(bytes);
+    this.keyMode.set(key ? (key.mode as KeyMode) : 'protected');
     this.revision.set(s.revision());
     this.status.set('unlocked');
     this.error.set(null);
@@ -244,9 +328,10 @@ export class VaultService {
     return p;
   }
 
-  /** New empty vault, persisted immediately. Refuses if one is stored. */
-  startNew(mode: KeyMode): Promise<void> {
+  /** New empty demo vault, persisted immediately. Refuses if one is stored. */
+  startNew(mode: DemoKeyMode): Promise<void> {
     return this.run(async (guard) => {
+      this.active = 'demo';
       const key = this.provider(mode);
       const s = this.c().VaultSession.create(key);
       const sealed = s.seal(key);
@@ -286,6 +371,7 @@ export class VaultService {
    *  or the key still held in memory (unlock after lock). */
   openStored(): Promise<void> {
     return this.run(async (guard) => {
+      this.active = 'demo';
       const rec = await this.store.read();
       guard();
       if (!rec) throw new VaultError('noStoredVault', 'No stored demo vault.');
@@ -305,22 +391,34 @@ export class VaultService {
     });
   }
 
-  /** Remove decrypted state. Every pending or queued operation is cancelled. */
+  /**
+   * Remove decrypted state. Every pending or queued operation is cancelled,
+   * including a running key derivation and an unconfirmed new vault.
+   */
   lock(): void {
     this.epoch++;
+    this.kdf.cancel();
     this.session?.lock();
     this.session?.free();
     this.session = null;
+    this.creating?.lock();
+    this.creating?.free();
+    this.creating = null;
+    this.confirmingNewVault.set(false);
+    if (this.active === 'protected') {
+      this.active = 'demo';
+      this.keyMode.set(this.key ? (this.key.mode as KeyMode) : null);
+    }
     this.items.set([]);
     this.query.set('');
     this.version.update((v) => v + 1);
-    this.status.set(this.stored() ? 'locked' : 'empty');
+    this.status.set(this.stored() ? (this.key ? 'locked' : 'stored') : 'empty');
   }
 
   /** Discard the stored demo vault, but only the one this tab last saw. */
   discard(): Promise<void> {
-    const expected = this.snapshot;
     this.lock();
+    const expected = this.demoSnap;
     return this.run(async (guard) => {
       await this.store.compareAndClear(expected, guard);
       guard();
@@ -328,6 +426,393 @@ export class VaultService {
       this.key = null;
       this.keyMode.set(null);
       this.showStored(null);
+    });
+  }
+
+  // --- password vault (envelope v2) -------------------------------------------
+
+  /** 1 (demo), 2 (password vault) or null if the bytes are not an envelope. */
+  envelopeVersion(bytes: Uint8Array): number | null {
+    try {
+      return this.info(bytes).version ?? 1;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Version of a backup file the user picked (bounded read), or null. */
+  async fileVersion(file: File): Promise<number | null> {
+    if (file.size > this.maxBytes()) throw new VaultError('backupTooLarge', 'Backup file is too large.');
+    return this.envelopeVersion(new Uint8Array(await file.arrayBuffer()));
+  }
+
+  /** Throws a localized-code error when `password` can't be a new master password. */
+  checkNewPassword(password: string): void {
+    this.c().checkNewPassword(password);
+  }
+
+  private requireSecure(): void {
+    if (!this.secure) {
+      throw new VaultError('insecureContext', 'Password vaults need a secure (HTTPS) connection.');
+    }
+  }
+
+  /**
+   * One credential operation at a time, refused (not queued) while another
+   * runs, so a double click can never start a second key derivation.
+   */
+  private credential<T>(fn: (guard: Guard) => Promise<T>): Promise<T> {
+    try {
+      this.requireSecure();
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    if (this.credentialOp) return Promise.reject(new VaultError('busy', 'Another unlock is in progress.'));
+    this.credentialOp = true;
+    this.credentialBusy.set(true);
+    return this.run(fn)
+      .catch((e: unknown) => {
+        if (e instanceof KdfCancelledError) throw new StaleWorkError();
+        if (e instanceof KdfBusyError) throw new VaultError('busy', 'Another unlock is in progress.');
+        throw e;
+      })
+      .finally(() => {
+        this.credentialOp = false;
+        this.credentialBusy.set(false);
+      });
+  }
+
+  /**
+   * Argon2id in the worker for a core-issued request. The lock generation is
+   * re-checked when it returns; a stale result is zeroed and dropped.
+   */
+  private async derive(password: string, request: string, guard: Guard): Promise<Uint8Array> {
+    const key = await this.kdf.derive(password, request);
+    if (this.isStale(guard)) {
+      key.fill(0);
+      throw new StaleWorkError();
+    }
+    return key;
+  }
+
+  /**
+   * Step 1 of creating a password vault: derive the password key and build
+   * the vault in memory with a fresh recovery code. Nothing is stored until
+   * `confirmNewVault` gets the recovery code back.
+   */
+  createProtected(password: string): Promise<void> {
+    return this.credential(async (guard) => {
+      this.checkNewPassword(password);
+      const existing = await this.protStore.read();
+      guard();
+      if (existing) throw new VaultError('protectedExists', 'A password vault already exists in this browser.');
+      const creation = new (this.c().ProtectedCreation)();
+      try {
+        const key = await this.derive(password, creation.request(), guard);
+        try {
+          const s = this.c().VaultSession.createProtected(creation, key);
+          this.creating?.free();
+          this.creating = s;
+        } finally {
+          key.fill(0);
+        }
+      } finally {
+        creation.free();
+      }
+      this.confirmingNewVault.set(true);
+    });
+  }
+
+  /** The new vault's recovery code, for display until it is confirmed. */
+  newVaultRecoveryCode(): string {
+    if (!this.creating) throw new VaultError('noPendingVault', 'No new vault is waiting.');
+    return this.creating.shownRecoveryCode();
+  }
+
+  /**
+   * Step 2: the core checks the typed code (by unwrapping the recovery slot),
+   * then the empty vault is stored (only if no password vault exists) and
+   * opened. A wrong code keeps the pending vault so it can be retried.
+   */
+  confirmNewVault(code: string): Promise<void> {
+    return this.run(async (guard) => {
+      this.requireSecure();
+      const s = this.creating;
+      if (!s) throw new VaultError('noPendingVault', 'No new vault is waiting.');
+      s.confirmRecovery(code);
+      const sealed = s.sealProtected();
+      const bytes = sealed.bytes;
+      const revision = sealed.revision;
+      sealed.free();
+      this.active = 'protected';
+      await this.protStore.create(this.record(bytes), guard);
+      if (this.isStale(guard)) throw new StaleWorkError(true);
+      this.creating = null;
+      this.confirmingNewVault.set(false);
+      s.commit(revision);
+      this.install(s, null, bytes);
+      this.broadcast();
+    });
+  }
+
+  /** Abandon a new vault before it was stored. */
+  cancelNewVault(): void {
+    this.creating?.lock();
+    this.creating?.free();
+    this.creating = null;
+    this.confirmingNewVault.set(false);
+  }
+
+  /** Open the stored password vault after a reload or lock. */
+  unlockWithPassword(password: string): Promise<void> {
+    return this.credential(async (guard) => {
+      const rec = await this.protStore.read();
+      guard();
+      if (!rec) throw new VaultError('noStoredVault', 'No stored vault.');
+      const key = await this.derive(password, this.c().passwordRequest(rec.bytes), guard);
+      let s: VaultSession;
+      try {
+        s = this.c().VaultSession.openWithPasswordKey(rec.bytes, key);
+      } catch (e) {
+        throw this.unlockError(e, 'wrongPassword');
+      } finally {
+        key.fill(0);
+      }
+      this.active = 'protected';
+      this.protSnap = rec.bytes;
+      this.install(s, null, rec.bytes);
+    });
+  }
+
+  private unlockError(e: unknown, code: 'wrongPassword' | 'wrongRecovery'): unknown {
+    return e instanceof Error && /^decryption failed/.test(e.message)
+      ? new VaultError(code, 'The vault could not be opened with this credential.')
+      : e;
+  }
+
+  /**
+   * Forgot the password: open `bytes` with the recovery code, wrap the same
+   * data key under a new password and store the result with a CAS against
+   * `expected`. Shared by "reset password" and "restore with recovery code".
+   */
+  private async recoverInto(
+    bytes: Uint8Array,
+    expected: Uint8Array | null,
+    code: string,
+    newPassword: string,
+    guard: Guard,
+  ): Promise<void> {
+    this.checkNewPassword(newPassword);
+    let s: VaultSession;
+    try {
+      s = this.c().VaultSession.openWithRecovery(bytes, code);
+    } catch (e) {
+      throw this.unlockError(e, 'wrongRecovery');
+    }
+    try {
+      const key = await this.derive(newPassword, s.beginPasswordChange(), guard);
+      try {
+        s.changePasswordWithRecovery(code, key);
+      } finally {
+        key.fill(0);
+      }
+      const sealed = s.sealProtected();
+      const next = sealed.bytes;
+      const revision = sealed.revision;
+      sealed.free();
+      this.active = 'protected';
+      await this.protStore.compareAndSwap(expected, this.record(next), guard);
+      if (this.isStale(guard)) throw new StaleWorkError(true);
+      s.commit(revision);
+      this.install(s, null, next);
+      this.broadcast();
+    } catch (e) {
+      if (this.session !== s) s.free();
+      throw e;
+    }
+  }
+
+  /** Reset the stored vault's password with its recovery code. */
+  resetPassword(code: string, newPassword: string): Promise<void> {
+    return this.credential(async (guard) => {
+      const rec = await this.protStore.read();
+      guard();
+      if (!rec) throw new VaultError('noStoredVault', 'No stored vault.');
+      await this.recoverInto(rec.bytes, rec.bytes, code, newPassword, guard);
+    });
+  }
+
+  /**
+   * Restore a password-vault backup, opened with its own password (stored
+   * as is) or with its recovery code plus a new password. Allowed into empty
+   * storage or over the unlocked password vault this tab last saw.
+   */
+  restoreProtected(
+    file: File,
+    credential: { password: string } | { recoveryCode: string; newPassword: string },
+  ): Promise<void> {
+    return this.credential(async (guard) => {
+      if (this.status() === 'stale') {
+        throw new ConflictError('This tab is out of date. Reload from storage before restoring.', 'staleTab');
+      }
+      const replacing = this.status() === 'unlocked' && this.active === 'protected';
+      if (this.status() === 'unlocked' && !replacing) {
+        throw new VaultError('restoreNotAllowed', 'Lock the demo vault before restoring a password vault.');
+      }
+      const current = await this.protStore.read();
+      guard();
+      if (current && !replacing) {
+        throw new VaultError('restoreNotAllowed', 'Unlock the stored password vault before replacing it.');
+      }
+      const expected = replacing ? this.protSnap : null;
+      if (file.size > this.maxBytes()) throw new VaultError('backupTooLarge', 'Backup file is too large.');
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      guard();
+      if (bytes.length > this.maxBytes()) throw new VaultError('backupTooLarge', 'Backup file is too large.');
+      const version = this.envelopeVersion(bytes);
+      if (version === 1) throw new VaultError('demoBackup', 'This is a demo backup.');
+      if (version !== 2) throw new VaultError('backupRejected', 'Not a Keymesh backup.');
+      if ('recoveryCode' in credential) {
+        await this.recoverInto(bytes, expected, credential.recoveryCode, credential.newPassword, guard);
+        return;
+      }
+      const key = await this.derive(credential.password, this.c().passwordRequest(bytes), guard);
+      let s: VaultSession;
+      try {
+        s = this.c().VaultSession.openWithPasswordKey(bytes, key);
+      } catch (e) {
+        throw this.unlockError(e, 'wrongPassword');
+      } finally {
+        key.fill(0);
+      }
+      try {
+        this.active = 'protected';
+        await this.protStore.compareAndSwap(expected, this.record(bytes), guard);
+        if (this.isStale(guard)) throw new StaleWorkError(true);
+      } catch (e) {
+        s.free();
+        if (e instanceof ConflictError && replacing && !this.isStale(guard)) this.status.set('stale');
+        throw e;
+      }
+      this.install(s, null, bytes);
+      this.broadcast();
+    });
+  }
+
+  /**
+   * Persist a credential change made in `s` (CAS against the snapshot). On
+   * any failure the core rolls back to the stored slots, so memory and
+   * storage keep the old password / recovery code.
+   */
+  private async persistCredentialChange(s: VaultSession, guard: Guard): Promise<void> {
+    const expected = this.protSnap;
+    let bytes: Uint8Array;
+    let revision: number;
+    try {
+      const sealed = s.sealProtected();
+      bytes = sealed.bytes;
+      revision = sealed.revision;
+      sealed.free();
+    } catch (e) {
+      s.rollback();
+      throw e;
+    }
+    try {
+      await this.protStore.compareAndSwap(expected, this.record(bytes), guard);
+    } catch (e) {
+      if (!this.isStale(guard)) {
+        s.rollback();
+        if (e instanceof ConflictError) this.status.set('stale');
+      }
+      throw e;
+    }
+    if (this.isStale(guard)) throw new StaleWorkError(true);
+    s.commit(revision);
+    this.protSnap = bytes;
+    this.revision.set(revision);
+    this.protectedStored.set(this.info(bytes));
+    this.broadcast();
+  }
+
+  private protectedSession(): VaultSession {
+    const s = this.s();
+    if (this.active !== 'protected') throw new VaultError('demoBackup', 'This is a demo vault.');
+    if (this.status() === 'stale') throw new ConflictError();
+    return s;
+  }
+
+  /**
+   * Change the master password. The core verifies `current` by unwrapping
+   * the password slot; only a key derived for the parameters it issued is
+   * accepted. Earlier backups keep the old password.
+   */
+  changePassword(current: string, next: string): Promise<void> {
+    return this.credential(async (guard) => {
+      const s = this.protectedSession();
+      this.checkNewPassword(next);
+      const curReq = s.currentPasswordRequest();
+      const curKey = await this.derive(current, curReq, guard);
+      try {
+        const newKey = await this.derive(next, s.beginPasswordChange(), guard);
+        try {
+          s.changePasswordWithKey(curKey, newKey);
+        } catch (e) {
+          throw this.unlockError(e, 'wrongPassword');
+        } finally {
+          newKey.fill(0);
+        }
+      } finally {
+        curKey.fill(0);
+      }
+      await this.persistCredentialChange(s, guard);
+    });
+  }
+
+  /**
+   * Start replacing the recovery code (needs the current password). Returns
+   * the new code to show; nothing changes until `finishRecoveryChange`.
+   */
+  beginRecoveryChange(current: string): Promise<string> {
+    return this.credential(async (guard) => {
+      const s = this.protectedSession();
+      const key = await this.derive(current, s.currentPasswordRequest(), guard);
+      try {
+        s.beginRecoveryChange(key);
+      } catch (e) {
+        throw this.unlockError(e, 'wrongPassword');
+      } finally {
+        key.fill(0);
+      }
+      return s.shownRecoveryCode();
+    });
+  }
+
+  /** Confirm the new recovery code (typed back) and store it. */
+  finishRecoveryChange(code: string): Promise<void> {
+    return this.run(async (guard) => {
+      this.requireSecure();
+      const s = this.protectedSession();
+      s.finishRecoveryChange(code);
+      await this.persistCredentialChange(s, guard);
+    });
+  }
+
+  cancelRecoveryChange(): void {
+    if (this.session && this.status() === 'unlocked' && this.active === 'protected') {
+      this.session.cancelRecoveryChange();
+    }
+  }
+
+  /** Delete the stored password vault (only the exact one this tab last saw). */
+  discardProtected(): Promise<void> {
+    this.lock();
+    const expected = this.protSnap;
+    return this.run(async (guard) => {
+      this.requireSecure();
+      await this.protStore.compareAndClear(expected, guard);
+      guard();
+      this.protSnap = null;
+      this.protectedStored.set(null);
     });
   }
 
@@ -429,13 +914,13 @@ export class VaultService {
     return this.run(async (guard) => {
       if (this.status() === 'stale') throw new ConflictError();
       const s = this.s();
-      const key = this.key!;
+      const key = this.active === 'protected' ? null : this.key;
       const expected = this.snapshot;
       const result = fn(s);
       let bytes: Uint8Array;
       let revision: number;
       try {
-        const sealed = s.seal(key);
+        const sealed = key ? s.seal(key) : s.sealProtected();
         bytes = sealed.bytes;
         revision = sealed.revision;
         sealed.free();
@@ -457,7 +942,7 @@ export class VaultService {
       s.commit(revision);
       this.snapshot = bytes;
       this.revision.set(revision);
-      this.stored.set(this.info(bytes));
+      this.setStoredInfo(bytes);
       this.version.update((v) => v + 1);
       this.refreshList();
       this.broadcast();
@@ -500,11 +985,18 @@ export class VaultService {
       if (status !== 'unlocked' && status !== 'empty') {
         throw new VaultError('restoreNotAllowed', 'Restore needs an unlocked vault or empty storage.');
       }
+      if (status === 'unlocked' && this.active === 'protected') {
+        throw new VaultError('demoBackup', 'A demo backup cannot replace a password vault.');
+      }
+      this.active = 'demo';
       if (file.size > this.maxBytes()) throw new VaultError('backupTooLarge', 'Backup file is too large.');
       const expected = status === 'unlocked' ? this.snapshot : null;
       const bytes = new Uint8Array(await file.arrayBuffer());
       guard();
       if (bytes.length > this.maxBytes()) throw new VaultError('backupTooLarge', 'Backup file is too large.');
+      if (this.envelopeVersion(bytes) === 2) {
+        throw new VaultError('protectedBackup', 'This backup belongs to a password vault.');
+      }
       const key = this.key ?? this.provider('synthetic-fixture');
       let candidate: VaultSession;
       try {

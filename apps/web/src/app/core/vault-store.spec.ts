@@ -11,6 +11,19 @@ describe('VaultStore (encrypted envelope only, exact-snapshot compare-and-swap)'
     store = new VaultStore(new IDBFactory());
   });
 
+  it('reading a vault that was never written does not create its database', async () => {
+    const factory = new IDBFactory();
+    const s = new VaultStore(factory, 'keymesh-vault');
+    expect(await s.read()).toBeNull();
+    expect(await s.read()).toBeNull();
+    expect((await factory.databases()).map((d) => d.name)).toEqual([]);
+    await s.create(rec(1));
+    expect((await s.read())?.revision).toBe(1);
+    expect((await factory.databases()).map((d) => d.name)).toEqual(['keymesh-vault']);
+    // A second store instance over the existing database reads it.
+    expect((await new VaultStore(factory, 'keymesh-vault').read())?.revision).toBe(1);
+  });
+
   it('create refuses to replace an existing vault', async () => {
     expect(await store.read()).toBeNull();
     await store.create(rec(1));

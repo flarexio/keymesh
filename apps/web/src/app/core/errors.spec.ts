@@ -19,12 +19,25 @@ describe('errorKey', () => {
       'errors.backupRejected',
     );
     expect(errorKey(new VaultError('ephemeralKeyLost', 'x'))).toBe('errors.ephemeralKeyLost');
+    for (const code of ['insecureContext', 'protectedExists', 'wrongPassword', 'wrongRecovery', 'demoBackup', 'protectedBackup', 'busy'] as const) {
+      expect(errorKey(new VaultError(code, 'x'))).toBe(`errors.${code}`);
+    }
     expect(errorKey(new DOMException('denied', 'NotAllowedError'))).toBe('errors.clipboard');
   });
 
   it('maps known core (Rust/WASM) messages', () => {
     const cases: [string, string][] = [
       ['decryption failed: wrong key or corrupted data', 'errors.decrypt'],
+      ['validation failed: password is too short', 'errors.passwordShort'],
+      ['validation failed: password is empty', 'errors.passwordShort'],
+      ['validation failed: password is too long', 'errors.passwordLong'],
+      ['validation failed: password is too common', 'errors.passwordCommon'],
+      ['validation failed: recovery code is not valid', 'errors.recoveryInvalid'],
+      ['unsupported or unknown format: unsupported recovery code version', 'errors.recoveryInvalid'],
+      ['validation failed: recovery code does not match', 'errors.recoveryMismatch'],
+      ['unsupported or unknown format: this is a demo vault without a password', 'errors.demoBackup'],
+      ['unsupported or unknown format: this vault opens with its password or recovery code', 'errors.protectedBackup'],
+      ['unsupported or unknown format: key derivation parameters out of bounds', 'errors.format'],
       ['unsupported or unknown format: vault would exceed the maximum size; the change was discarded', 'errors.vaultTooLarge'],
       ['unsupported or unknown format: vault exceeds the maximum size', 'errors.vaultTooLarge'],
       ['unsupported or unknown format: not a keymesh vault', 'errors.format'],
