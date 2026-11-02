@@ -1,6 +1,6 @@
 # ADR 0001: Local unlock, recovery and trusted delivery
 
-* **Status:** Proposed (design only). Nothing here is implemented, and it does not authorize real-secret entry, Keymesh authentication, identity registration, KMS/NATS/blockchain dependencies, certificates, public deployment or a schema migration.
+* **Status:** Proposed. **Stage 1 (password + recovery slots, secure-context gating) is implemented as experimental in M4; see ADR 0002**, which supersedes §3's sketch where they differ: exact AAD, HKDF over the Argon2 output, and parameters chosen from measurements. Stages 2–4 remain design only. This ADR does not authorize real-secret entry, Keymesh authentication, identity registration, KMS/NATS/blockchain dependencies, public deployment or automatic migration.
 * **Date:** 2026-10-29
 * **Deciders:** FlareX (product owner). Reviewed by Jarvis.
 

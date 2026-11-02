@@ -46,7 +46,7 @@ import { ProtectedStart } from './protected-start';
           }
           @default {
             <h2 id="start-title">{{ i18n.t('start.new.title') }}</h2>
-            <p class="lead">{{ i18n.t('demo.section.lead') }} {{ i18n.t('start.new.lead') }}</p>
+            <p class="lead">{{ i18n.t('demo.section.lead') }}</p>
             <fieldset class="choice-group">
               <legend>{{ i18n.t('start.new.provider') }}</legend>
               @for (o of options; track o.mode) {

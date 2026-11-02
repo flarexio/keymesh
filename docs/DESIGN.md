@@ -46,12 +46,27 @@ No remote fonts, images or icon fonts are loaded. Icons are a small local stroke
 - **Touch:** on `pointer: coarse`, buttons, nav items, menu items and the language/appearance segments are at least 44×44px. That rule sits last in `components.css` so later component rules cannot shrink it; E2E measures it at 320 and 390px in both locales.
 - **Feedback:** inline callouts (info, warning, danger, success) with an icon and text, and short-lived toasts in a polite live region. Errors are localized and never show raw low-level messages.
 - **States:** loading (spinner plus text, static under reduced motion), core failed to start (with a reload action), start, stored vault found, ephemeral key lost, locked, empty vault (a grid of item types to create), no search matches (clear filters), and stale tab (blocking warning plus reload).
+- **Password vault (M4):** the start screen leads with the password vault card and keeps the demo below it, labelled "Demo vault". Card states:
+  - create (password, repeat, hint "at least 15 characters");
+  - recovery code (shown once in 14 monospace groups, Copy, an "I've saved it" checkbox, then typed back);
+  - unlock (password with Show/Hide, "Forgot your password?");
+  - reset with the recovery code;
+  - restore a backup (choose "With its password" or "With the recovery code");
+  - delete from this browser (danger zone);
+  - "Password vaults need a secure connection" on plain HTTP.
+
+  Buttons show progress text ("Securing your vault…", "Unlocking…") and stay disabled while the key derivation runs. The Backup page adds "Password and recovery" (change password, new recovery code) and a plain note that these changes don't affect older backups.
 - **Motion:** short transitions only. `prefers-reduced-motion: reduce` disables transitions and animations.
 
 ## Writing and translation
 
 - Write for people managing credentials: name the goal and the result, not the mechanism. Implementation terms (Rust, WASM, IndexedDB, envelopes, compare-and-swap, key-provider names) belong in `docs/ARCHITECTURE.md`, not on screen. Keep technical terms people need to choose or use something: TOTP, Ed25519, OpenSSH, Base32, otpauth://, hex/base64url, `op`.
-- Limitations stay visible and plain: "Preview version. Do not store real passwords." (預覽版本，請勿存放真實密碼。), no recovery, data loss on reload for "This session only", and failed or blocked saves, each with its consequence and next step. Never claim production safety, audits or guaranteed security.
+- Limitations stay visible and plain, each with its consequence and next step:
+  - "Preview version. Do not store real passwords." (預覽版本，請勿存放真實密碼。);
+  - experimental password vaults;
+  - that no one can reset a lost password and recovery code;
+  - data loss on reload for "This session only";
+  - failed or blocked saves. Never claim production safety, audits or guaranteed security.
 
 - Catalog keys are grouped by area (`start.*`, `list.*`, `detail.*`, `field.*`, `form.*`, `errors.*`, …). Add a key to `en.ts` first; the build fails until `zh-tw.ts` has it too.
 - zh-TW uses Taiwan terminology: 保險庫, 項目, 金鑰, 登入資訊, 產生器, 匯入, 備份, 還原, 設定, 檔案, 剪貼簿 and so on. A unit test rejects common Simplified-only characters.

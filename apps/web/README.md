@@ -1,10 +1,11 @@
-# Keymesh web demo
+# Keymesh web app
 
 An Angular 22 app running the real Keymesh Rust core, compiled to WebAssembly (`crates/keymesh-wasm`). Runtime language 繁體中文 (zh-TW) / English and System / Light / Dark appearance (M3).
 
-> **Synthetic demo, not production.**
-> - The key provider is development-only and memory-only.
-> - There is no real unlock, recovery or account system.
+> **Experimental, not production, not independently reviewed. Synthetic data only.**
+> - **Password vaults** (master password + recovery code, M4) only work in a secure context (HTTPS or 127.0.0.1); see `docs/DELIVERY.md`.
+> - **Demo vaults** use a development-only key (public fixture or memory-only ephemeral).
+> - There is no account, sign-in, sync or reset service.
 > - Do not enter real secrets.
 
 ## Build and run (loopback by default)
@@ -36,8 +37,18 @@ HOST=192.168.50.100 node scripts/serve.mjs 4310   # one literal IP; default stay
 | Clipboard API (Copy) | missing; Copy shows "The browser did not allow copying to the clipboard". Reveal still works |
 | `Cross-Origin-Opener-Policy` | ignored by the browser on untrustworthy origins (a console error says so) |
 | `crypto.subtle` | missing (not used by Keymesh) |
+| Password vaults | **off**: create, unlock, reset and restore are refused, and their database is never opened; the start screen says so and offers the demo |
 
-Traffic is unencrypted. Anyone on the network can read the served app and could modify it in transit, for example by injecting script that reads an unlocked vault. Vault data never leaves the browser, but use synthetic data only and treat a LAN preview as a UI check, not a security boundary.
+Traffic is unencrypted. Anyone on the network can read the served app and could modify it in transit, for example by injecting script that reads an unlocked vault. Vault data never leaves the browser, but use synthetic data only and treat a LAN preview as a UI check, not a security boundary. A VPN does not change this: `http://10.8.0.22` is still not a secure context.
+
+### HTTPS (TLS mode)
+
+```sh
+TLS_CERT=/outside/repo/fullchain.pem TLS_KEY=/outside/repo/key.pem node scripts/serve.mjs 4443   # loopback by default
+npm run tls-check   # throwaway CA on 127.0.0.1:4311: chain, hostname, TLS floor, headers, secure-context flow
+```
+
+`tls-check` proves TLS mechanics on loopback only. A certificate that client devices actually trust, and permission to run an HTTPS listener on a private address, are open decisions (`docs/DELIVERY.md` §4).
 
 ## Checks
 
