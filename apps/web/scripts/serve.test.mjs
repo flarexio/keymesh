@@ -98,3 +98,47 @@ for (const path of ['/%E0%A4%A', '/%', '/a%00b']) {
     assert.ok(!r.body.includes(OUTSIDE));
   });
 }
+
+// A second tree whose index.html is a symlink pointing OUTSIDE the root:
+// the SPA fallback must get the same containment as explicit files.
+test('an outward index.html symlink is never served, not even as the SPA fallback', async () => {
+  const base2 = mkdtempSync(join(tmpdir(), 'keymesh-serve-idx-'));
+  const root2 = join(base2, 'browser');
+  mkdirSync(root2);
+  writeFileSync(join(base2, 'outside-index.html'), OUTSIDE);
+  symlinkSync(join(base2, 'outside-index.html'), join(root2, 'index.html'));
+  writeFileSync(join(root2, 'main-TEST.js'), 'console.log("synthetic")');
+  const PORT2 = PORT + 1;
+  const script = fileURLToPath(new URL('./serve.mjs', import.meta.url));
+  const srv = spawn(process.execPath, [script, String(PORT2)], {
+    env: { ...process.env, HOST: '127.0.0.1', STATIC_ROOT: root2, TLS_CERT: '', TLS_KEY: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      srv.stdout.once('data', resolve);
+      srv.once('exit', (c) => reject(new Error(`server exited ${c}`)));
+    });
+    const get2 = (path) =>
+      new Promise((resolve, reject) => {
+        const r = request({ host: '127.0.0.1', port: PORT2, path, method: 'GET' }, (res) => {
+          let body = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => (body += c));
+          res.on('end', () => resolve({ status: res.statusCode, body }));
+        });
+        r.on('error', reject);
+        r.end();
+      });
+    for (const path of ['/', '/missing-app-route', '/index.html']) {
+      const r = await get2(path);
+      assert.ok(!r.body.includes(OUTSIDE), `${path} served the outside index (status ${r.status})`);
+      assert.equal(r.status, 404, `${path}: status ${r.status}`);
+    }
+    // Real files inside the root are still served.
+    assert.equal((await get2('/main-TEST.js')).status, 200);
+  } finally {
+    srv.kill();
+    rmSync(base2, { recursive: true, force: true });
+  }
+});

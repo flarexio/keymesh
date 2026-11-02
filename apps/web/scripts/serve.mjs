@@ -66,10 +66,27 @@ function fail(res, status) {
 }
 
 /**
+ * The real path of `p` if it is a regular file inside the root after
+ * resolving symlinks, else null. Used for EVERY file served, including the
+ * SPA fallback. (Checked per request; it does not defend against a hostile
+ * process rewriting the build directory between this check and the read.)
+ */
+async function servable(p) {
+  try {
+    const real = await realpath(p);
+    if (!inside(real)) return null;
+    return (await stat(real)).isFile() ? real : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Serves only regular files whose real path (after resolving symlinks) lies
  * inside the build root. Malformed percent-encoding, NUL and backslashes are
  * 400; anything resolving outside the root is 404 (never the SPA shell);
- * missing paths inside the root get index.html (client-side routes).
+ * missing paths inside the root get index.html (client-side routes), which
+ * passes the same check.
  */
 async function handler(req, res) {
   let path;
@@ -82,12 +99,13 @@ async function handler(req, res) {
   const candidate = resolve(realRoot, '.' + path);
   if (!inside(candidate)) return fail(res, 404);
   try {
-    let file = join(realRoot, 'index.html');
+    let file;
     if ((await stat(candidate).catch(() => null))?.isFile()) {
-      const real = await realpath(candidate);
-      if (!inside(real)) return fail(res, 404);
-      file = real;
+      file = await servable(candidate);
+    } else {
+      file = await servable(join(realRoot, 'index.html'));
     }
+    if (!file) return fail(res, 404);
     const body = await readFile(file);
     res.writeHead(200, { 'Content-Type': types[extname(file)] ?? 'application/octet-stream', ...security });
     res.end(body);

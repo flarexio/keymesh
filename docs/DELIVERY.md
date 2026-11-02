@@ -28,6 +28,8 @@ Passing A or B does not imply C:
   * Only regular files whose real path, with symlinks resolved, lies inside the build root are served.
   * The check is separator-aware, so siblings that merely share the root's name prefix are excluded.
   * Malformed percent-encoding, NUL and backslashes are refused with 400. Anything resolving outside the root is a 404, never the SPA shell.
+  * The same real-path check applies to every file actually served, including the `index.html` SPA fallback: an `index.html` symlink pointing outside the root gives 404 for `/` and for app routes.
+  * The check runs per request. It is not race-free against a hostile process rewriting the build directory between the check and the read; the build directory is assumed to be written only by the build.
   * Covered by `npm run test:serve` (127.0.0.1:4313, temporary synthetic tree).
   * Servers already running keep the handler they started with until they are restarted. The two HTTP previews were not restarted, because that is not authorised.
 * Keys must stay outside the repository; `*.pem` and `*.key` are git-ignored.
