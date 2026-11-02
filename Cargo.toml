@@ -14,7 +14,7 @@ members = [".", "crates/keymesh-wasm"]
 default = ["native"]
 # Filesystem persistence, the `op` subprocess runner and the CLI. Everything
 # outside this feature is intended to stay WASM-compatible.
-native = ["dep:tempfile", "dep:clap"]
+native = ["dep:tempfile", "dep:clap", "dep:rpassword"]
 
 [dependencies]
 chacha20poly1305 = "0.10"
@@ -30,8 +30,14 @@ data-encoding = "2"
 percent-encoding = "2"
 thiserror = "2"
 subtle = "2"
+# Envelope v2 key slots (pinned; see docs/adr/0002-envelope-v2.md).
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+hkdf = "=0.12.4"
+unicode-normalization = "=0.1.26"
 tempfile = { version = "3", optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
+# Masked terminal input for the master password and recovery code.
+rpassword = { version = "=7.5.4", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # kill(2) on the importer's child process group (timeout cleanup).
@@ -47,6 +53,12 @@ required-features = ["native"]
 
 [profile.dev.package."*"]
 opt-level = 1
+
+# Real-strength Argon2id in debug tests (speed only; parameters unchanged).
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
 
 # Browser WASM: the OS CSPRNG is reached through `crypto.getRandomValues`.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

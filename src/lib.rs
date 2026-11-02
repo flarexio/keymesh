@@ -15,7 +15,10 @@ pub mod ed25519;
 pub mod error;
 pub mod generate;
 pub mod import;
+pub mod kdf;
+pub mod keyslot;
 pub mod model;
+pub mod recovery;
 pub mod rng;
 pub mod secret;
 #[cfg(feature = "native")]

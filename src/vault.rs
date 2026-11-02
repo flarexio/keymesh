@@ -1,32 +1,51 @@
-//! In-memory vault and its versioned encrypted file format (`keymesh.vault` v1).
+//! In-memory vault and its versioned encrypted file formats.
 //!
 //! ```text
-//! VaultFile (JSON)
+//! v1 (demo/test key providers only; read and written for synthetic data)
 //!   format = "keymesh.vault", version = 1, aead = "xchacha20poly1305"
 //!   vault_id (random 128-bit hex), kek_id (key provider id), revision (u64)
 //!   wrapped_dek : Seal(KEK, AAD = dek_aad(vault_id, kek_id), DEK)
 //!   manifest    : Seal(DEK, AAD = header_aad(..revision..), [{id, rev, sha256(item sealed)}])
 //!   items[]     : {id, rev, sealed: Seal(DEK, AAD = item_aad(vault_id, id, rev), Item JSON)}
+//!
+//! v2 (password + recovery key slots; see `keyslot` and docs/adr/0002-envelope-v2.md)
+//!   format = "keymesh.vault", version = 2, aead = "xchacha20poly1305"
+//!   vault_id, revision
+//!   slots[]     : exactly one password slot and one recovery slot, each
+//!                 wrapping the same DEK
+//!   manifest    : Seal(DEK, AAD = fields(.."manifest"..vault_id, revision, slots_digest), …)
+//!   items[]     : {id, rev, sealed: Seal(DEK, AAD = fields(.."item"..vault_id, id, rev), Item JSON)}
 //! ```
 //!
-//! Public metadata is limited to the header and each item's random id and
-//! revision. Titles, URLs, notes, kinds and all secret fields are encrypted.
-//! The manifest is bound to the header revision and lists every item record's
-//! digest, so dropping, duplicating, or swapping individual item records is
-//! detected. Rolling back the *entire* file to an older valid version cannot be
-//! detected without external state (documented limitation).
+//! Public metadata is limited to the header, the key slots' public KDF
+//! parameters and each item's random id and revision. Titles, URLs, notes,
+//! kinds and all secret fields are encrypted. The manifest is bound to the
+//! header revision (and in v2 to the exact slot list) and lists every item
+//! record's digest, so dropping, duplicating, or swapping individual item
+//! records or key slots is detected. Rolling back the *entire* file to an
+//! older valid version cannot be detected without external state
+//! (documented limitation).
+//!
+//! The version is chosen by the file, never by the caller: a v1 file opens
+//! only with a [`KeyProvider`], a v2 file only with its password or recovery
+//! code, and an unknown version is refused.
 
 use crate::crypto::{self, Key256, KeyProvider, Sealed, AEAD_ALG};
 use crate::error::{Error, Result};
+use crate::kdf::fields;
+use crate::keyslot::{Authority, PasswordSetup, Slot, SlotKind, SlotRecord, SlotSet};
 use crate::model::{Item, ItemData, ItemId, ItemKind};
+use crate::recovery::RecoveryCode;
 use crate::rng::{random_array, RandomSource};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 pub const FORMAT: &str = "keymesh.vault";
 pub const VERSION: u32 = 1;
+pub const VERSION_V2: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +57,19 @@ struct VaultFile {
     kek_id: String,
     revision: u64,
     wrapped_dek: Sealed,
+    manifest: Sealed,
+    items: Vec<ItemRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultFileV2 {
+    format: String,
+    version: u32,
+    aead: String,
+    vault_id: String,
+    revision: u64,
+    slots: Vec<SlotRecord>,
     manifest: Sealed,
     items: Vec<ItemRecord>,
 }
@@ -70,8 +102,10 @@ struct ManifestEntry {
 /// to detect concurrent writers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultHeader {
+    pub version: u32,
     pub vault_id: String,
-    pub kek_id: String,
+    /// v1 only: the key provider id. `None` for v2 (key slots).
+    pub kek_id: Option<String>,
     pub revision: u64,
 }
 
@@ -88,12 +122,47 @@ fn item_aad(vault_id: &str, id: &ItemId, rev: u64) -> Vec<u8> {
     format!("{FORMAT}\0v{VERSION}\0item\0{AEAD_ALG}\0{vault_id}\0{id}\0{rev}").into_bytes()
 }
 
+fn header_aad_v2(vault_id: &str, revision: u64, slots: &SlotSet) -> Vec<u8> {
+    fields(&[
+        FORMAT.as_bytes(),
+        b"2",
+        b"manifest",
+        AEAD_ALG.as_bytes(),
+        vault_id.as_bytes(),
+        &revision.to_be_bytes(),
+        &slots.digest(),
+    ])
+}
+
+fn item_aad_v2(vault_id: &str, id: &ItemId, rev: u64) -> Vec<u8> {
+    fields(&[
+        FORMAT.as_bytes(),
+        b"2",
+        b"item",
+        AEAD_ALG.as_bytes(),
+        vault_id.as_bytes(),
+        id.to_string().as_bytes(),
+        &rev.to_be_bytes(),
+    ])
+}
+
 fn sha256_hex(b: &[u8]) -> String {
     data_encoding::HEXLOWER.encode(&Sha256::digest(b))
 }
 
-/// Parse and validate the unencrypted envelope without decrypting.
-fn parse_file(bytes: &[u8]) -> Result<VaultFile> {
+fn valid_vault_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+enum ParsedFile {
+    V1(VaultFile),
+    V2(VaultFileV2, SlotSet),
+}
+
+/// Parse and validate the unencrypted envelope without decrypting. Every
+/// bound (version, algorithm, ids, key slots and their KDF cost) is checked
+/// here, before any key derivation.
+fn parse_any(bytes: &[u8]) -> Result<ParsedFile> {
     // Check format/version before strict parsing so future versions produce a
     // clear "unknown format" error rather than a schema error.
     let probe: serde_json::Value = serde_json::from_slice(bytes)
@@ -103,24 +172,94 @@ fn parse_file(bytes: &[u8]) -> Result<VaultFile> {
     if fmt != Some(FORMAT) {
         return Err(Error::Format("not a keymesh vault".into()));
     }
-    if ver != Some(u64::from(VERSION)) {
-        return Err(Error::Format("unsupported vault version".into()));
-    }
-    let f: VaultFile = serde_json::from_value(probe)
-        .map_err(|_| Error::Format("malformed keymesh vault envelope".into()))?;
-    if f.aead != AEAD_ALG {
-        return Err(Error::Format("unsupported AEAD algorithm".into()));
-    }
-    Ok(f)
+    let parsed = match ver {
+        Some(v) if v == u64::from(VERSION) => {
+            let f: VaultFile = serde_json::from_value(probe)
+                .map_err(|_| Error::Format("malformed keymesh vault envelope".into()))?;
+            if f.aead != AEAD_ALG {
+                return Err(Error::Format("unsupported AEAD algorithm".into()));
+            }
+            ParsedFile::V1(f)
+        }
+        Some(v) if v == u64::from(VERSION_V2) => {
+            let f: VaultFileV2 = serde_json::from_value(probe)
+                .map_err(|_| Error::Format("malformed keymesh vault envelope".into()))?;
+            if f.aead != AEAD_ALG {
+                return Err(Error::Format("unsupported AEAD algorithm".into()));
+            }
+            if !valid_vault_id(&f.vault_id) {
+                return Err(Error::Format("invalid vault id".into()));
+            }
+            let slots = SlotSet::from_records(f.slots.clone())?;
+            ParsedFile::V2(f, slots)
+        }
+        _ => return Err(Error::Format("unsupported vault version".into())),
+    };
+    Ok(parsed)
 }
 
 pub fn read_header(bytes: &[u8]) -> Result<VaultHeader> {
-    let f = parse_file(bytes)?;
-    Ok(VaultHeader {
-        vault_id: f.vault_id,
-        kek_id: f.kek_id,
-        revision: f.revision,
+    Ok(match parse_any(bytes)? {
+        ParsedFile::V1(f) => VaultHeader {
+            version: VERSION,
+            vault_id: f.vault_id,
+            kek_id: Some(f.kek_id),
+            revision: f.revision,
+        },
+        ParsedFile::V2(f, _) => VaultHeader {
+            version: VERSION_V2,
+            vault_id: f.vault_id,
+            kek_id: None,
+            revision: f.revision,
+        },
     })
+}
+
+/// Public parameters for deriving the password key of a v2 envelope (the
+/// browser runs Argon2id in a worker with them). Bounds are already checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordRequest {
+    pub vault_id: String,
+    pub setup: PasswordSetup,
+}
+
+pub fn password_request(bytes: &[u8]) -> Result<PasswordRequest> {
+    match parse_any(bytes)? {
+        ParsedFile::V2(f, slots) => Ok(PasswordRequest {
+            vault_id: f.vault_id,
+            setup: slots.get(SlotKind::Password).password_setup()?,
+        }),
+        ParsedFile::V1(_) => Err(Error::Format(
+            "this is a demo vault without a password".into(),
+        )),
+    }
+}
+
+/// How a vault's data key is protected.
+#[derive(Clone)]
+enum Keys {
+    /// v1: one KEK from a key provider (demo/test only).
+    Provider { kek_id: String },
+    /// v2: password + recovery slots. `recovery_confirmed` is false for a
+    /// new vault until its recovery code was entered back; sealing (and so
+    /// persisting) is refused until then.
+    Slots {
+        slots: SlotSet,
+        recovery_confirmed: bool,
+    },
+}
+
+/// A new recovery code waiting for confirmation before it replaces the
+/// vault's recovery slot.
+pub struct PendingRecovery {
+    code: RecoveryCode,
+    slot: Slot,
+}
+
+impl PendingRecovery {
+    pub fn code(&self) -> &RecoveryCode {
+        &self.code
+    }
 }
 
 /// `Clone` lets storage adapters keep a last-committed checkpoint; clones hold
@@ -128,9 +267,11 @@ pub fn read_header(bytes: &[u8]) -> Result<VaultHeader> {
 #[derive(Clone)]
 pub struct Vault {
     vault_id: String,
-    kek_id: String,
+    keys: Keys,
     /// Revision of the file this vault was decrypted from (0 for a new vault).
     loaded_revision: u64,
+    /// SHA-256 of the exact bytes last read or written (compare-and-swap).
+    snapshot: Option<[u8; 32]>,
     dek: Key256,
     items: BTreeMap<ItemId, Item>,
 }
@@ -145,19 +286,80 @@ impl std::fmt::Debug for Vault {
     }
 }
 
+/// Public parameters for creating a new password-protected vault: its id
+/// and the password slot's id, salt and KDF cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedSetup {
+    pub vault_id: String,
+    pub password: PasswordSetup,
+}
+
+impl ProtectedSetup {
+    pub fn generate(rng: &mut dyn RandomSource) -> Result<Self> {
+        Ok(Self {
+            vault_id: data_encoding::HEXLOWER.encode(&random_array::<16>(rng)?),
+            password: PasswordSetup::generate(rng)?,
+        })
+    }
+}
+
 impl Vault {
-    /// New empty vault with a fresh random data key.
+    /// New empty v1 vault with a fresh random data key (demo/test providers).
     pub fn create(provider: &dyn KeyProvider, rng: &mut dyn RandomSource) -> Result<Self> {
         crypto::validate_key_id(provider.key_id())?;
         // Ensure the provider is usable before we hand out a vault.
         provider.key_encryption_key()?;
         Ok(Self {
             vault_id: data_encoding::HEXLOWER.encode(&random_array::<16>(rng)?),
-            kek_id: provider.key_id().to_owned(),
+            keys: Keys::Provider {
+                kek_id: provider.key_id().to_owned(),
+            },
             loaded_revision: 0,
+            snapshot: None,
             dek: Key256::generate(rng)?,
             items: BTreeMap::new(),
         })
+    }
+
+    /// New empty v2 vault with a fresh random data key, a password slot from
+    /// `password_key` (Argon2id output for `setup.password`) and a fresh
+    /// recovery code. The vault cannot be sealed until
+    /// [`Vault::confirm_recovery`] succeeds with that code.
+    pub fn create_protected(
+        setup: &ProtectedSetup,
+        password_key: &[u8; 32],
+        rng: &mut dyn RandomSource,
+    ) -> Result<(Self, RecoveryCode)> {
+        if !valid_vault_id(&setup.vault_id) {
+            return Err(Error::validation("invalid vault id"));
+        }
+        let dek = Key256::generate(rng)?;
+        let code = RecoveryCode::generate(rng)?;
+        let pw = Slot::new_password(&setup.vault_id, &setup.password, password_key, &dek, rng)?;
+        let rc = Slot::new_recovery(&setup.vault_id, &code, &dek, rng)?;
+        let v = Self {
+            vault_id: setup.vault_id.clone(),
+            keys: Keys::Slots {
+                slots: SlotSet::new(pw, rc)?,
+                recovery_confirmed: false,
+            },
+            loaded_revision: 0,
+            snapshot: None,
+            dek,
+            items: BTreeMap::new(),
+        };
+        Ok((v, code))
+    }
+
+    /// Native convenience: run Argon2id and create a v2 vault.
+    pub fn create_with_password(
+        password: &str,
+        rng: &mut dyn RandomSource,
+    ) -> Result<(Self, RecoveryCode)> {
+        crate::kdf::check_new_password(password)?;
+        let setup = ProtectedSetup::generate(rng)?;
+        let key = setup.password.derive(password)?;
+        Self::create_protected(&setup, &key, rng)
     }
 
     pub fn vault_id(&self) -> &str {
@@ -166,11 +368,126 @@ impl Vault {
     pub fn revision(&self) -> u64 {
         self.loaded_revision
     }
+    /// True for a v2 (password + recovery) vault.
+    pub fn is_protected(&self) -> bool {
+        matches!(self.keys, Keys::Slots { .. })
+    }
+    /// v2: whether the recovery code has been confirmed (always true for an
+    /// opened vault). v1: true.
+    pub fn recovery_confirmed(&self) -> bool {
+        match &self.keys {
+            Keys::Slots {
+                recovery_confirmed, ..
+            } => *recovery_confirmed,
+            Keys::Provider { .. } => true,
+        }
+    }
+    /// SHA-256 of the exact envelope bytes last read or written.
+    pub fn snapshot_digest(&self) -> Option<[u8; 32]> {
+        self.snapshot
+    }
 
-    /// Decrypt and fully verify a vault file. Any failure is an error; a
-    /// failed decrypt never yields an empty vault.
+    fn slots(&self) -> Result<&SlotSet> {
+        match &self.keys {
+            Keys::Slots { slots, .. } => Ok(slots),
+            Keys::Provider { .. } => Err(Error::Format(
+                "this is a demo vault without a password".into(),
+            )),
+        }
+    }
+
+    /// Public parameters of the current password slot (to derive the key
+    /// for [`Authority::PasswordKey`]).
+    pub fn password_setup(&self) -> Result<PasswordSetup> {
+        self.slots()?.get(SlotKind::Password).password_setup()
+    }
+
+    /// Prove that `code` is this vault's recovery code (by unwrapping the
+    /// recovery slot); a new vault becomes sealable after this succeeds.
+    pub fn confirm_recovery(&mut self, code: &RecoveryCode) -> Result<()> {
+        Authority::Recovery(code)
+            .verify(&self.vault_id, self.slots()?, &self.dek)
+            .map_err(|_| Error::validation("recovery code does not match"))?;
+        if let Keys::Slots {
+            recovery_confirmed, ..
+        } = &mut self.keys
+        {
+            *recovery_confirmed = true;
+        }
+        Ok(())
+    }
+
+    /// Replace the password slot (rewrap; the data key is unchanged, so
+    /// backups made earlier still open with the old password). Requires
+    /// `authority` over this vault; `new_password_key` is Argon2id output
+    /// for `setup`, which must use a fresh slot id and salt.
+    pub fn change_password(
+        &mut self,
+        authority: Authority<'_>,
+        setup: &PasswordSetup,
+        new_password_key: &[u8; 32],
+        rng: &mut dyn RandomSource,
+    ) -> Result<()> {
+        let slots = self.slots()?;
+        authority.verify(&self.vault_id, slots, &self.dek)?;
+        let old = slots.get(SlotKind::Password).password_setup()?;
+        if old.slot_id == setup.slot_id || bool::from(old.salt.ct_eq(&setup.salt)) {
+            return Err(Error::validation("a new password needs a fresh salt"));
+        }
+        let slot = Slot::new_password(&self.vault_id, setup, new_password_key, &self.dek, rng)?;
+        let next = slots.replace(slot)?;
+        if let Keys::Slots { slots, .. } = &mut self.keys {
+            *slots = next;
+        }
+        Ok(())
+    }
+
+    /// Start replacing the recovery code. Nothing changes until
+    /// [`Vault::finish_recovery_change`] gets the new code back.
+    pub fn begin_recovery_change(
+        &self,
+        authority: Authority<'_>,
+        rng: &mut dyn RandomSource,
+    ) -> Result<PendingRecovery> {
+        let slots = self.slots()?;
+        authority.verify(&self.vault_id, slots, &self.dek)?;
+        let code = RecoveryCode::generate(rng)?;
+        let slot = Slot::new_recovery(&self.vault_id, &code, &self.dek, rng)?;
+        Ok(PendingRecovery { code, slot })
+    }
+
+    /// Install a pending recovery code once the user entered it back.
+    pub fn finish_recovery_change(
+        &mut self,
+        pending: PendingRecovery,
+        confirmation: &RecoveryCode,
+    ) -> Result<()> {
+        if !pending.code.ct_eq(confirmation) {
+            return Err(Error::validation("recovery code does not match"));
+        }
+        let next = self.slots()?.replace(pending.slot)?;
+        if let Keys::Slots {
+            slots,
+            recovery_confirmed,
+        } = &mut self.keys
+        {
+            *slots = next;
+            *recovery_confirmed = true;
+        }
+        Ok(())
+    }
+
+    /// Decrypt and fully verify a v1 vault file with a key provider. Any
+    /// failure is an error; a failed decrypt never yields an empty vault.
     pub fn decrypt(bytes: &[u8], provider: &dyn KeyProvider) -> Result<Self> {
-        let f = parse_file(bytes)?;
+        let f = match parse_any(bytes)? {
+            ParsedFile::V1(f) => f,
+            ParsedFile::V2(..) => {
+                return Err(Error::Format(
+                    "this vault opens with its password or recovery code".into(),
+                ))
+            }
+        };
         if provider.key_id() != f.kek_id {
             return Err(Error::KeyProvider(
                 "key provider id does not match vault".into(),
@@ -183,50 +500,76 @@ impl Vault {
             .try_into()
             .map_err(|_| Error::Integrity("data key has wrong length".into()))?;
         let dek = Key256::from_bytes(dek_arr);
-
-        let manifest_pt = crypto::open(
+        let maad = header_aad(&f.vault_id, &f.kek_id, f.revision);
+        let items = open_items(
             &dek,
             &f.manifest,
-            &header_aad(&f.vault_id, &f.kek_id, f.revision),
+            &maad,
+            &f.vault_id,
+            f.revision,
+            &f.items,
+            |id, rev| item_aad(&f.vault_id, id, rev),
         )?;
-        let manifest: Manifest = serde_json::from_slice(&manifest_pt)
-            .map_err(|_| Error::Integrity("malformed manifest".into()))?;
-        if manifest.vault_id != f.vault_id || manifest.revision != f.revision {
-            return Err(Error::Integrity("manifest does not match header".into()));
-        }
-        if manifest.entries.len() != f.items.len() {
-            return Err(Error::Integrity(
-                "item count does not match manifest".into(),
-            ));
-        }
-
-        let mut items = BTreeMap::new();
-        for (rec, entry) in f.items.iter().zip(&manifest.entries) {
-            if rec.id != entry.id
-                || rec.rev != entry.rev
-                || sha256_hex(&rec.sealed.digest_input()) != entry.sha256
-            {
-                return Err(Error::Integrity(
-                    "item record does not match manifest".into(),
-                ));
-            }
-            let pt = crypto::open(&dek, &rec.sealed, &item_aad(&f.vault_id, &rec.id, rec.rev))?;
-            let item: Item = serde_json::from_slice(&pt)
-                .map_err(|_| Error::Integrity("malformed item payload".into()))?;
-            if item.id != rec.id || item.rev != rec.rev {
-                return Err(Error::Integrity(
-                    "item payload does not match record".into(),
-                ));
-            }
-            item.validate()?;
-            if items.insert(item.id.clone(), item).is_some() {
-                return Err(Error::Integrity("duplicate item id".into()));
-            }
-        }
         let v = Self {
             vault_id: f.vault_id,
-            kek_id: f.kek_id,
+            keys: Keys::Provider { kek_id: f.kek_id },
             loaded_revision: f.revision,
+            snapshot: Some(Sha256::digest(bytes).into()),
+            dek,
+            items,
+        };
+        v.validate_references()?;
+        Ok(v)
+    }
+
+    /// Open a v2 envelope with Argon2id output for its password slot (see
+    /// [`password_request`]).
+    pub fn open_with_password_key(bytes: &[u8], password_key: &[u8; 32]) -> Result<Self> {
+        Self::open_v2(bytes, SlotKind::Password, &password_key[..])
+    }
+
+    /// Native convenience: derive the password key and open.
+    pub fn open_with_password(bytes: &[u8], password: &str) -> Result<Self> {
+        let req = password_request(bytes)?;
+        let key = req.setup.derive(password)?;
+        Self::open_with_password_key(bytes, &key)
+    }
+
+    pub fn open_with_recovery(bytes: &[u8], code: &RecoveryCode) -> Result<Self> {
+        Self::open_v2(bytes, SlotKind::Recovery, code.secret())
+    }
+
+    fn open_v2(bytes: &[u8], kind: SlotKind, ikm: &[u8]) -> Result<Self> {
+        let (f, slots) = match parse_any(bytes)? {
+            ParsedFile::V2(f, slots) => (f, slots),
+            ParsedFile::V1(_) => {
+                return Err(Error::Format(
+                    "this is a demo vault without a password".into(),
+                ))
+            }
+        };
+        let dek = slots.get(kind).unwrap(&f.vault_id, ikm)?;
+        let maad = header_aad_v2(&f.vault_id, f.revision, &slots);
+        let items = open_items(
+            &dek,
+            &f.manifest,
+            &maad,
+            &f.vault_id,
+            f.revision,
+            &f.items,
+            |id, rev| item_aad_v2(&f.vault_id, id, rev),
+        )?;
+        // The other slots cannot be checked without their secrets; the
+        // manifest (sealed with this DEK) binds their exact bytes, so only
+        // someone who already held the DEK could have written them.
+        let v = Self {
+            vault_id: f.vault_id,
+            keys: Keys::Slots {
+                slots,
+                recovery_confirmed: true,
+            },
+            loaded_revision: f.revision,
+            snapshot: Some(Sha256::digest(bytes).into()),
             dek,
             items,
         };
@@ -243,7 +586,7 @@ impl Vault {
         rng: &mut dyn RandomSource,
     ) -> Result<Vec<u8>> {
         let (bytes, rev) = self.seal_next(provider, rng)?;
-        self.loaded_revision = rev;
+        self.mark_written(rev, &bytes)?;
         Ok(bytes)
     }
 
@@ -257,15 +600,31 @@ impl Vault {
         Ok(())
     }
 
-    /// Encrypt to revision `self.revision() + 1` without mutating the vault.
-    /// Every item and the manifest get fresh nonces. Storage adapters write
-    /// the bytes, then call [`Vault::mark_persisted`].
+    /// [`Vault::mark_persisted`] plus the exact bytes, for byte-level
+    /// compare-and-swap on the next save.
+    pub fn mark_written(&mut self, revision: u64, bytes: &[u8]) -> Result<()> {
+        self.mark_persisted(revision)?;
+        self.snapshot = Some(Sha256::digest(bytes).into());
+        Ok(())
+    }
+
+    /// v1: encrypt to revision `self.revision() + 1` without mutating the
+    /// vault. Every item and the manifest get fresh nonces. Storage adapters
+    /// write the bytes, then call [`Vault::mark_persisted`].
     pub fn seal_next(
         &self,
         provider: &dyn KeyProvider,
         rng: &mut dyn RandomSource,
     ) -> Result<(Vec<u8>, u64)> {
-        if provider.key_id() != self.kek_id {
+        let kek_id = match &self.keys {
+            Keys::Provider { kek_id } => kek_id,
+            Keys::Slots { .. } => {
+                return Err(Error::KeyProvider(
+                    "a password vault is sealed with its key slots, not a key provider".into(),
+                ))
+            }
+        };
+        if provider.key_id() != kek_id {
             return Err(Error::KeyProvider(
                 "key provider id does not match vault".into(),
             ));
@@ -276,9 +635,80 @@ impl Vault {
         let wrapped_dek = crypto::seal(
             &kek,
             rng,
-            &dek_aad(&self.vault_id, &self.kek_id),
+            &dek_aad(&self.vault_id, kek_id),
             self.dek.as_bytes(),
         )?;
+        let (records, manifest) = self.seal_items(
+            rng,
+            revision,
+            &header_aad(&self.vault_id, kek_id, revision),
+            |id, rev| item_aad(&self.vault_id, id, rev),
+        )?;
+        let file = VaultFile {
+            format: FORMAT.into(),
+            version: VERSION,
+            aead: AEAD_ALG.into(),
+            vault_id: self.vault_id.clone(),
+            kek_id: kek_id.clone(),
+            revision,
+            wrapped_dek,
+            manifest,
+            items: records,
+        };
+        let out = serde_json::to_vec_pretty(&file)
+            .map_err(|_| Error::Integrity("serialize vault".into()))?;
+        Ok((out, revision))
+    }
+
+    /// v2: encrypt to the next revision with the current key slots. Refused
+    /// for a new vault whose recovery code was not confirmed yet.
+    pub fn seal_next_protected(&self, rng: &mut dyn RandomSource) -> Result<(Vec<u8>, u64)> {
+        let (slots, confirmed) = match &self.keys {
+            Keys::Slots {
+                slots,
+                recovery_confirmed,
+            } => (slots, *recovery_confirmed),
+            Keys::Provider { .. } => {
+                return Err(Error::KeyProvider(
+                    "demo vault needs its key provider".into(),
+                ))
+            }
+        };
+        if !confirmed {
+            return Err(Error::validation(
+                "confirm the recovery code before saving the vault",
+            ));
+        }
+        self.validate_references()?;
+        let revision = self.loaded_revision + 1;
+        let (records, manifest) = self.seal_items(
+            rng,
+            revision,
+            &header_aad_v2(&self.vault_id, revision, slots),
+            |id, rev| item_aad_v2(&self.vault_id, id, rev),
+        )?;
+        let file = VaultFileV2 {
+            format: FORMAT.into(),
+            version: VERSION_V2,
+            aead: AEAD_ALG.into(),
+            vault_id: self.vault_id.clone(),
+            revision,
+            slots: slots.records(),
+            manifest,
+            items: records,
+        };
+        let out = serde_json::to_vec_pretty(&file)
+            .map_err(|_| Error::Integrity("serialize vault".into()))?;
+        Ok((out, revision))
+    }
+
+    fn seal_items(
+        &self,
+        rng: &mut dyn RandomSource,
+        revision: u64,
+        manifest_aad: &[u8],
+        item_aad: impl Fn(&ItemId, u64) -> Vec<u8>,
+    ) -> Result<(Vec<ItemRecord>, Sealed)> {
         let mut records = Vec::with_capacity(self.items.len());
         let mut entries = Vec::with_capacity(self.items.len());
         for item in self.items.values() {
@@ -286,12 +716,7 @@ impl Vault {
             let pt = Zeroizing::new(
                 serde_json::to_vec(item).map_err(|_| Error::Integrity("serialize item".into()))?,
             );
-            let sealed = crypto::seal(
-                &self.dek,
-                rng,
-                &item_aad(&self.vault_id, &item.id, item.rev),
-                &pt,
-            )?;
+            let sealed = crypto::seal(&self.dek, rng, &item_aad(&item.id, item.rev), &pt)?;
             entries.push(ManifestEntry {
                 id: item.id.clone(),
                 rev: item.rev,
@@ -310,30 +735,19 @@ impl Vault {
         };
         let manifest_pt = serde_json::to_vec(&manifest)
             .map_err(|_| Error::Integrity("serialize manifest".into()))?;
-        let manifest = crypto::seal(
-            &self.dek,
-            rng,
-            &header_aad(&self.vault_id, &self.kek_id, revision),
-            &manifest_pt,
-        )?;
-        let file = VaultFile {
-            format: FORMAT.into(),
-            version: VERSION,
-            aead: AEAD_ALG.into(),
-            vault_id: self.vault_id.clone(),
-            kek_id: self.kek_id.clone(),
-            revision,
-            wrapped_dek,
-            manifest,
-            items: records,
-        };
-        let out = serde_json::to_vec_pretty(&file)
-            .map_err(|_| Error::Integrity("serialize vault".into()))?;
-        Ok((out, revision))
+        let manifest = crypto::seal(&self.dek, rng, manifest_aad, &manifest_pt)?;
+        Ok((records, manifest))
     }
 
-    /// Replace the data key; all items are re-encrypted on the next save.
+    /// v1 only: replace the data key; all items are re-encrypted on the next
+    /// save. For v2 vaults, compromise rotation (new DEK with every slot
+    /// re-established) is deferred and refused here.
     pub fn rotate_data_key(&mut self, rng: &mut dyn RandomSource) -> Result<()> {
+        if self.is_protected() {
+            return Err(Error::validation(
+                "data key rotation for password vaults is not supported yet",
+            ));
+        }
         self.dek = Key256::generate(rng)?;
         Ok(())
     }
@@ -423,6 +837,53 @@ impl Vault {
         }
         Ok(())
     }
+}
+
+/// Verify the manifest and decrypt every item record (shared by v1 and v2).
+fn open_items(
+    dek: &Key256,
+    manifest: &Sealed,
+    manifest_aad: &[u8],
+    vault_id: &str,
+    revision: u64,
+    records: &[ItemRecord],
+    item_aad: impl Fn(&ItemId, u64) -> Vec<u8>,
+) -> Result<BTreeMap<ItemId, Item>> {
+    let manifest_pt = crypto::open(dek, manifest, manifest_aad)?;
+    let manifest: Manifest = serde_json::from_slice(&manifest_pt)
+        .map_err(|_| Error::Integrity("malformed manifest".into()))?;
+    if manifest.vault_id != vault_id || manifest.revision != revision {
+        return Err(Error::Integrity("manifest does not match header".into()));
+    }
+    if manifest.entries.len() != records.len() {
+        return Err(Error::Integrity(
+            "item count does not match manifest".into(),
+        ));
+    }
+    let mut items = BTreeMap::new();
+    for (rec, entry) in records.iter().zip(&manifest.entries) {
+        if rec.id != entry.id
+            || rec.rev != entry.rev
+            || sha256_hex(&rec.sealed.digest_input()) != entry.sha256
+        {
+            return Err(Error::Integrity(
+                "item record does not match manifest".into(),
+            ));
+        }
+        let pt = crypto::open(dek, &rec.sealed, &item_aad(&rec.id, rec.rev))?;
+        let item: Item = serde_json::from_slice(&pt)
+            .map_err(|_| Error::Integrity("malformed item payload".into()))?;
+        if item.id != rec.id || item.rev != rec.rev {
+            return Err(Error::Integrity(
+                "item payload does not match record".into(),
+            ));
+        }
+        item.validate()?;
+        if items.insert(item.id.clone(), item).is_some() {
+            return Err(Error::Integrity("duplicate item id".into()));
+        }
+    }
+    Ok(items)
 }
 
 #[cfg(test)]
@@ -607,5 +1068,387 @@ mod tests {
         let other = EphemeralKeyProvider::generate("other-id", &mut OsRandom).unwrap();
         assert!(Vault::decrypt(&bytes, &other).is_err());
         assert!(v.encrypt(&other, &mut OsRandom).is_err());
+    }
+
+    // --- v2: password + recovery key slots ---------------------------------
+
+    use crate::keyslot::{Authority, PasswordSetup};
+    use crate::recovery::RecoveryCode;
+    use std::sync::OnceLock;
+
+    const PW: &str = "synthetic river lamp ferry";
+
+    /// One real-strength Argon2id run shared by the tests (same setup is
+    /// reused, so the derived key is too).
+    fn shared() -> &'static (ProtectedSetup, Zeroizing<[u8; 32]>) {
+        static S: OnceLock<(ProtectedSetup, Zeroizing<[u8; 32]>)> = OnceLock::new();
+        S.get_or_init(|| {
+            let setup = ProtectedSetup::generate(&mut OsRandom).unwrap();
+            let key = setup.password.derive(PW).unwrap();
+            (setup, key)
+        })
+    }
+
+    fn protected() -> (Vault, RecoveryCode, Vec<u8>) {
+        let (setup, key) = shared();
+        let (mut v, code) = Vault::create_protected(setup, key, &mut OsRandom).unwrap();
+        v.confirm_recovery(&code).unwrap();
+        v.insert(note("Synthetic title A", "SYNTHETIC-BODY-A"))
+            .unwrap();
+        let (bytes, rev) = v.seal_next_protected(&mut OsRandom).unwrap();
+        v.mark_written(rev, &bytes).unwrap();
+        (v, code, bytes)
+    }
+
+    fn json(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(bytes).unwrap()
+    }
+
+    fn bytes_of(j: &serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(j).unwrap()
+    }
+
+    #[test]
+    fn v2_new_vault_needs_recovery_confirmation_before_sealing() {
+        let (setup, key) = shared();
+        let (mut v, code) = Vault::create_protected(setup, key, &mut OsRandom).unwrap();
+        assert!(v.is_protected());
+        assert!(!v.recovery_confirmed());
+        assert!(v.seal_next_protected(&mut OsRandom).is_err());
+        let other = RecoveryCode::generate(&mut OsRandom).unwrap();
+        assert!(v.confirm_recovery(&other).is_err());
+        assert!(v.seal_next_protected(&mut OsRandom).is_err());
+        v.confirm_recovery(&code).unwrap();
+        assert!(v.seal_next_protected(&mut OsRandom).is_ok());
+    }
+
+    #[test]
+    fn v2_opens_with_password_or_recovery_and_hides_secrets() {
+        let (v, code, bytes) = protected();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        for needle in [
+            "SYNTHETIC-BODY",
+            "Synthetic title",
+            PW,
+            code.to_text().as_str(),
+        ] {
+            assert!(!text.contains(needle), "leaked");
+        }
+        let code_raw = code.to_text().replace('-', "");
+        assert!(!text.to_uppercase().contains(&code_raw[..20]));
+        let a = Vault::open_with_password(&bytes, PW).unwrap();
+        let b = Vault::open_with_recovery(&bytes, &code).unwrap();
+        for o in [&a, &b] {
+            assert_eq!(o.len(), 1);
+            assert_eq!(o.vault_id(), v.vault_id());
+            assert_eq!(o.revision(), 1);
+            assert!(o.recovery_confirmed());
+        }
+        let h = read_header(&bytes).unwrap();
+        assert_eq!((h.version, h.kek_id, h.revision), (2, None, 1));
+    }
+
+    #[test]
+    fn v2_wrong_credentials_fail_closed() {
+        let (_v, _code, bytes) = protected();
+        assert!(matches!(
+            Vault::open_with_password(&bytes, "synthetic wrong password"),
+            Err(Error::Decrypt)
+        ));
+        let other = RecoveryCode::generate(&mut OsRandom).unwrap();
+        assert!(matches!(
+            Vault::open_with_recovery(&bytes, &other),
+            Err(Error::Decrypt)
+        ));
+        // Formats never cross: v2 needs slots, v1 needs a provider.
+        assert!(matches!(
+            Vault::decrypt(&bytes, &provider()),
+            Err(Error::Format(_))
+        ));
+        let (_v1, v1_bytes) = sample(&provider());
+        assert!(matches!(
+            Vault::open_with_password(&v1_bytes, PW),
+            Err(Error::Format(_))
+        ));
+        assert!(password_request(&v1_bytes).is_err());
+    }
+
+    #[test]
+    fn v2_hostile_kdf_parameters_are_rejected_before_derivation() {
+        let (_v, _code, bytes) = protected();
+        for (field, value) in [
+            ("m_kib", serde_json::json!(4_294_967_295u64)),
+            ("m_kib", serde_json::json!(1024 * 1024)),
+            ("t", serde_json::json!(1_000_000)),
+            ("t", serde_json::json!(1)),
+            ("p", serde_json::json!(64)),
+            ("m_kib", serde_json::json!(-1)),
+            ("v", serde_json::json!(16)),
+            ("salt", serde_json::json!("AAAA")),
+        ] {
+            let mut j = json(&bytes);
+            j["slots"][0]["kdf"][field] = value;
+            let t = std::time::Instant::now();
+            let r = Vault::open_with_password(&bytes_of(&j), PW);
+            assert!(matches!(r, Err(Error::Format(_))), "{field}");
+            assert!(password_request(&bytes_of(&j)).is_err());
+            assert!(
+                t.elapsed() < std::time::Duration::from_millis(200),
+                "no KDF ran"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_tampered_slots_fail() {
+        let (_v, code, bytes) = protected();
+        // KDF parameter changed within bounds: the slot AAD no longer matches.
+        let mut j = json(&bytes);
+        j["slots"][0]["kdf"]["t"] = 4.into();
+        assert!(matches!(
+            Vault::open_with_password(&bytes_of(&j), PW),
+            Err(Error::Decrypt)
+        ));
+        // Recovery slot altered: opening with the PASSWORD still fails,
+        // because the manifest binds every slot's bytes.
+        let mut j = json(&bytes);
+        let ct = j["slots"][1]["wrapped"]["ct"].as_str().unwrap().to_owned();
+        let flipped = if ct.starts_with('A') { "B" } else { "A" };
+        j["slots"][1]["wrapped"]["ct"] = format!("{flipped}{}", &ct[1..]).into();
+        assert!(matches!(
+            Vault::open_with_password(&bytes_of(&j), PW),
+            Err(Error::Decrypt)
+        ));
+        // Recovery slot salt changed.
+        let mut j = json(&bytes);
+        j["slots"][1]["kdf"]["salt"] = "AAAAAAAAAAAAAAAAAAAAAA".into();
+        assert!(Vault::open_with_recovery(&bytes_of(&j), &code).is_err());
+        assert!(Vault::open_with_password(&bytes_of(&j), PW).is_err());
+        // Slot ids swapped / changed.
+        let mut j = json(&bytes);
+        j["slots"][0]["id"] = "0123456789abcdef".into();
+        assert!(Vault::open_with_password(&bytes_of(&j), PW).is_err());
+        // Slot order swapped: digest differs.
+        let mut j = json(&bytes);
+        j["slots"].as_array_mut().unwrap().swap(0, 1);
+        assert!(Vault::open_with_password(&bytes_of(&j), PW).is_err());
+        // Header fields bound by the manifest AAD.
+        let mut j = json(&bytes);
+        j["revision"] = 7.into();
+        assert!(matches!(
+            Vault::open_with_password(&bytes_of(&j), PW),
+            Err(Error::Decrypt)
+        ));
+        let mut j = json(&bytes);
+        j["vault_id"] = "00000000000000000000000000000000".into();
+        assert!(matches!(
+            Vault::open_with_password(&bytes_of(&j), PW),
+            Err(Error::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn v2_malformed_duplicate_removed_and_unknown_slots_are_refused() {
+        let (_v, _code, bytes) = protected();
+        type Edit = Box<dyn Fn(&mut serde_json::Value)>;
+        let edits: Vec<(&str, Edit)> = vec![
+            (
+                "removed",
+                Box::new(|j| {
+                    j["slots"].as_array_mut().unwrap().pop();
+                }),
+            ),
+            ("none", Box::new(|j| j["slots"] = serde_json::json!([]))),
+            (
+                "duplicate",
+                Box::new(|j| {
+                    let a = j["slots"][0].clone();
+                    j["slots"].as_array_mut().unwrap().push(a);
+                }),
+            ),
+            (
+                "second password slot",
+                Box::new(|j| {
+                    let mut a = j["slots"][0].clone();
+                    a["id"] = "fedcba9876543210".into();
+                    j["slots"].as_array_mut().unwrap().push(a);
+                }),
+            ),
+            (
+                "too many",
+                Box::new(|j| {
+                    let a = j["slots"][0].clone();
+                    for _ in 0..10 {
+                        j["slots"].as_array_mut().unwrap().push(a.clone());
+                    }
+                }),
+            ),
+            (
+                "unknown kind",
+                Box::new(|j| j["slots"][1]["kind"] = "passkey".into()),
+            ),
+            (
+                "wrong alg for kind",
+                Box::new(|j| j["slots"][0]["kind"] = "recovery".into()),
+            ),
+            (
+                "unknown alg",
+                Box::new(|j| j["slots"][0]["kdf"]["alg"] = "scrypt".into()),
+            ),
+            (
+                "extra field",
+                Box::new(|j| j["slots"][0]["note"] = "x".into()),
+            ),
+            ("bad id", Box::new(|j| j["slots"][0]["id"] = "../x".into())),
+            (
+                "short ct",
+                Box::new(|j| j["slots"][0]["wrapped"]["ct"] = "AAAA".into()),
+            ),
+            (
+                "short nonce",
+                Box::new(|j| j["slots"][0]["wrapped"]["nonce"] = "AAAA".into()),
+            ),
+            ("bad vault id", Box::new(|j| j["vault_id"] = "x".into())),
+            ("aead", Box::new(|j| j["aead"] = "aes-gcm".into())),
+            ("future version", Box::new(|j| j["version"] = 3.into())),
+            ("relabelled v1", Box::new(|j| j["version"] = 1.into())),
+            (
+                "extra top-level",
+                Box::new(|j| j["kek_id"] = "synthetic-fixture-v1".into()),
+            ),
+        ];
+        for (name, edit) in edits {
+            let mut j = json(&bytes);
+            edit(&mut j);
+            let r = Vault::open_with_password(&bytes_of(&j), PW);
+            assert!(matches!(r, Err(Error::Format(_))), "{name}: {r:?}");
+        }
+        assert!(Vault::open_with_password(&bytes[..bytes.len() / 2], PW).is_err());
+        assert!(Vault::open_with_password(b"", PW).is_err());
+    }
+
+    #[test]
+    fn v2_slot_from_another_vault_does_not_open() {
+        let (a, _ca, bytes_a) = protected();
+        // Same password slot id, salt and derived key; only the vault id differs.
+        let (setup, key) = shared();
+        let other = ProtectedSetup {
+            vault_id: data_encoding::HEXLOWER.encode(&[0x11; 16]),
+            password: setup.password.clone(),
+        };
+        assert_ne!(other.vault_id, a.vault_id());
+        let (mut b, cb) = Vault::create_protected(&other, key, &mut OsRandom).unwrap();
+        b.confirm_recovery(&cb).unwrap();
+        let (bytes_b, _) = b.seal_next_protected(&mut OsRandom).unwrap();
+        assert!(Vault::open_with_password(&bytes_b, PW).is_ok());
+        let mut j = json(&bytes_a);
+        j["slots"][0] = json(&bytes_b)["slots"][0].clone();
+        assert_eq!(j["slots"][0]["id"], json(&bytes_a)["slots"][0]["id"]);
+        // HKDF info and slot AAD bind the vault id: B's wrapper is useless in A.
+        assert!(matches!(
+            Vault::open_with_password(&bytes_of(&j), PW),
+            Err(Error::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn v2_password_change_requires_authority_and_is_a_rewrap() {
+        let (mut v, code, old_bytes) = protected();
+        let new_pw = "synthetic second passphrase";
+        let setup = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let new_key = setup.derive(new_pw).unwrap();
+        // Wrong authority: refused, vault unchanged.
+        let wrong = [0u8; 32];
+        assert!(v
+            .change_password(
+                Authority::PasswordKey(&wrong),
+                &setup,
+                &new_key,
+                &mut OsRandom
+            )
+            .is_err());
+        let other = RecoveryCode::generate(&mut OsRandom).unwrap();
+        assert!(v
+            .change_password(Authority::Recovery(&other), &setup, &new_key, &mut OsRandom)
+            .is_err());
+        // Reusing the current slot's salt is refused.
+        let mut reuse = setup.clone();
+        reuse.salt = v.password_setup().unwrap().salt;
+        assert!(v
+            .change_password(Authority::Recovery(&code), &reuse, &new_key, &mut OsRandom)
+            .is_err());
+        v.change_password(Authority::Recovery(&code), &setup, &new_key, &mut OsRandom)
+            .unwrap();
+        let (bytes, rev) = v.seal_next_protected(&mut OsRandom).unwrap();
+        v.mark_written(rev, &bytes).unwrap();
+        assert!(Vault::open_with_password(&bytes, new_pw).is_ok());
+        assert!(matches!(
+            Vault::open_with_password(&bytes, PW),
+            Err(Error::Decrypt)
+        ));
+        assert!(Vault::open_with_recovery(&bytes, &code).is_ok());
+        // Rewrap, not rotation: the OLD file still opens with the old password.
+        assert!(Vault::open_with_password(&old_bytes, PW).is_ok());
+        assert!(v.rotate_data_key(&mut OsRandom).is_err());
+        assert!(v.seal_next(&provider(), &mut OsRandom).is_err());
+        // Current-password authority works with the derived key.
+        let cur = v.password_setup().unwrap();
+        let cur_key = cur.derive(new_pw).unwrap();
+        let setup3 = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let k3 = setup3.derive(PW).unwrap();
+        v.change_password(
+            Authority::PasswordKey(&cur_key),
+            &setup3,
+            &k3,
+            &mut OsRandom,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v2_recovery_change_needs_authority_and_confirmation() {
+        let (mut v, code, old_bytes) = protected();
+        let other = RecoveryCode::generate(&mut OsRandom).unwrap();
+        assert!(v
+            .begin_recovery_change(Authority::Recovery(&other), &mut OsRandom)
+            .is_err());
+        let pending = v
+            .begin_recovery_change(Authority::Recovery(&code), &mut OsRandom)
+            .unwrap();
+        let new_code = RecoveryCode::parse(&pending.code().to_text()).unwrap();
+        // Wrong confirmation: refused, old code stays in force.
+        let pending2 = v
+            .begin_recovery_change(Authority::Recovery(&code), &mut OsRandom)
+            .unwrap();
+        assert!(v.finish_recovery_change(pending2, &other).is_err());
+        v.finish_recovery_change(pending, &new_code).unwrap();
+        let (bytes, rev) = v.seal_next_protected(&mut OsRandom).unwrap();
+        v.mark_written(rev, &bytes).unwrap();
+        assert!(Vault::open_with_recovery(&bytes, &new_code).is_ok());
+        assert!(matches!(
+            Vault::open_with_recovery(&bytes, &code),
+            Err(Error::Decrypt)
+        ));
+        assert!(Vault::open_with_password(&bytes, PW).is_ok());
+        assert!(Vault::open_with_recovery(&old_bytes, &code).is_ok());
+    }
+
+    #[test]
+    fn v2_item_records_are_bound_like_v1() {
+        let (mut v, _code, _) = protected();
+        v.insert(note("Synthetic title B", "SYNTHETIC-BODY-B"))
+            .unwrap();
+        let (bytes, _) = v.seal_next_protected(&mut OsRandom).unwrap();
+        let mut j = json(&bytes);
+        j["items"].as_array_mut().unwrap().pop();
+        assert!(matches!(
+            Vault::open_with_password(&bytes_of(&j), PW),
+            Err(Error::Integrity(_))
+        ));
+        let mut j = json(&bytes);
+        let a = j["items"][0]["sealed"].clone();
+        j["items"][0]["sealed"] = j["items"][1]["sealed"].clone();
+        j["items"][1]["sealed"] = a;
+        assert!(Vault::open_with_password(&bytes_of(&j), PW).is_err());
     }
 }

@@ -110,12 +110,15 @@ fn generators() {
 fn vault_lifecycle_end_to_end() {
     let c = Ctx::new();
     // No key: refuses.
-    assert!(!c.cmd_with_key(None, &["init"], None).status.success());
-    let o = c.run(&["init"], None);
+    assert!(!c
+        .cmd_with_key(None, &["init", "--demo"], None)
+        .status
+        .success());
+    let o = c.run(&["init", "--demo"], None);
     assert!(o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("SYNTHETIC DEMO"));
     assert!(
-        !c.run(&["init"], None).status.success(),
+        !c.run(&["init", "--demo"], None).status.success(),
         "init must not overwrite"
     );
     assert_eq!(c.ok(&["list"], None), "");
@@ -351,7 +354,7 @@ fn vault_lifecycle_end_to_end() {
         .status
         .success());
     assert!(!c
-        .cmd_with_key(Some(&wrong), &["init"], None)
+        .cmd_with_key(Some(&wrong), &["init", "--demo"], None)
         .status
         .success());
     assert_eq!(std::fs::read(c.vault()).unwrap(), before);
@@ -395,7 +398,7 @@ fn fake_op_wrapper(dir: &Path, fixture: &str) -> PathBuf {
 #[test]
 fn import_op_preview_apply_idempotent() {
     let c = Ctx::new();
-    c.ok(&["init"], None);
+    c.ok(&["init", "--demo"], None);
     let op = fake_op_wrapper(c.dir.path(), "login.json");
     let op = op.to_str().unwrap();
     let before = std::fs::read(c.vault()).unwrap();

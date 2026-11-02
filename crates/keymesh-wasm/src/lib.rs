@@ -1,14 +1,15 @@
-//! `wasm-bindgen` adapter for the Keymesh core — **SYNTHETIC DEMO ONLY, NOT
-//! PRODUCTION READY.**
+//! `wasm-bindgen` adapter for the Keymesh core — **EXPERIMENTAL, NOT
+//! INDEPENDENTLY REVIEWED; synthetic data only.**
 //!
-//! Exposes a key-provider handle (development-only, memory-only), a vault
-//! session, generators and envelope inspection. Errors carry the core's
+//! Exposes a demo key-provider handle (development-only, memory-only), a
+//! vault session (demo v1 or password + recovery v2), the Argon2id step the
+//! browser runs in a worker, generators and envelope inspection. Errors carry the core's
 //! messages, which never include secret values. All logic lives in
 //! [`bridge`]; this file only converts types.
 
 pub mod bridge;
 
-use bridge::{DemoKey, ItemInput, Session};
+use bridge::{DemoKey, ItemInput, ProtectedCreation as Creation, Session};
 use wasm_bindgen::prelude::*;
 
 fn err(e: keymesh::Error) -> JsError {
@@ -55,6 +56,28 @@ impl DemoKeyProvider {
     #[wasm_bindgen(getter, js_name = keyId)]
     pub fn key_id(&self) -> String {
         self.inner.provider().key_id().into()
+    }
+}
+
+/// A password vault about to be created. `request` holds the public Argon2id
+/// parameters (JSON) for the KDF worker; the core keeps the setup so only a
+/// key derived for exactly these parameters is accepted.
+#[wasm_bindgen]
+pub struct ProtectedCreation {
+    inner: Creation,
+}
+
+#[wasm_bindgen]
+impl ProtectedCreation {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Result<ProtectedCreation, JsError> {
+        Ok(Self {
+            inner: Creation::new().map_err(err)?,
+        })
+    }
+
+    pub fn request(&self) -> Result<String, JsError> {
+        json(&self.inner.request())
     }
 }
 
@@ -112,6 +135,121 @@ impl VaultSession {
         Ok(Self {
             inner: Session::open(bytes, &key.inner).map_err(err)?,
         })
+    }
+
+    /// New empty password vault from the key derived for `creation`. Shows
+    /// its recovery code until `confirmRecovery`; saving is refused before.
+    #[wasm_bindgen(js_name = createProtected)]
+    pub fn create_protected(
+        creation: &ProtectedCreation,
+        password_key: &[u8],
+    ) -> Result<VaultSession, JsError> {
+        Ok(Self {
+            inner: Session::create_protected(&creation.inner, password_key).map_err(err)?,
+        })
+    }
+
+    /// Open a v2 envelope with the Argon2id output for its password slot.
+    #[wasm_bindgen(js_name = openWithPasswordKey)]
+    pub fn open_with_password_key(
+        bytes: &[u8],
+        password_key: &[u8],
+    ) -> Result<VaultSession, JsError> {
+        Ok(Self {
+            inner: Session::open_with_password_key(bytes, password_key).map_err(err)?,
+        })
+    }
+
+    #[wasm_bindgen(js_name = openWithRecovery)]
+    pub fn open_with_recovery(bytes: &[u8], code: &str) -> Result<VaultSession, JsError> {
+        Ok(Self {
+            inner: Session::open_with_recovery(bytes, code).map_err(err)?,
+        })
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn protected(&self) -> Result<bool, JsError> {
+        self.inner.is_protected().map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = recoveryConfirmed)]
+    pub fn recovery_confirmed(&self) -> Result<bool, JsError> {
+        self.inner.recovery_confirmed().map_err(err)
+    }
+
+    /// The recovery code waiting for confirmation (shown to the user).
+    #[wasm_bindgen(js_name = shownRecoveryCode)]
+    pub fn shown_recovery_code(&self) -> Result<String, JsError> {
+        Ok(self
+            .inner
+            .shown_recovery_code()
+            .map_err(err)?
+            .as_str()
+            .to_owned())
+    }
+
+    #[wasm_bindgen(js_name = confirmRecovery)]
+    pub fn confirm_recovery(&mut self, code: &str) -> Result<(), JsError> {
+        self.inner.confirm_recovery(code).map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = currentPasswordRequest)]
+    pub fn current_password_request(&self) -> Result<String, JsError> {
+        json(&self.inner.current_password_request().map_err(err)?)
+    }
+
+    #[wasm_bindgen(js_name = beginPasswordChange)]
+    pub fn begin_password_change(&mut self) -> Result<String, JsError> {
+        json(&self.inner.begin_password_change().map_err(err)?)
+    }
+
+    #[wasm_bindgen(js_name = changePasswordWithKey)]
+    pub fn change_password_with_key(
+        &mut self,
+        current_key: &[u8],
+        new_key: &[u8],
+    ) -> Result<(), JsError> {
+        self.inner
+            .change_password_with_key(current_key, new_key)
+            .map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = changePasswordWithRecovery)]
+    pub fn change_password_with_recovery(
+        &mut self,
+        code: &str,
+        new_key: &[u8],
+    ) -> Result<(), JsError> {
+        self.inner
+            .change_password_with_recovery(code, new_key)
+            .map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = beginRecoveryChange)]
+    pub fn begin_recovery_change(&mut self, current_key: &[u8]) -> Result<(), JsError> {
+        self.inner.begin_recovery_change(current_key).map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = finishRecoveryChange)]
+    pub fn finish_recovery_change(&mut self, code: &str) -> Result<(), JsError> {
+        self.inner.finish_recovery_change(code).map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = cancelRecoveryChange)]
+    pub fn cancel_recovery_change(&mut self) {
+        self.inner.cancel_recovery_change();
+    }
+
+    /// Back to the last committed state after a failed or cancelled write.
+    pub fn rollback(&mut self) -> Result<(), JsError> {
+        self.inner.rollback().map_err(err)
+    }
+
+    /// v2: encrypt the next revision; persist `bytes`, then call `commit`.
+    #[wasm_bindgen(js_name = sealProtected)]
+    pub fn seal_protected(&mut self) -> Result<SealedVault, JsError> {
+        let (bytes, revision) = self.inner.seal_protected().map_err(err)?;
+        Ok(SealedVault { bytes, revision })
     }
 
     /// Drop all decrypted state; every later call fails.
@@ -293,7 +431,30 @@ impl VaultSession {
     }
 }
 
-/// Header of an envelope (no decryption): JSON `{vault_id, kek_id, revision}`.
+/// Argon2id parameters (JSON `{salt, mKib, t, p}`) of a stored v2 envelope's
+/// password slot; bounds are checked first. No secret.
+#[wasm_bindgen(js_name = passwordRequest)]
+pub fn password_request(bytes: &[u8]) -> Result<String, JsError> {
+    json(&bridge::password_request(bytes).map_err(err)?)
+}
+
+/// Argon2id of `password` for a request from `passwordRequest`,
+/// `ProtectedCreation.request` or `beginPasswordChange`. Runs in the KDF
+/// worker; re-validates the bounds before allocating.
+#[wasm_bindgen(js_name = deriveArgon2id)]
+pub fn derive_argon2id(password: &str, request: &str) -> Result<Vec<u8>, JsError> {
+    Ok(bridge::derive_password_key(password, request)
+        .map_err(err)?
+        .to_vec())
+}
+
+/// Throws when `password` is not acceptable as a new master password.
+#[wasm_bindgen(js_name = checkNewPassword)]
+pub fn check_new_password(password: &str) -> Result<(), JsError> {
+    bridge::check_new_password(password).map_err(err)
+}
+
+/// Header of an envelope (no decryption): JSON `{version, vault_id, kek_id, revision}`.
 #[wasm_bindgen(js_name = inspectEnvelope)]
 pub fn inspect_envelope(bytes: &[u8]) -> Result<String, JsError> {
     json(&bridge::inspect_envelope(bytes).map_err(err)?)

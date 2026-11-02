@@ -7,8 +7,11 @@
 //! Safety rules:
 //! * `create` refuses to replace an existing file.
 //! * `load` never returns an empty vault for a file it cannot decrypt.
-//! * `save` re-reads the on-disk header and refuses to overwrite if the file's
-//!   vault id or revision differs from what was loaded (lost-update guard).
+//! * `save` re-reads the file and refuses to overwrite unless it is byte for
+//!   byte what this vault last read or wrote (SHA-256 compare; lost-update
+//!   guard). This is a check-then-rename, not a lock: two processes saving
+//!   at the same instant can still race. Keymesh assumes a single writer per
+//!   vault file and does not implement file locking.
 //! * `backup` and `restore` verify the source decrypts before writing.
 //! * Reads and writes share one size bound ([`MAX_VAULT_BYTES`]); an oversize
 //!   vault is refused before anything is written.
@@ -17,6 +20,7 @@ use crate::crypto::KeyProvider;
 use crate::error::{Error, Result};
 use crate::rng::RandomSource;
 use crate::vault::{read_header, Vault};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -114,7 +118,7 @@ pub(crate) fn create_limited(
     let (bytes, rev) = vault.seal_next(provider, rng)?;
     check_write_size(&bytes, limit)?;
     atomic_write(path, &bytes, true)?;
-    vault.mark_persisted(rev)?;
+    vault.mark_written(rev, &bytes)?;
     Ok(())
 }
 
@@ -146,22 +150,92 @@ pub(crate) fn save_limited(
     rng: &mut dyn RandomSource,
     limit: u64,
 ) -> Result<()> {
-    let on_disk = read_header(&read_bounded(path, limit)?)?;
+    check_unchanged(path, vault, limit)?;
+    let (bytes, rev) = vault.seal_next(provider, rng)?;
+    check_write_size(&bytes, limit)?;
+    atomic_write(path, &bytes, false)?;
+    vault.mark_written(rev, &bytes)?;
+    Ok(())
+}
+
+/// The file must still be exactly what `vault` last read or wrote.
+fn check_unchanged(path: &Path, vault: &Vault, limit: u64) -> Result<()> {
+    let current = read_bounded(path, limit)?;
+    let on_disk = read_header(&current)?;
     if on_disk.vault_id != vault.vault_id() {
         return Err(Error::Integrity(
             "target file holds a different vault".into(),
         ));
     }
-    if on_disk.revision != vault.revision() {
+    let digest: [u8; 32] = Sha256::digest(&current).into();
+    if on_disk.revision != vault.revision() || vault.snapshot_digest() != Some(digest) {
         return Err(Error::Integrity(
             "vault changed on disk since it was loaded; reload and retry".into(),
         ));
     }
-    let (bytes, rev) = vault.seal_next(provider, rng)?;
-    check_write_size(&bytes, limit)?;
-    atomic_write(path, &bytes, false)?;
-    vault.mark_persisted(rev)?;
     Ok(())
+}
+
+// --- v2 (password + recovery) ----------------------------------------------
+
+/// Write a new password-protected vault. Refused until its recovery code was
+/// confirmed ([`Vault::confirm_recovery`]) and if `path` exists.
+pub fn create_protected(path: &Path, vault: &mut Vault, rng: &mut dyn RandomSource) -> Result<()> {
+    if path.exists() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "vault file already exists",
+        )));
+    }
+    if vault.revision() != 0 {
+        return Err(Error::validation("create expects a new vault"));
+    }
+    let (bytes, rev) = vault.seal_next_protected(rng)?;
+    check_write_size(&bytes, MAX_VAULT_BYTES)?;
+    atomic_write(path, &bytes, true)?;
+    vault.mark_written(rev, &bytes)
+}
+
+/// Bounded read of an envelope (for password/recovery unlock).
+pub fn read_envelope(path: &Path) -> Result<Vec<u8>> {
+    read_bounded(path, MAX_VAULT_BYTES)
+}
+
+pub fn save_protected(path: &Path, vault: &mut Vault, rng: &mut dyn RandomSource) -> Result<()> {
+    check_unchanged(path, vault, MAX_VAULT_BYTES)?;
+    let (bytes, rev) = vault.seal_next_protected(rng)?;
+    check_write_size(&bytes, MAX_VAULT_BYTES)?;
+    atomic_write(path, &bytes, false)?;
+    vault.mark_written(rev, &bytes)
+}
+
+/// Write `vault` (already opened, e.g. from a backup with its recovery code
+/// and given a new password) as the next revision to `dest`. Without
+/// `overwrite`, an existing `dest` is never replaced.
+pub fn write_protected_to(
+    dest: &Path,
+    vault: &mut Vault,
+    rng: &mut dyn RandomSource,
+    overwrite: bool,
+) -> Result<()> {
+    let (bytes, rev) = vault.seal_next_protected(rng)?;
+    check_write_size(&bytes, MAX_VAULT_BYTES)?;
+    atomic_write(dest, &bytes, !overwrite)?;
+    vault.mark_written(rev, &bytes)
+}
+
+/// Write backup bytes the caller already opened to `dest` (restore).
+/// Without `overwrite`, an existing `dest` is never replaced.
+pub fn restore_verified(bytes: &[u8], dest: &Path, overwrite: bool) -> Result<()> {
+    check_write_size(bytes, MAX_VAULT_BYTES)?;
+    atomic_write(dest, bytes, !overwrite)
+}
+
+/// Copy verified bytes to a new file (never clobbers). The caller has already
+/// opened `bytes` with a valid credential.
+pub fn write_backup(dest: &Path, bytes: &[u8]) -> Result<()> {
+    check_write_size(bytes, MAX_VAULT_BYTES)?;
+    atomic_write(dest, bytes, true)
 }
 
 /// Copy an encrypted vault to `dest` after verifying it decrypts with
@@ -410,5 +484,93 @@ mod tests {
     fn missing_file_is_error_not_empty_vault() {
         let (_d, path, p) = setup();
         assert!(load(&path, &p).is_err());
+    }
+
+    // --- v2 ------------------------------------------------------------------
+
+    const PW: &str = "synthetic storage passphrase";
+
+    fn protected_file(path: &Path) -> Vec<u8> {
+        let (mut v, code) = Vault::create_with_password(PW, &mut OsRandom).unwrap();
+        // Refused until the recovery code was confirmed: nothing written.
+        assert!(create_protected(path, &mut v, &mut OsRandom).is_err());
+        assert!(!path.exists());
+        v.confirm_recovery(&code).unwrap();
+        v.insert(note("a")).unwrap();
+        create_protected(path, &mut v, &mut OsRandom).unwrap();
+        fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn protected_save_uses_exact_bytes_not_just_revision() {
+        let (d, path, _p) = setup();
+        let original = protected_file(&path);
+        let bytes = read_envelope(&path).unwrap();
+        let mut a = Vault::open_with_password(&bytes, PW).unwrap();
+        let mut b = Vault::open_with_password(&bytes, PW).unwrap();
+        // Another writer replaces the file with different content at the SAME
+        // revision (e.g. a restore of a sibling backup).
+        let mut sibling = Vault::open_with_password(&bytes, PW).unwrap();
+        sibling.insert(note("sibling")).unwrap();
+        let sib_path = d.path().join("sibling.keymesh");
+        write_protected_to(&sib_path, &mut sibling, &mut OsRandom, false).unwrap();
+        a.insert(note("a2")).unwrap();
+        save_protected(&path, &mut a, &mut OsRandom).unwrap();
+        let after_a = fs::read(&path).unwrap();
+        b.insert(note("b2")).unwrap();
+        assert!(save_protected(&path, &mut b, &mut OsRandom).is_err());
+        assert_eq!(fs::read(&path).unwrap(), after_a);
+        // Same revision (2) as `a`'s save, different bytes: still refused.
+        let mut c = Vault::open_with_password(&after_a, PW).unwrap();
+        fs::copy(&sib_path, &path).unwrap();
+        assert_eq!(
+            read_header(&fs::read(&path).unwrap()).unwrap().revision,
+            c.revision()
+        );
+        c.insert(note("c")).unwrap();
+        assert!(save_protected(&path, &mut c, &mut OsRandom).is_err());
+        assert_eq!(fs::read(&path).unwrap(), fs::read(&sib_path).unwrap());
+        assert_ne!(original, after_a);
+    }
+
+    #[test]
+    fn protected_failures_leave_the_file_intact() {
+        let (d, path, _p) = setup();
+        let original = protected_file(&path);
+        assert!(create_protected(
+            &path,
+            &mut Vault::create_with_password(PW, &mut OsRandom).unwrap().0,
+            &mut OsRandom
+        )
+        .is_err());
+        assert!(Vault::open_with_password(
+            &read_envelope(&path).unwrap(),
+            "synthetic wrong passphrase"
+        )
+        .is_err());
+        // Restoring/recovering never clobbers without overwrite.
+        let mut v = Vault::open_with_password(&original, PW).unwrap();
+        assert!(write_protected_to(&path, &mut v, &mut OsRandom, false).is_err());
+        assert!(restore_verified(&original, &path, false).is_err());
+        assert!(write_backup(&path, &original).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        // Oversize envelopes are refused on read.
+        let huge = d.path().join("huge.keymesh");
+        fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_VAULT_BYTES + 1)
+            .unwrap();
+        assert!(matches!(read_envelope(&huge), Err(Error::Format(_))));
+        let leftovers = fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 }

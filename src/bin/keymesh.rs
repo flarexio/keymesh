@@ -1,8 +1,18 @@
-//! Keymesh CLI test harness — **SYNTHETIC DEMO ONLY, NOT PRODUCTION READY.**
+//! Keymesh CLI — **EXPERIMENTAL, NOT INDEPENDENTLY REVIEWED: synthetic data
+//! only until acceptance.**
 //!
-//! The vault key comes from `KEYMESH_DEMO_KEY` (64 hex chars) via the
-//! synthetic demo key provider. Real unlock/recovery is not implemented.
-//! Secret inputs are read from stdin, never from command-line arguments.
+//! * `init` creates a password-protected vault (envelope v2): a master
+//!   password plus a recovery code that is shown once and must be typed back.
+//!   Every command opens the vault with the password (Argon2id each time; no
+//!   agent or cached key).
+//! * `init --demo` creates a v1 demo vault keyed by `KEYMESH_DEMO_KEY` (64 hex
+//!   chars, synthetic demo key provider). The file's version decides which
+//!   unlock applies; a demo vault is never converted into a protected one.
+//!
+//! Secrets are never taken from command-line arguments: the password and
+//! recovery code are read from the terminal without echo, or with
+//! `--password-stdin` one line each from stdin (the first lines), followed by
+//! any other stdin input the command reads.
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use keymesh::crypto::SyntheticDemoKeyProvider;
@@ -13,18 +23,22 @@ use keymesh::generate::{
 };
 use keymesh::import::op::{plan, ConflictPolicy, OpTarget};
 use keymesh::import::process::ProcessOpRunner;
+use keymesh::kdf::check_new_password;
+use keymesh::keyslot::{Authority, PasswordSetup};
 use keymesh::model::{
     Contact, CryptoWalletRecord, Ed25519KeyRecord, Item, ItemData, ItemId, LabeledValue, Login,
     SecretCredential, SecretFormat, SecretOrigin, SecureNote, TotpRecord,
 };
+use keymesh::recovery::RecoveryCode;
 use keymesh::rng::OsRandom;
 use keymesh::secret::SecretString;
 use keymesh::totp::{
     code_now, parse_base32_secret, parse_otpauth_uri, FixedClock, SystemClock, TotpConfig,
 };
-use keymesh::vault::Vault;
+use keymesh::vault::{password_request, read_header, Vault};
 use keymesh::{storage, Error};
-use std::io::Read;
+use std::cell::RefCell;
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -32,25 +46,53 @@ use zeroize::Zeroizing;
 
 const BANNER: &str =
     "keymesh: SYNTHETIC DEMO KEY PROVIDER — not production unlock; use synthetic data only";
+const EXPERIMENTAL: &str =
+    "keymesh: password vault (experimental, not independently reviewed) — use synthetic data only";
 
 #[derive(Parser)]
 #[command(
     name = "keymesh",
     version,
-    about = "Keymesh vault CLI harness (M1, synthetic demo only)"
+    about = "Keymesh vault CLI (experimental; synthetic data only)"
 )]
 struct Cli {
     /// Vault file path.
     #[arg(long, env = "KEYMESH_VAULT", global = true)]
     vault: Option<PathBuf>,
+    /// Read the password / recovery code from stdin (one line each) instead
+    /// of the terminal.
+    #[arg(long, global = true)]
+    password_stdin: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a new empty vault (refuses to overwrite).
-    Init,
+    /// Create a new empty vault (refuses to overwrite). Asks for a master
+    /// password, shows a recovery code once and asks you to type it back.
+    Init {
+        /// Demo vault keyed by KEYMESH_DEMO_KEY instead (synthetic data only).
+        #[arg(long)]
+        demo: bool,
+    },
+    /// Change the master password (needs the current password, or the
+    /// recovery code with --recovery). Older backups keep the old password.
+    Passwd {
+        #[arg(long)]
+        recovery: bool,
+    },
+    /// Replace the recovery code (needs the current password). Older backups
+    /// keep the old code.
+    NewRecoveryCode,
+    /// Open a backup with its recovery code, set a new password and write it
+    /// to --vault (refuses to overwrite without --force).
+    Recover {
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
     /// List items: id, kind, title.
     List,
     /// Show one item as JSON; secrets redacted unless --reveal.
@@ -91,12 +133,13 @@ enum Cmd {
     /// Generators (no vault needed).
     #[command(subcommand)]
     Gen(GenCmd),
-    /// Copy the encrypted vault to a new file after verifying it decrypts.
+    /// Copy the encrypted vault to a new file after verifying it opens.
     Backup {
         #[arg(long)]
         to: PathBuf,
     },
-    /// Restore an encrypted backup to --vault after verifying it decrypts.
+    /// Restore an encrypted backup to --vault after verifying it opens (with
+    /// the backup's own password for a password vault).
     Restore {
         #[arg(long)]
         from: PathBuf,
@@ -298,29 +341,128 @@ fn vault_path(cli: &Cli) -> R<PathBuf> {
         .ok_or_else(|| usage("--vault (or KEYMESH_VAULT) is required"))
 }
 
+thread_local! {
+    /// One buffered stdin for the whole run: credential lines first, then
+    /// whatever else the command reads.
+    static STDIN: RefCell<std::io::BufReader<std::io::Stdin>> =
+        RefCell::new(std::io::BufReader::new(std::io::stdin()));
+}
+
+fn strip_eol(s: &str) -> &str {
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    s.strip_suffix('\r').unwrap_or(s)
+}
+
+/// A password or recovery code: from the terminal without echo, or one line
+/// of stdin with `--password-stdin`. Never from arguments or the environment.
+fn read_credential(cli: &Cli, prompt: &str) -> R<Zeroizing<String>> {
+    let value = if cli.password_stdin {
+        let mut line = Zeroizing::new(String::new());
+        STDIN.with(|s| s.borrow_mut().read_line(&mut line))?;
+        Zeroizing::new(strip_eol(&line).to_owned())
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err(usage(
+                "no terminal for the password prompt; use --password-stdin",
+            ));
+        }
+        Zeroizing::new(rpassword::prompt_password(prompt)?)
+    };
+    if value.is_empty() {
+        return Err(usage("expected a password or recovery code"));
+    }
+    Ok(value)
+}
+
+/// A new master password, checked against the password rules (typed twice
+/// on a terminal).
+fn read_new_password(cli: &Cli) -> R<Zeroizing<String>> {
+    let pw = read_credential(cli, "New master password: ")?;
+    check_new_password(&pw)?;
+    if !cli.password_stdin {
+        let again = read_credential(cli, "Repeat new master password: ")?;
+        if *again != *pw {
+            return Err(usage("the passwords do not match"));
+        }
+    }
+    Ok(pw)
+}
+
+fn read_recovery_code(cli: &Cli, prompt: &str) -> R<RecoveryCode> {
+    RecoveryCode::parse(&read_credential(cli, prompt)?)
+}
+
+/// Show a new recovery code once, then require it to be typed back.
+fn show_and_confirm_code(cli: &Cli, code: &RecoveryCode) -> R<RecoveryCode> {
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "Recovery code (shown once; store it offline, separate from this device):"
+    )?;
+    writeln!(out, "{}", code.to_text().as_str())?;
+    out.flush()?;
+    drop(out);
+    let back = read_recovery_code(cli, "Type the recovery code to confirm: ")?;
+    if !back.ct_eq(code) {
+        return Err(usage(
+            "the recovery code does not match; nothing was written",
+        ));
+    }
+    Ok(back)
+}
+
 fn read_stdin_secret() -> R<SecretString> {
     let mut s = Zeroizing::new(String::new());
-    std::io::stdin().read_to_string(&mut s)?;
-    let trimmed = s.strip_suffix('\n').unwrap_or(&s);
-    let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+    STDIN.with(|i| i.borrow_mut().read_to_string(&mut s))?;
+    let trimmed = strip_eol(&s);
     if trimmed.is_empty() {
         return Err(usage("expected a value on stdin"));
     }
     Ok(SecretString::new(trimmed))
 }
 
+/// An opened vault and how to save it again.
+enum Opened {
+    Demo(SyntheticDemoKeyProvider),
+    Protected,
+}
+
+/// Open --vault with the unlock its file version needs.
+fn open_vault(cli: &Cli, path: &std::path::Path) -> R<(Vault, Opened, Zeroizing<[u8; 32]>)> {
+    let bytes = storage::read_envelope(path)?;
+    if read_header(&bytes)?.version == 1 {
+        let p = provider()?;
+        let v = Vault::decrypt(&bytes, &p)?;
+        return Ok((v, Opened::Demo(p), Zeroizing::new([0; 32])));
+    }
+    eprintln!("{EXPERIMENTAL}");
+    let req = password_request(&bytes)?;
+    let pw = read_credential(cli, "Master password: ")?;
+    let key = req.setup.derive(&pw)?;
+    let v = Vault::open_with_password_key(&bytes, &key)?;
+    Ok((v, Opened::Protected, key))
+}
+
+fn save_vault(path: &std::path::Path, v: &mut Vault, how: &Opened) -> R<()> {
+    match how {
+        Opened::Demo(p) => storage::save(path, v, p, &mut OsRandom),
+        Opened::Protected => storage::save_protected(path, v, &mut OsRandom),
+    }
+}
+
 fn with_vault(cli: &Cli, f: impl FnOnce(&mut Vault) -> R<bool>) -> R<()> {
-    let p = provider()?;
     let path = vault_path(cli)?;
-    let mut v = storage::load(&path, &p)?;
+    let (mut v, how, _key) = open_vault(cli, &path)?;
     if f(&mut v)? {
-        storage::save(&path, &mut v, &p, &mut OsRandom)?;
+        save_vault(&path, &mut v, &how)?;
     }
     Ok(())
 }
 
-fn add_item(cli: &Cli, title: String, data: ItemData) -> R<()> {
+/// Opens the vault (reading the password first), then reads item input.
+fn add_item(cli: &Cli, a: &AddCmd) -> R<()> {
     with_vault(cli, |v| {
+        let (title, data) = build_item(a)?;
         let item = Item::new(title, data, &mut OsRandom)?;
         let id = v.insert(item)?;
         println!("{id}");
@@ -368,12 +510,86 @@ fn redact(v: &mut serde_json::Value) {
 
 fn run(cli: Cli) -> R<()> {
     match &cli.cmd {
-        Cmd::Init => {
+        Cmd::Init { demo: true } => {
             let p = provider()?;
             let path = vault_path(&cli)?;
             let mut v = Vault::create(&p, &mut OsRandom)?;
             storage::create(&path, &mut v, &p, &mut OsRandom)?;
             println!("created vault {}", v.vault_id());
+        }
+        Cmd::Init { demo: false } => {
+            let path = vault_path(&cli)?;
+            if path.exists() {
+                return Err(usage("vault file already exists"));
+            }
+            eprintln!("{EXPERIMENTAL}");
+            let pw = read_new_password(&cli)?;
+            let (mut v, code) = Vault::create_with_password(&pw, &mut OsRandom)?;
+            let back = show_and_confirm_code(&cli, &code)?;
+            v.confirm_recovery(&back)?;
+            storage::create_protected(&path, &mut v, &mut OsRandom)?;
+            println!("created vault {}", v.vault_id());
+            println!("Without the password or the recovery code this vault cannot be opened.");
+        }
+        Cmd::Passwd { recovery } => {
+            let path = vault_path(&cli)?;
+            let bytes = storage::read_envelope(&path)?;
+            eprintln!("{EXPERIMENTAL}");
+            let (mut v, code, key) = if *recovery {
+                let code = read_recovery_code(&cli, "Recovery code: ")?;
+                (Vault::open_with_recovery(&bytes, &code)?, Some(code), None)
+            } else {
+                let req = password_request(&bytes)?;
+                let pw = read_credential(&cli, "Current master password: ")?;
+                let key = req.setup.derive(&pw)?;
+                (
+                    Vault::open_with_password_key(&bytes, &key)?,
+                    None,
+                    Some(key),
+                )
+            };
+            let new_pw = read_new_password(&cli)?;
+            let setup = PasswordSetup::generate(&mut OsRandom)?;
+            let new_key = setup.derive(&new_pw)?;
+            let authority = match (&code, &key) {
+                (Some(c), _) => Authority::Recovery(c),
+                (None, Some(k)) => Authority::PasswordKey(k),
+                _ => unreachable!(),
+            };
+            v.change_password(authority, &setup, &new_key, &mut OsRandom)?;
+            storage::save_protected(&path, &mut v, &mut OsRandom)?;
+            println!("password changed");
+            println!("Backups made before this change still open with the old password.");
+        }
+        Cmd::NewRecoveryCode => {
+            let path = vault_path(&cli)?;
+            let (mut v, how, key) = open_vault(&cli, &path)?;
+            if !matches!(how, Opened::Protected) {
+                return Err(usage("demo vaults have no recovery code"));
+            }
+            let pending = v.begin_recovery_change(Authority::PasswordKey(&key), &mut OsRandom)?;
+            let code = RecoveryCode::parse(&pending.code().to_text())?;
+            let back = show_and_confirm_code(&cli, &code)?;
+            v.finish_recovery_change(pending, &back)?;
+            storage::save_protected(&path, &mut v, &mut OsRandom)?;
+            println!("recovery code replaced");
+            println!("Backups made before this change still open with the old recovery code.");
+        }
+        Cmd::Recover { from, force } => {
+            let dest = vault_path(&cli)?;
+            if dest.exists() && !force {
+                return Err(usage("--vault exists; pass --force to replace it"));
+            }
+            let bytes = storage::read_envelope(from)?;
+            eprintln!("{EXPERIMENTAL}");
+            let code = read_recovery_code(&cli, "Recovery code: ")?;
+            let mut v = Vault::open_with_recovery(&bytes, &code)?;
+            let new_pw = read_new_password(&cli)?;
+            let setup = PasswordSetup::generate(&mut OsRandom)?;
+            let new_key = setup.derive(&new_pw)?;
+            v.change_password(Authority::Recovery(&code), &setup, &new_key, &mut OsRandom)?;
+            storage::write_protected_to(&dest, &mut v, &mut OsRandom, *force)?;
+            println!("recovered vault {} with a new password", v.vault_id());
         }
         Cmd::List => with_vault(&cli, |v| {
             for i in v.items() {
@@ -391,35 +607,30 @@ fn run(cli: Cli) -> R<()> {
             println!("{}", out.as_str());
             Ok(false)
         })?,
-        Cmd::Add(a) => {
-            let (title, data) = build_item(a)?;
-            add_item(&cli, title, data)?;
-        }
+        Cmd::Add(a) => add_item(&cli, a)?,
         Cmd::Edit {
             id,
             title,
             add_tags,
             notes_stdin,
-        } => {
+        } => with_vault(&cli, |v| {
             let notes = if *notes_stdin {
                 Some(read_stdin_secret()?)
             } else {
                 None
             };
-            with_vault(&cli, |v| {
-                v.update(id, |it| {
-                    if let Some(t) = title {
-                        it.title = t.clone();
-                    }
-                    it.tags.extend(add_tags.iter().cloned());
-                    if notes.is_some() {
-                        it.notes = notes.clone();
-                    }
-                })?;
-                println!("updated {id}");
-                Ok(true)
-            })?
-        }
+            v.update(id, |it| {
+                if let Some(t) = title {
+                    it.title = t.clone();
+                }
+                it.tags.extend(add_tags.iter().cloned());
+                if notes.is_some() {
+                    it.notes = notes.clone();
+                }
+            })?;
+            println!("updated {id}");
+            Ok(true)
+        })?,
         Cmd::Delete { id } => with_vault(&cli, |v| {
             v.remove(id)?;
             println!("deleted {id}");
@@ -469,13 +680,33 @@ fn run(cli: Cli) -> R<()> {
             println!("{}", s.expose());
         }
         Cmd::Backup { to } => {
-            let p = provider()?;
-            storage::backup(&vault_path(&cli)?, to, &p)?;
+            let path = vault_path(&cli)?;
+            let bytes = storage::read_envelope(&path)?;
+            if read_header(&bytes)?.version == 1 {
+                storage::backup(&path, to, &provider()?)?;
+            } else {
+                // Verify the exact bytes open before copying them.
+                let (_v, _, _) = open_vault(&cli, &path)?;
+                if storage::read_envelope(&path)? != bytes {
+                    return Err(usage("vault changed while the backup was verified"));
+                }
+                storage::write_backup(to, &bytes)?;
+            }
             println!("backup written");
         }
         Cmd::Restore { from, force } => {
-            let p = provider()?;
-            storage::restore(from, &vault_path(&cli)?, &p, *force)?;
+            let dest = vault_path(&cli)?;
+            let bytes = storage::read_envelope(from)?;
+            if read_header(&bytes)?.version == 1 {
+                storage::restore(from, &dest, &provider()?, *force)?;
+            } else {
+                eprintln!("{EXPERIMENTAL}");
+                let req = password_request(&bytes)?;
+                let pw = read_credential(&cli, "Backup's master password: ")?;
+                let key = req.setup.derive(&pw)?;
+                Vault::open_with_password_key(&bytes, &key)?;
+                storage::restore_verified(&bytes, &dest, *force)?;
+            }
             println!("restored");
         }
         Cmd::ImportOp(a) => import_op(&cli, a)?,
@@ -655,10 +886,9 @@ fn import_op(cli: &Cli, a: &ImportArgs) -> R<()> {
             "specify --op-vault with --item, or --ref (no implicit enumeration)",
         ));
     }
-    let p = provider()?;
     let path = vault_path(cli)?;
-    // Load first: never fetch provider data if the vault cannot be opened.
-    let mut v = storage::load(&path, &p)?;
+    // Open first: never fetch provider data if the vault cannot be opened.
+    let (mut v, how, _key) = open_vault(cli, &path)?;
     let runner = ProcessOpRunner::with_program(
         a.op_path.clone().unwrap_or_else(|| PathBuf::from("op")),
         Duration::from_secs(a.timeout_secs),
@@ -673,7 +903,7 @@ fn import_op(cli: &Cli, a: &ImportArgs) -> R<()> {
         Mode::Preview => pl.preview(&v, policy),
         Mode::Apply => {
             let r = pl.apply(&mut v, policy, &mut OsRandom);
-            storage::save(&path, &mut v, &p, &mut OsRandom)?;
+            save_vault(&path, &mut v, &how)?;
             r
         }
     };

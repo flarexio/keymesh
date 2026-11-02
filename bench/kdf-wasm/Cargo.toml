@@ -1,0 +1,19 @@
+# Benchmark-only crate (not part of the app or the workspace): times Argon2id
+# from the same pinned `argon2` version in browser WASM on synthetic input.
+[package]
+name = "kdf-bench-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+wasm-bindgen = "=0.2.129"
+
+[profile.release]
+opt-level = 3
