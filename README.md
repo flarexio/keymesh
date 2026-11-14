@@ -137,5 +137,6 @@ apps/web/        Angular 22 demo app, Vitest unit tests, Playwright E2E (e2e/)
 scripts/         build-wasm.sh (cargo wasm32 build + wasm-bindgen into apps/web), check-vectors.mjs
 bench/kdf-wasm/  benchmark-only WASM crate (Argon2id timings in a browser; not part of the app)
 docs/            ARCHITECTURE.md (formats, key hierarchy, browser app, decisions, limitations), DESIGN.md,
-                 DELIVERY.md (HTTPS scope and decision), adr/0001 (unlock/recovery design), adr/0002 (envelope v2)
+                 DELIVERY.md (HTTPS scope and decision), ROADMAP.md (backlog, gates, acceptance criteria),
+                 adr/0001 (unlock/recovery design), adr/0002 (envelope v2), adr/0003 (quick unlock, proposed)
 ```

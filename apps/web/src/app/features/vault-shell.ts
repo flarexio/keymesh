@@ -75,6 +75,13 @@ const TABS: { id: Tab; label: MessageKey; icon: IconName }[] = [
       </aside>
 
       <div class="workspace">
+        @if (vault.keyMode() === 'synthetic-fixture' || vault.keyMode() === 'ephemeral') {
+          <!-- Mode-specific: a demo vault is not confidential (the global banner stays too). -->
+          <div class="callout callout-warn demo-mode-notice" role="note" data-testid="demo-mode-notice">
+            <km-icon name="shieldAlert" />
+            <p>{{ i18n.t(vault.keyMode() === 'synthetic-fixture' ? 'vault.demoNotice.fixture' : 'vault.demoNotice.ephemeral') }}</p>
+          </div>
+        }
         @if (vault.status() === 'stale') {
           <div class="callout callout-warn stale" role="alert">
             <km-icon name="alert" />

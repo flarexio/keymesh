@@ -17,7 +17,7 @@ All colours are semantic custom properties defined with `light-dark(light, dark)
 |---|---|---|
 | Surfaces | `--bg`, `--surface`, `--surface-2`, `--surface-sunken`, `--surface-hover` | page, cards and panes, sidebar and subtle fills, inputs and code, hover |
 | Lines | `--border`, `--border-strong` | dividers and cards; inputs and secondary buttons |
-| Text | `--fg`, `--fg-muted`, `--fg-subtle` | body, secondary, labels/meta (all ≥ 4.5:1 on `--surface` and `--bg`) |
+| Text | `--fg`, `--fg-muted`, `--fg-subtle` | body, secondary, labels/meta. Token contrast against every surface token is ≥ 4.5:1; the lowest is `--fg-subtle` on `--accent-soft`, 4.72 light / 4.84 dark. E2E measures rendered secondary and status text in both themes |
 | Accent | `--accent`, `--accent-hover`, `--accent-fg`, `--accent-soft`, `--accent-soft-fg` | primary actions, selection, focus |
 | Status | `--danger*`, `--success*`, `--warn*`, `--info-*` | destructive actions and errors, confirmations, demo/stale warnings, neutral callouts |
 | Kinds | `--kind-<item kind>` | low-saturation hue per item type, always paired with an icon and a text label |
@@ -46,7 +46,16 @@ No remote fonts, images or icon fonts are loaded. Icons are a small local stroke
 - **Touch:** on `pointer: coarse`, buttons, nav items, menu items and the language/appearance segments are at least 44×44px. That rule sits last in `components.css` so later component rules cannot shrink it; E2E measures it at 320 and 390px in both locales.
 - **Feedback:** inline callouts (info, warning, danger, success) with an icon and text, and short-lived toasts in a polite live region. Errors are localized and never show raw low-level messages.
 - **States:** loading (spinner plus text, static under reduced motion), core failed to start (with a reload action), start, stored vault found, ephemeral key lost, locked, empty vault (a grid of item types to create), no search matches (clear filters), and stale tab (blocking warning plus reload).
-- **Password vault (M4):** the start screen leads with the password vault card and keeps the demo below it, labelled "Demo vault". Card states:
+- **Start-screen orientation (M4 follow-up):**
+  - A "Vaults in this browser" overview opens the start screen. It has one row per kind: "Password vault" (protected by your master password, experimental) and "Demo vault" (not confidential, sample data only).
+  - Each row shows its state: not created, locked, saved, can't be opened, being created, or needs HTTPS. A button moves focus to that card without changing the URL.
+  - The cards follow the overview's order. An **existing** vault comes before creating a new one: a locked or saved demo vault comes before password-vault *creation*, while an existing or in-progress password vault always stays first.
+  - The demo card is the one that moves, in DOM order, so keyboard and screen-reader order match what is shown. The password card keeps its state.
+- **Demo-mode notice:** inside an open demo vault, a warning callout at the top of the workspace says what the mode means. It is shown on desktop and mobile, below the global preview strip, which stays.
+  - **Test key:** "uses a public test key, so anyone with the stored data can read it".
+  - **Session only:** "not protected by a password, and can't be opened after a reload".
+  - Password vaults don't show it.
+- **Password vault (M4):** the password vault card and the demo card, labelled "Demo vault", are ordered as above. Card states:
   - create (password, repeat, hint "at least 15 characters");
   - recovery code (shown once in 14 monospace groups, Copy, an "I've saved it" checkbox, then typed back);
   - unlock (password with Show/Hide, "Forgot your password?");

@@ -19,7 +19,7 @@ type View = 'create' | 'unlock' | 'reset';
   selector: 'km-protected-start',
   imports: [Icon, RecoveryConfirm, SecretInput, ProtectedRestore],
   template: `
-    <section class="card start-card" aria-labelledby="protected-title" data-testid="protected-section">
+    <section class="card start-card" id="protected-card" tabindex="-1" aria-labelledby="protected-title" data-testid="protected-section">
       @if (!vault.secure) {
         <span class="state-icon"><km-icon name="shieldAlert" /></span>
         <h2 id="protected-title">{{ i18n.t('protected.insecure.title') }}</h2>

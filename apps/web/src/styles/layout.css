@@ -275,6 +275,12 @@ html:lang(en) .eyebrow {
   margin-bottom: var(--space-4);
 }
 
+.workspace > .demo-mode-notice {
+  margin-bottom: var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+}
+
 .items-layout {
   display: grid;
   grid-template-columns: minmax(17rem, 22rem) minmax(0, 1fr);
@@ -564,6 +570,94 @@ html:lang(en) .eyebrow {
 }
 
 /* ---- Start: password vault + demo ---- */
+
+.vault-overview {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-5);
+}
+
+.overview-list {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.overview-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+}
+
+.overview-row + .overview-row {
+  border-top: 1px solid var(--border);
+}
+
+.overview-icon {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 2rem;
+  height: 2rem;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent-soft-fg);
+}
+
+.overview-icon.demo {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.overview-body {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+}
+
+.overview-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  align-items: baseline;
+}
+
+.overview-name {
+  font-weight: 600;
+}
+
+.overview-state {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
+.overview-row[data-state='locked'] .overview-state,
+.overview-row[data-state='stored'] .overview-state,
+.overview-row[data-state='creating'] .overview-state {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.overview-note {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
+.overview-go {
+  flex: none;
+}
+
+.start-card:focus {
+  outline: none;
+}
+
+.start-card:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
 
 .start-main {
   display: grid;
