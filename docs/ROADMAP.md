@@ -35,8 +35,8 @@
   * the product decisions D1–D3 and D5 (none is approved by the ADR).
 * **Acceptance:**
   * **Format:** test vectors for the new slot kind; unknown kinds are still refused by older readers.
-  * **Browser:** the Playwright virtual authenticator covers enrolment, unlock, removal, PRF-unsupported and no-results refusal, UV-missing refusal, abort on lock or hide, and the leftover-credential message for every failure after `create()`.
-  * **Lock:** deadline-based (ADR 0003 §4.2): elapsed deadline with timers never fired, freeze/resume and bfcache `pageshow`, protected operations after expiry, clock changes, and stale async work dropped.
+  * **Browser:** the Playwright virtual authenticator covers enrolment, unlock, removal, PRF-unsupported and no-results refusal, UV-missing refusal, abort on lock or hide, and enrolment failures after `create()` split by commit stage: a leftover-credential message when no slot was written, and reconciliation of a possibly committed slot otherwise (ADR 0003 §4.1).
+  * **Lock:** deadline-based (ADR 0003 §4.2): elapsed deadline with timers never fired, freeze/resume and bfcache `pageshow`, protected operations after expiry, clock changes, early return and re-hide, first input after expiry, stale async work dropped, and submitted writes reconciled without re-unlocking.
   * **Real devices:** at least one BE = 0 and one backup-eligible path recorded on real devices, with authenticator and transport.
   * **Copy:** never says "biometric" alone; describes BE = 0 as bound to an authenticator (not to this computer) and BE = 1 as backup-eligible (not as synced everywhere); never offers rotation before it exists.
 
@@ -54,7 +54,10 @@
 * **Depends on:** ADR 0001 §3 staging; item 1's slot model, so rotation knows every slot kind.
 * **Acceptance:**
   * After rotation, old-credential failures are shown against the new revision.
-  * **Before commit** (before the IndexedDB transaction completes, or before the native rename), interruption, a CAS conflict or a lock leaves the old vault and memory intact.
+  * **Stopped before the last cancellable point**, meaning the browser guard just before IndexedDB `put` or, natively, before the rename:
+    * an interruption, a CAS conflict or another ordinary failure leaves the old stored vault, and an unlocked session stays as it was;
+    * a **lock** leaves the old stored vault but always drops decrypted memory (ADR 0003 §4.2).
+  * **Submitted but not confirmed** (browser: `put` issued and then a lock, expiry or stale epoch): the new envelope may commit even though the operation reports locked or stale. Decrypted memory is still dropped. The next unlock reconciles against what is stored and never reinstalls a session from the late result. Rotation must therefore show both credential sets as possibly current until reconciliation.
   * **After commit**, nothing is rolled back. If the native directory fsync then fails (`DurabilityUncertain`), the new vault and its new credentials are reported as **possibly in effect**: the UI reconciles to the new revision, tells the user to keep the old credentials until the new ones open the vault, and to make a fresh backup. Tests distinguish the precommit and postcommit outcomes and never assert rollback after commit.
   * A rotation that would leave no recovery path is refused without an explicit acknowledgement.
   * Native and browser tests run on synthetic data.

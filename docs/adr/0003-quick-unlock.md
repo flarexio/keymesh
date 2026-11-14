@@ -103,17 +103,20 @@ KEK    = HKDF-SHA256(ikm = prf_output(salt), salt = none,
 3. Call `navigator.credentials.create()`:
    * `authenticatorSelection.userVerification: "required"` and `residentKey: "preferred"`;
    * `extensions.prf.eval.first = salt`.
-4. If `prf.enabled !== true` → stop with **no vault write**, and report "this authenticator cannot unlock vaults".
+4. If `prf.enabled !== true` → stop before any write, and report "this authenticator cannot unlock vaults".
 5. If no `results` came back at creation (allowed by the spec), immediately run `get()` with `allowCredentials = [that id]` and `evalByCredential`.
-6. If there is still no 32-byte `results.first` → stop with no vault write.
+6. If there is still no 32-byte `results.first` → stop before any write.
 7. Derive the KEK, wrap the DEK, then verify by unwrapping the new slot in memory.
-8. Write once with the existing exact-byte CAS.
+8. Write once with the existing exact-byte CAS. Its **last cancellable point is the guard just before IndexedDB `put`** (`vault-store.ts`); once `put` is issued the write can complete even if the vault is locked meanwhile (§4.2).
 
-**Failure after `create()` succeeded.** Steps 4–8 can fail (no PRF, no results, missing UV flag, a CAS conflict, a lock, a cancelled `get()`) **after the authenticator has already made a credential**. "No vault write" is all Keymesh can guarantee; it cannot delete a credential from an authenticator or provider. On every such path:
-* the vault is unchanged and the in-memory KEK and PRF output are zeroed;
-* the UI names the leftover passkey (user name, display name and creation time chosen by Keymesh, so it is recognisable) and tells the user how to delete it in their authenticator or provider settings;
-* where the client implements it, Keymesh may also call `PublicKeyCredential.signalUnknownCredential()` for that id [WA3 §5.1.10.2]. This is a best-effort hint; the client and authenticator decide what to do, so the manual instruction stays.
-* Tests cover the orphan message for each failure step, including lock during the follow-up `get()`.
+**Failure after `create()` succeeded.** Any failure from step 4 on happens **after the authenticator has already made a credential**, which Keymesh cannot delete from an authenticator or provider. In every case the in-memory KEK and PRF output are zeroed, and a lock drops all decrypted state. What happened to the **vault** depends on where the failure happened, so the outcomes are not all called "orphans":
+* **Confirmed before the write** (steps 4–7, a CAS conflict, or a lock or cancel caught by the guard before `put`): this operation wrote no slot. A conflict means another writer changed storage, not that the vault stayed globally unchanged; this operation's slot is simply absent. The credential is an **orphan**:
+  * the UI names it (user name, display name and creation time chosen by Keymesh, so it is recognisable) and tells the user how to delete it in their authenticator or provider settings;
+  * where the client implements it, Keymesh may also call `PublicKeyCredential.signalUnknownCredential()` for that id [WA3 §5.1.10.2]. This is a best-effort hint; the client and authenticator decide what to do, so the manual instruction stays.
+* **Committed or uncertain** (the write was submitted: `put` issued, then a lock, expiry or stale epoch, or an error whose outcome is unknown): the slot **may be stored**. Keymesh never reinstalls an unlocked session from that late result. At the next unlock (by any method) it first **reconciles**: it reads the stored slot list and checks whether a slot for that credential id exists.
+  * **Slot present:** enrolment did take effect. The UI says so, and offers to keep it or to remove it as a normal slot removal (unlocked vault, master password). No `signalUnknownCredential()` is sent while a slot still refers to the credential.
+  * **Slot absent:** it is treated as an orphan, as above.
+* **Tests:** each failure point, including lock during the follow-up `get()`, a lock before `put` (no slot, orphan message), and a lock after `put` (slot reconciled on the next unlock, never reported as an orphan, no secret shown before that unlock).
 
 **Unlock**
 * Call `get()` with `userVerification: "required"`, `allowCredentials` listing this vault's PRF slots, and `evalByCredential` per credential.
@@ -138,7 +141,9 @@ Whether backup-eligible passkeys are allowed at all is a product decision (§8, 
 
 **Deadlines, not timers.** Timers may not run while a page is hidden, frozen or in the bfcache (constraint 9). The rules are therefore stated as **deadlines that are checked**, with timers only as a best-effort trigger:
 * **Idle deadline:** `lastInput + idleLimit`. Default 5 minutes without input, configurable from 1 to 60 minutes, or "never" with a warning. Input events only, never network activity. Stored in the vault's local preferences, not inside the ciphertext.
+  * **Input cannot revive an expired session.** Each input event runs the freshness check **before** it updates `lastInput`. If the idle (or hidden) deadline has already passed, that input locks instead of extending the session.
 * **Hidden deadline:** `hiddenAt + hideGrace`, set on `visibilitychange` → hidden. Default 30 seconds, configurable, with "immediately" available (proposed default on mobile).
+  * **Cleared only after a passing check.** On return (`visibilitychange` → visible, `resume`, `pageshow`), the freshness check runs **first**. If the deadline has passed, the vault locks. Only if it has not passed is the hidden deadline cleared. The next hide sets a new one from its own `hiddenAt`, so a short hide never causes a lock later while the user is active.
 * **"Immediately" is enforced synchronously** in the `visibilitychange` handler, which runs before the page can be frozen. This is the only setting that does not depend on later execution.
 * **Freshness check before secret access.** One synchronous check, `sessionFresh()`, compares now with both deadlines and locks first if either has passed. It runs:
   * on `visibilitychange` → visible, `resume`, `pageshow` (including `persisted = true`) and `focus`;
@@ -152,7 +157,10 @@ Whether backup-eligible passkeys are allowed at all is a product decision (§8, 
 * Clears any revealed-secret state in the UI.
 * Bumps the session epoch.
 * Every async continuation already checks the epoch after each await: the KDF worker, IndexedDB reads and writes, the CAS and restore. A WebAuthn call is aborted with an `AbortController`; its late result is discarded after the epoch check.
-* A write that has not committed fails as "locked". One that has committed stays committed (existing M4 semantics).
+* **Decrypted state is always dropped**, whatever stage any operation was in. Locking never keeps an unlocked session to let an operation finish.
+* **Writes, by stage (existing M4 boundary):**
+  * **Stopped before the last cancellable point** (the guard just before IndexedDB `put`; natively, before the rename): the write is abandoned and storage keeps its previous contents.
+  * **Already submitted** (`put` issued; natively, the rename done): the ciphertext write may still complete, and is not rolled back. The operation reports stale or locked, but storage may hold the new envelope. Keymesh **reconciles** against what is stored at the next unlock or read, and never re-unlocks or renders secrets from the late result.
 
 **What it does not promise.** JavaScript strings, DOM text, browser caches and copies the engine made inside WASM linear memory cannot be proven erased. Locking removes the app's references and zeroizes what Rust owns. It does not guarantee that every in-memory copy is gone [WC §6.2 notes the same for key material]. The UI must not claim otherwise.
 
@@ -161,9 +169,11 @@ Whether backup-eligible passkeys are allowed at all is a product decision (§8, 
 2. **Suspended resume:** the same through `freeze`/`resume` (Chromium's DevTools `Page.setWebLifecycleState` can freeze a real page) and through `pageshow` with `persisted = true`.
 3. **Protected operation after expiry:** reveal, copy, edit, save and export each lock and refuse when called past a deadline, even if no lifecycle event arrived.
 4. **Clock changes:** wall clock moved forward past the limit → locked; wall clock moved backwards beyond tolerance → locked; monotonic clock past the limit with an unchanged wall clock → locked.
-5. **Stale async work:** a KDF, IndexedDB read, write or WebAuthn result that completes after an expiry lock is dropped by the epoch check and never rendered or written.
+5. **Stale async work:** a KDF, IndexedDB read or WebAuthn result that completes after an expiry lock is dropped by the epoch check: never rendered, and never the start of a new write. A write stopped before `put` leaves storage as it was. A write already submitted may commit: the test asserts that the vault stays locked, that no secret is shown, and that the next unlock reconciles to whichever envelope is stored.
 6. **"Immediately" on hide:** locked synchronously inside the `visibilitychange` handler.
 7. **Same-document navigation:** route changes inside the app keep the session; `pagehide` locks.
+8. **Early return and re-hide:** hide, return after 5 s (before the 30 s grace), stay active. No lock at the original 30 s mark. Hide again: a new deadline counts from the second hide.
+9. **First input after expiry:** advance past the idle deadline without timers firing, then send one input event. The vault locks and the input does not extend the session.
 
 ### 4.3 Master-password custody (FlareX decision)
 
