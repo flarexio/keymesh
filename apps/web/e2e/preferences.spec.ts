@@ -664,6 +664,176 @@ test('desktop New-item menu: every kind is clickable with an empty and a one-ite
   await expect(page.locator('.detail-pane')).toHaveCSS('overflow-y', 'auto');
 });
 
+/**
+ * Records, in the page, scroll events and focus moves into menu items, and
+ * counts the capture-phase scroll listeners on `document` that are still active.
+ */
+function menuProbe() {
+  const w = window as unknown as { __menu: { scrolls: string[]; itemFocus: string[]; scrollListeners: number } };
+  w.__menu = { scrolls: [], itemFocus: [], scrollListeners: 0 };
+  const add = Document.prototype.addEventListener;
+  const remove = Document.prototype.removeEventListener;
+  const live = new Set<unknown>();
+  const capture = (o: unknown) => o === true || (typeof o === 'object' && !!o && (o as { capture?: boolean }).capture === true);
+  Document.prototype.addEventListener = function (this: Document, type: string, fn: unknown, o?: unknown) {
+    if (type === 'scroll' && capture(o)) live.add(fn), (w.__menu.scrollListeners = live.size);
+    return add.call(this, type, fn as EventListener, o as boolean);
+  } as typeof add;
+  Document.prototype.removeEventListener = function (this: Document, type: string, fn: unknown, o?: unknown) {
+    if (type === 'scroll' && capture(o)) live.delete(fn), (w.__menu.scrollListeners = live.size);
+    return remove.call(this, type, fn as EventListener, o as boolean);
+  } as typeof remove;
+  add.call(document, 'scroll', (e: Event) => {
+    const t = e.target instanceof Element ? e.target : null;
+    w.__menu.scrolls.push(`${t?.id || t?.className || 'document'} menuOpen=${!!document.querySelector('[role=menu]')}`);
+  }, true);
+  add.call(document, 'focusin', (e: Event) => {
+    const k = e.target instanceof Element ? e.target.getAttribute('data-kind') : null;
+    if (k && (e.target as Element).getAttribute('role') === 'menuitem') w.__menu.itemFocus.push(k);
+  }, true);
+}
+const probe = (page: Page) =>
+  page.evaluate(() => (window as unknown as { __menu: { scrolls: string[]; itemFocus: string[]; scrollListeners: number } }).__menu);
+
+test('New-item menu lifecycle: stale scroll events, real outside scroll, render-timed focus, cancel and destroy', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.addInitScript(menuProbe);
+  await page.setViewportSize({ width: 1280, height: 860 });
+  await page.goto('/');
+  await page.locator('input[name=mode][value=synthetic-fixture]').check();
+  const menu = page.locator('[role=menu]');
+  const item = (k: string) => page.locator(`[role=menuitem][data-kind=${k}]`);
+
+  // 1. CI ordering (preferences keyboard test, PR run 43579235905): the start
+  // page is scrolled, the vault view clamps #main back to 0, and the keyboard
+  // opens the menu before that clamp's scroll event is dispatched (next frame).
+  await page.getByTestId('start-vault').focus();
+  expect(await page.evaluate(() => document.querySelector('#main')!.scrollTop)).toBeGreaterThan(0);
+  await page.evaluate(() => {
+    new MutationObserver((_, obs) => {
+      const btn = document.querySelector<HTMLElement>('[data-testid=new-item]');
+      if (!btn) return;
+      obs.disconnect();
+      btn.focus();
+      btn.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    }).observe(document, { childList: true, subtree: true });
+    document.querySelector<HTMLElement>('[data-testid=start-vault]')!.click();
+  });
+  await expect(item('login')).toBeFocused();
+  // The stale event really arrived while the menu was open, and was ignored.
+  await expect.poll(async () => (await probe(page)).scrolls).toContain('main menuOpen=true');
+  await expect(menu).toHaveCount(1);
+  await expect(item('login')).toBeFocused();
+
+  // 2. Keyboard inside the open menu: ArrowUp wraps, Home, End, Escape returns focus.
+  await page.keyboard.press('ArrowUp');
+  await expect(item('secure_note')).toBeFocused();
+  await page.keyboard.press('Home');
+  await expect(item('login')).toBeFocused();
+  await page.keyboard.press('End');
+  await expect(item('secure_note')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(menu).toHaveCount(0);
+  await expect(page.getByTestId('new-item')).toBeFocused();
+  expect((await probe(page)).scrollListeners).toBe(0);
+
+  // 3. Focus waits for the render and is cancelled by close and by a newer open:
+  // open, close by an outside click and open upwards, all in one task.
+  const before = (await probe(page)).itemFocus.length;
+  await page.evaluate(() => {
+    const btn = document.querySelector<HTMLElement>('[data-testid=new-item]')!;
+    const key = (k: string) => btn.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+    key('ArrowDown');
+    document.body.click();
+    key('ArrowUp');
+  });
+  await expect(item('secure_note')).toBeFocused();
+  // Exactly one focus move into the menu: the cancelled open never focused its first item.
+  expect((await probe(page)).itemFocus.slice(before)).toEqual(['secure_note']);
+  await page.keyboard.press('Escape');
+  await expect(menu).toHaveCount(0);
+
+  // Open then close in one task: the pending focus never runs, focus stays on the button.
+  await page.evaluate(() => {
+    const btn = document.querySelector<HTMLElement>('[data-testid=new-item]')!;
+    btn.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    document.body.click();
+  });
+  await expect(menu).toHaveCount(0);
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  expect((await probe(page)).itemFocus.slice(before)).toEqual(['secure_note']);
+  expect((await probe(page)).scrollListeners).toBe(0);
+
+  // 4. Focus-induced scroll: on a short viewport the menu scrolls itself to the
+  // last item; no ancestor scrolls, so the menu stays open and the item is visible.
+  await page.setViewportSize({ width: 1280, height: 460 });
+  await page.getByTestId('new-item').click();
+  await expect(item('login')).toBeFocused();
+  const outside = await page.evaluate(() =>
+    [...document.querySelectorAll('*')].filter((e) => !e.closest('[role=menu]')).map((e) => e.scrollTop + e.scrollLeft).join(','),
+  );
+  await page.keyboard.press('End');
+  await expect(item('secure_note')).toBeFocused();
+  await expect(menu).toHaveCount(1);
+  const after = await page.evaluate(() => {
+    const m = document.querySelector('[role=menu]')!;
+    const r = document.querySelector('[role=menuitem][data-kind=secure_note]')!.getBoundingClientRect();
+    const b = m.getBoundingClientRect();
+    return {
+      outside: [...document.querySelectorAll('*')].filter((e) => !e.closest('[role=menu]')).map((e) => e.scrollTop + e.scrollLeft).join(','),
+      menuScrolled: m.scrollTop > 0,
+      visible: r.top >= b.top - 0.5 && r.bottom <= b.bottom + 0.5,
+    };
+  });
+  expect(after.outside).toBe(outside);
+  expect(after.menuScrolled).toBe(true);
+  expect(after.visible).toBe(true);
+  await page.keyboard.press('Home');
+  await expect(item('login')).toBeFocused();
+  await expect(menu).toHaveCount(1);
+
+  // 5. A real scroll outside the menu, after it opened, still closes it.
+  const pane = await page.evaluate(() => {
+    const el = [...document.querySelectorAll<HTMLElement>('.list-pane *, .detail-pane, .detail-pane *')].find(
+      (e) => !e.closest('[role=menu]') && e.scrollHeight > e.clientHeight + 20 && /auto|scroll/.test(getComputedStyle(e).overflowY),
+    );
+    if (!el) return null;
+    el.setAttribute('data-test-scroll-pane', '');
+    return el.className;
+  });
+  expect(pane, 'a scrollable pane outside the menu').not.toBeNull();
+  await page.locator('[data-test-scroll-pane]').evaluate((el) => el.scrollBy(0, 40));
+  await expect(menu).toHaveCount(0);
+  expect((await probe(page)).scrollListeners).toBe(0);
+  await page.setViewportSize({ width: 1280, height: 860 });
+
+  // 6. Destroy: open, then lock (which removes the menu's component) in the same
+  // task. No errors, no listener left behind, and the cancelled focus never runs.
+  const focusCount = (await probe(page)).itemFocus.length;
+  await page.evaluate(() => {
+    const btn = document.querySelector<HTMLElement>('[data-testid=new-item]')!;
+    btn.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    document.querySelector<HTMLElement>('[data-testid=lock]')!.click();
+  });
+  await expect(page.getByTestId('unlock')).toBeVisible();
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  expect((await probe(page)).itemFocus.length).toBe(focusCount);
+  expect((await probe(page)).scrollListeners).toBe(0);
+  await expect(menu).toHaveCount(0);
+
+  // Pointer use after all of this: unlock, click opens, click outside closes, a click picks.
+  await page.getByTestId('unlock').click();
+  await page.getByTestId('new-item').click();
+  await expect(menu).toHaveCount(1);
+  await page.getByTestId('item-count').click();
+  await expect(menu).toHaveCount(0);
+  await page.getByTestId('new-item').click();
+  await item('secret').click();
+  await expect(page.locator('form.item-form .form-head .kind-tile[data-kind=secret]')).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
 test('mobile New-item menu: every kind is clickable by touch-size pointer', async ({ browser }) => {
   const ctx = await browser.newContext({ hasTouch: true, isMobile: true, viewport: { width: 360, height: 640 } });
   const page = await ctx.newPage();

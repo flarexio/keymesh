@@ -1,6 +1,6 @@
 # ADR 0002: Envelope v2 — master password and recovery code
 
-* **Status:** Implemented as **experimental** in M4 (native core, CLI, browser). Not independently reviewed yet; synthetic data only until Jarvis accepts it. Implements Stage 1 of ADR 0001.
+* **Status:** Implemented as **experimental** in M4 (native core, CLI, browser). Partially reviewed, not independently accepted; synthetic data only until Jarvis accepts it. Implements Stage 1 of ADR 0001.
 * **Date:** 2026-11-02
 * **Deciders:** FlareX approved M4: master password plus an independent recovery code first, with mnemonic, keycard and passkey adapters deferred.
 

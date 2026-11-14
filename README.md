@@ -2,7 +2,7 @@
 
 Local-first encrypted vault core in Rust, with an Angular browser demo running the same core compiled to WebAssembly.
 
-> **Status: M4 experimental — NOT production ready, not independently reviewed.** Password vaults (master password + independent recovery code, envelope v2, `docs/adr/0002-envelope-v2.md`) work natively and in the browser, but stay **synthetic-data only until independent acceptance**. Demo vaults keep their public fixture or ephemeral keys. Keymesh's own authentication, accounts and sync don't exist. Trusted remote HTTPS is not set up yet (`docs/DELIVERY.md`).
+> **Status: M4 experimental — NOT production ready, not independently accepted.** Password vaults (master password + independent recovery code, envelope v2, `docs/adr/0002-envelope-v2.md`) work natively and in the browser, but stay **synthetic-data only until independent acceptance**. Demo vaults keep their public fixture or ephemeral keys. Keymesh's own authentication, accounts and sync don't exist. Trusted remote HTTPS is not set up yet (`docs/DELIVERY.md`).
 
 ## Capability matrix (M1 core, M2 browser slice, M3 UI, M4 local unlock)
 
@@ -44,7 +44,7 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 
 ## Known limitations
 
-- **Experimental password vaults:** implemented to a reviewed-format proposal (ADR 0002) but not independently reviewed. Synthetic data only.
+- **Experimental password vaults:** implemented to a reviewed-format proposal (ADR 0002); partially reviewed, not independently accepted. Synthetic data only.
 - **Rewrap, not rotation:** changing the password or recovery code doesn't revoke older backups or data already read. Compromise rotation is not implemented.
 - **Weak passwords stay guessable offline:** anyone with the file can try passwords at about one Argon2id (64 MiB, t=3) per guess. Use a long passphrase; the recovery code itself cannot be guessed.
 - **Single writer:** `save` refuses unless the file is byte for byte what was loaded, but there is no file lock. Two writers racing during the save can still conflict.

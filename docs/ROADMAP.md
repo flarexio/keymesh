@@ -13,7 +13,7 @@
 | M2 browser vault (WASM) | Accepted |
 | M3 UI polish, locale and theme | Accepted |
 | Generator finish | Accepted |
-| **M4 local unlock** (password and recovery slots, backup/restore, HTTPS mechanics) | **Partial.** Exact-head native, web and static-containment evidence exists. Open: visual follow-ups (reconcile task) and **gate C, trusted remote HTTPS**, which needs a human decision (`docs/DELIVERY.md` §4) |
+| **M4 local unlock** (password and recovery slots, backup/restore, HTTPS mechanics) | **Partial, not accepted.** Web and static-containment evidence exists at the current head; native evidence is retained from earlier runs on unchanged Rust source and is not independently re-bound. Open: visual follow-ups (reconcile task) and **gate C, trusted remote HTTPS**, which needs a human decision (`docs/DELIVERY.md` §4) |
 
 ### Gates shared by several items
 * **G-HTTPS (gate C).** A client-trusted HTTPS origin for LAN/VPN use, because the plain-HTTP previews are not secure contexts. It is required for non-loopback password vaults, WebAuthn, the camera and the Clipboard API. The decision is the human's; no CA or certificate is created without approval.
@@ -22,9 +22,9 @@
 ## Backlog (ordered)
 
 ### 1. Quick unlock and auto-lock — high priority
-* **Scope:** design in [ADR 0003](adr/0003-quick-unlock.md); proposed now, not implemented.
+* **Scope:** design in [ADR 0003](adr/0003-quick-unlock.md); proposed now, not implemented. Any capability study or prototype is **synthetic-data only and experimental** until the interim compromise-response gate (ADR 0003 D5) is decided, because revoking a lost authenticator needs item 2.
   * A `webauthn-prf` slot with fail-closed capability detection.
-  * Idle and hide auto-lock with the existing epoch cancellation.
+  * Deadline-based idle and hide auto-lock, checked on resume and before protected operations, with the existing epoch cancellation.
   * A generated master password and printable emergency sheet.
   * Separate custody of the recovery code.
 * **Not in scope:** a browser-only PIN slot (ADR 0003 option E, decision D2), plaintext remembered keys, and Keymesh login.
@@ -32,19 +32,21 @@
   * review of ADR 0003;
   * the real-device capability test (ADR 0003 §5);
   * G-HTTPS for any non-loopback use;
-  * the product decisions D1–D3.
+  * the product decisions D1–D3 and D5 (none is approved by the ADR).
 * **Acceptance:**
   * **Format:** test vectors for the new slot kind; unknown kinds are still refused by older readers.
-  * **Browser:** the Playwright virtual authenticator covers enrolment, unlock, removal, PRF-unsupported and no-results refusal, UV-missing refusal, and abort on lock or hide.
-  * **Lock:** idle and hide timers lock and cancel in-flight work.
-  * **Real devices:** at least one device-bound and one synced path recorded on real devices.
-  * **Copy:** never says "biometric" alone, and discloses synced-passkey scope.
+  * **Browser:** the Playwright virtual authenticator covers enrolment, unlock, removal, PRF-unsupported and no-results refusal, UV-missing refusal, abort on lock or hide, and the leftover-credential message for every failure after `create()`.
+  * **Lock:** deadline-based (ADR 0003 §4.2): elapsed deadline with timers never fired, freeze/resume and bfcache `pageshow`, protected operations after expiry, clock changes, and stale async work dropped.
+  * **Real devices:** at least one BE = 0 and one backup-eligible path recorded on real devices, with authenticator and transport.
+  * **Copy:** never says "biometric" alone; describes BE = 0 as bound to an authenticator (not to this computer) and BE = 1 as backup-eligible (not as synced everywhere); never offers rotation before it exists.
 
 ### 2. DEK rotation (re-encrypt the vault) — after item 1
 * **Scope:**
   * A new random DEK, every item re-encrypted, and new password and recovery slots, with the new recovery code typed back.
   * Every other slot (PRF, later device) re-established with a fresh evaluation, or explicitly invalidated and listed for confirmation (ADR 0001 §3).
-  * One atomic write: the native exact-byte CAS and durable replace, or one IndexedDB CAS transaction.
+  * One write of the new vault:
+    * **Browser:** one IndexedDB exact-byte compare-and-swap transaction.
+    * **Native:** the existing re-read, SHA-256 check, then temp-file rename and directory fsync (ADR 0002 §9). This is a **check-then-rename under a single-writer assumption, not a lock**: two processes writing at once can still race. Rotation keeps that documented limit unless file locking is separately authorized.
 * **Must tell the user:**
   * Copies an attacker already holds (old backups, a copied profile, plaintext already seen) **cannot be revoked**.
   * Delete your own old backups.
@@ -52,7 +54,8 @@
 * **Depends on:** ADR 0001 §3 staging; item 1's slot model, so rotation knows every slot kind.
 * **Acceptance:**
   * After rotation, old-credential failures are shown against the new revision.
-  * Interruption or a lock at each stage leaves the old vault intact.
+  * **Before commit** (before the IndexedDB transaction completes, or before the native rename), interruption, a CAS conflict or a lock leaves the old vault and memory intact.
+  * **After commit**, nothing is rolled back. If the native directory fsync then fails (`DurabilityUncertain`), the new vault and its new credentials are reported as **possibly in effect**: the UI reconciles to the new revision, tells the user to keep the old credentials until the new ones open the vault, and to make a fresh backup. Tests distinguish the precommit and postcommit outcomes and never assert rollback after commit.
   * A rotation that would leave no recovery path is refused without an explicit acknowledgement.
   * Native and browser tests run on synthetic data.
 
@@ -126,6 +129,12 @@
   * The serving program and the target site learn which hosts are looked up.
   * Caching reduces repeats but is not unlinkability.
   * The route must be disclosed in the UI and docs.
+* **Before any route is implemented** (prerequisites, not decisions):
+  * opt-in only, with **no automatic lookup** of hosts already in the vault;
+  * no logging of looked-up hosts;
+  * defined cache ownership and retention (a shared plaintext host cache would leak browsing history);
+  * handling of hosts that resolve differently on public and private DNS;
+  * parsing tests for numeric, IDNA and IPv6 hosts.
 * **Review:** a same-program route is not intrinsically a new listener. The outbound fetch and the metadata exposure still need their own scoped review, and so would any CSP change.
 * **Acceptance (for step 1 now, step 2 later):**
   * Table-driven matching tests.

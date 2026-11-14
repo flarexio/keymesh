@@ -346,17 +346,31 @@ for (const locale of ['zh-TW', 'en'] as const) {
       await page.getByRole('button', { name: t['start.stored.open'] }).click();
       await page.getByTestId('nav-generators').click();
     };
+    // The fresh page shows the default symbols; Reset must bring back exactly these.
+    await card.locator('[name=pw-symbols]').check();
+    const defaultSymbols = await card.locator('[name=pwSymbolSet]').inputValue();
+    expect(defaultSymbols.length).toBeGreaterThan(0);
+    await expect(card.getByRole('button', { name: t['pwopt.symbolReset'] })).toBeDisabled();
     for (const [text, key, length] of [
       ['abc', 'errors.pwSymbolChars', '40'],
       ['!'.repeat(65), 'errors.pwSymbolsLong', '41'],
     ] as const) {
+      // Every step waits for its rendered result before the next input. `fill`
+      // selects the old text and then inserts, so a render still pending from
+      // the previous step (e.g. Reset) could otherwise land in between and
+      // leave the old text in front of the new one (seen in CI).
       await card.locator('[name=pw-symbols]').check();
+      await expect(card.locator('[name=pw-symbols]')).toBeChecked();
       await card.locator('[name=pwLength]').fill('32');
+      await expect(card.locator('[name=pwLength]')).toHaveValue('32');
       await card.locator('[name=pwSymbolSet]').fill(text);
+      await expect(card.locator('[name=pwSymbolSet]')).toHaveValue(text);
       await expect(card.getByTestId('password-options-error')).toHaveText(t[key]);
       // Turning Symbols off makes the settings valid (the core ignores unused text).
       await card.locator('[name=pw-symbols]').uncheck();
+      await expect(card.locator('[name=pwSymbolSet]')).toHaveCount(0);
       await card.locator('[name=pwLength]').fill(length);
+      await expect(card.locator('[name=pwLength]')).toHaveValue(length);
       await expect(card.getByTestId('password-options-error')).toHaveCount(0);
       await page.getByTestId('generate-password').click();
       const shown = await revealIn(card, t);
@@ -371,6 +385,10 @@ for (const locale of ['zh-TW', 'en'] as const) {
       await expect(card.locator('[name=pwSymbolSet]')).toHaveValue(text);
       await expect(card.getByTestId('password-options-error')).toHaveText(t[key]);
       await card.getByRole('button', { name: t['pwopt.symbolReset'] }).click();
+      // Reset is rendered (default set, problem gone) before the next round types.
+      await expect(card.locator('[name=pwSymbolSet]')).toHaveValue(defaultSymbols);
+      await expect(card.getByRole('button', { name: t['pwopt.symbolReset'] })).toBeDisabled();
+      await expect(card.getByTestId('password-options-error')).toHaveCount(0);
     }
     expect(errors).toEqual([]);
     await context.close();

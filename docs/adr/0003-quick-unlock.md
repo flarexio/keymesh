@@ -1,6 +1,8 @@
 # ADR 0003: Quick unlock, auto-lock and master-password custody
 
 * **Status:** **Proposed. Nothing in this ADR is implemented.** It needs independent review and a scoped task before any code. It does not authorize real-secret entry, Keymesh login, external network calls or trust changes.
+  * Any capability study or prototype built from it stays **synthetic-data only and experimental** until a compromise-response (DEK rotation) policy is approved (§4.5, D5).
+  * The product decisions in §8 (synced passkeys, browser PIN, lifecycle defaults, HTTPS trust, interim rotation gate) are open. This document proposes; it records no approval.
 * **Date:** 2026-11-14
 * **Builds on:**
   * ADR 0001 (key slots wrapping one DEK; the `webauthn-prf` sketch in §3; rotation in §3 and §4).
@@ -27,7 +29,8 @@ FlareX's requirement is right about usability. The goal is to type the strong ma
    * An assertion without support returns an empty `prf` output [MDN-EXT].
 4. **`getClientCapabilities()` is a hint, not a guarantee.**
    * A missing key means unknown, not unsupported [MDN-GCC]. The extension key format is `extension:<id>`.
-   * Even when the client supports an extension, a particular authenticator may not [MDN-GCC].
+   * The method itself may be absent in older browsers; MDN's own example feature-detects it before calling [MDN-GCC]. Keymesh treats an absent method, a rejected call and an absent key all as **unknown**.
+   * Even when the client supports an extension, a particular authenticator may not [MDN-GCC]. Only the actual `create()`/`get()` results decide (§4.1).
 5. **PRF behaviour:**
    * Outputs are 32 bytes [WA3 §10.1.4].
    * The client hashes each input as `SHA-256("WebAuthn PRF" ‖ 0x00 ‖ input)`, so a web origin cannot evaluate the platform's raw `hmac-secret` [WA3 §10.1.4].
@@ -37,19 +40,25 @@ FlareX's requirement is right about usability. The goal is to type the strong ma
    * It may be "a biometric gesture … the device PIN, or … the device password" [PK-TERMS]. The spec treats a PIN as a knowledge factor [WA3 §6.2.3].
    * Requiring UV fails with `ConstraintError` if the authenticator cannot perform it [WA3 §6.3.2].
    * User-facing copy must say "your device's unlock (fingerprint, face, or device PIN/password)", never "biometrics" alone.
-7. **Passkeys may be synced.**
-   * Synced passkeys are copied by a provider across the user's devices; device-bound passkeys "cannot leave the device" [PK-TERMS].
-   * The BE flag (backup eligible) is fixed at creation. BS (backed up) may change over time [WA3 §6.1.3].
-   * Because the PRF belongs to the credential, a synced passkey's PRF follows the passkey to every device of that provider account. That account then becomes part of the vault's unlock surface.
+7. **Passkeys may be synced; the flags say less than they seem.**
+   * Synced passkeys are copied by a provider across the user's devices. A device-bound passkey is bound to **one authenticator** [PK-TERMS], and that authenticator may be a roaming security key that works from any client it is plugged into [WA3 §1.2.2].
+   * BE (backup eligible) is fixed at creation and means the credential is **allowed** to be backed up. BS (backed up) says whether it is backed up **now**, and may change [WA3 §6.1.3].
+   * Neither flag names the provider, proves where or how the key is stored, or attests attempt limiting or hardware isolation. Those need attestation or measurement, which this design does not rely on.
+   * The PRF belongs to the credential for its lifetime [WA3 §10.1.4]. A backed-up credential may therefore be usable to unlock wherever its provider makes it available, and that account's recovery becomes part of the unlock surface. Whether PRF actually works on each such device or cross-device (hybrid) path is not implied by the flags; it is measured (§5).
 8. **A browser-side non-extractable CryptoKey is not a hardware guarantee.** The Web Crypto API:
    * "places no normative requirements on implementations as to how the underlying cryptographic key material is stored";
    * "does not guarantee that the underlying cryptographic key material will not be persisted to disk";
    * and says "any application or user that has access to the device storage may be able to recover the key material" [WC §6.2].
    * `extractable: false` only stops `exportKey`/`wrapKey` from script [MDN-CK].
-9. **Pages cannot rely on unload.** `visibilitychange` to hidden "is the last event that's reliably observable by the page" [MDN-VIS].
+9. **Pages cannot rely on unload, and hidden pages may stop running.**
+   * `visibilitychange` to hidden "is the last event that's reliably observable by the page" [MDN-VIS].
+   * A hidden page may be **frozen**: the browser "suspends execution of freezable tasks … This means things like JavaScript timers and fetch callbacks don't run", and a frozen page may be discarded without further events [CR-LC].
+   * Pages in the back/forward cache likewise have pending timers and promises paused, resumed only if the page is restored [WD-BFC]. A restore fires `pageshow` with `persisted = true` [MDN-PS].
+   * So a timer started on hide is **not** guaranteed to fire at its deadline. It may fire late, on resume, or never.
    * WebAuthn calls are cancelled if the window loses focus while pending [MDN-WA].
 10. **Browser support:**
-    * The PRF extension shipped in Chromium (Intent to Ship, 2023) [CR-I2S] and in Safari 18.0 [SAF18].
+    * Chromium published an *Intent to Ship* for the PRF extension in April 2023 [CR-I2S]. That is evidence of intent, not of a shipping version; the shipping version was **not** verified from an inspectable official source for this ADR.
+    * Safari 18 release notes list "Added support for the WebAuthn PRF extension" [SAF18]. That does not prove every credential type or the hybrid path works.
     * A Safari cross-device (QR/hybrid) PRF gap has been reported by developers [APPLE-FORUM]. That report is not a primary statement of design, and it is why runtime detection is mandatory.
     * Firefox support was not verified from a primary source for this ADR.
 
@@ -59,7 +68,7 @@ FlareX's requirement is right about usability. The goal is to type the strong ma
 |---|---|---|---|---|
 | A. Master password every time (status quo) | high (typing + ~1 s KDF) | yes (Argon2id) | yes (Argon2id) | Keep as a fallback; insufficient alone (usability) |
 | B. Keep the DEK in `sessionStorage` / IndexedDB to "remember" | none | **no** | **no** | **Rejected.** Plaintext auto-unlock key beside ciphertext (CLAUDE.md) |
-| C. `webauthn-prf` slot | one gesture | yes (needs the authenticator plus UV) | yes, for device-bound credentials. For synced credentials, protected only as well as the provider account | **Proposed primary quick unlock** |
+| C. `webauthn-prf` slot | one gesture | yes (needs the authenticator plus UV) | **depends on the authenticator, not the flags.** A profile copy alone should not carry a security key's or OS authenticator's secret, but this is per authenticator and unverified here. A backed-up credential is protected only as well as the provider account | **Proposed primary quick unlock** (experimental until D5) |
 | D. Short PIN as its own Argon2id slot | low | **no**: about 10⁶ guesses for 6 digits is feasible offline | **no** | **Rejected** |
 | E. Short PIN + non-extractable WebCrypto key in IndexedDB + local attempt counter | low | yes, if only the vault file or backup is copied | **no**: the key material may be on disk [WC §6.2], and a copied profile resets the counter. Rollback cannot be detected locally | **Not in the first implementation.** Product choice in §8 |
 | F. Native app: OS keystore or secure hardware (Secure Enclave, TPM, Android Keystore) with hardware attempt limits | one gesture or PIN | yes | depends on the platform's hardware binding; must be verified per platform | Future native track; out of scope for the web app |
@@ -67,7 +76,7 @@ FlareX's requirement is right about usability. The goal is to type the strong ma
 
 Option E is the "PIN + non-extractable key + attempt limit" idea from the 2026-11-14 discussion. **It is not universally secure.** It protects against someone who copies only the vault file or a backup. It does **not** protect against someone who copies the browser profile (rollback of the counter, key material possibly on disk). It must never be presented as equivalent to a hardware-enforced PIN.
 
-A user who wants a PIN can already get a **hardware- or OS-enforced** PIN through option C: many platform authenticators and security keys accept the device PIN as user verification (constraint 6).
+A user who wants a PIN can often use one through option C: many platform authenticators and security keys accept a device PIN as user verification (constraint 6). The PIN is then checked by the authenticator or OS, not by Keymesh. **How well it resists guessing (attempt limits, hardware isolation) depends on that authenticator** and is not proven by the UV or BE flags; Keymesh does not claim it.
 
 ## 4. Proposed decision
 
@@ -87,44 +96,56 @@ KEK    = HKDF-SHA256(ikm = prf_output(salt), salt = none,
 
 **Enrolment**
 1. The vault is unlocked, and the user re-enters the master password. Enrolment is a sensitive operation (§4.4).
-2. Pre-check with `PublicKeyCredential.getClientCapabilities()`:
+2. Pre-check, as a hint only:
+   * `PublicKeyCredential.getClientCapabilities` absent, the call rejected, or the `extension:prf` key absent → **unknown**: continue to step 3 and let the real results decide [MDN-GCC];
    * `extension:prf === false` → do not offer quick unlock, and say why;
-   * `true` or absent → continue, because absent means unknown [MDN-GCC].
+   * `true` → continue.
 3. Call `navigator.credentials.create()`:
    * `authenticatorSelection.userVerification: "required"` and `residentKey: "preferred"`;
    * `extensions.prf.eval.first = salt`.
-4. If `prf.enabled !== true` → stop, store nothing, and report "this authenticator cannot unlock vaults".
+4. If `prf.enabled !== true` → stop with **no vault write**, and report "this authenticator cannot unlock vaults".
 5. If no `results` came back at creation (allowed by the spec), immediately run `get()` with `allowCredentials = [that id]` and `evalByCredential`.
-6. If there is still no 32-byte `results.first` → stop, store nothing, and suggest deleting the orphan passkey.
+6. If there is still no 32-byte `results.first` → stop with no vault write.
 7. Derive the KEK, wrap the DEK, then verify by unwrapping the new slot in memory.
-8. Write once with the existing exact-byte CAS. Lock or cancel at any step before the write leaves nothing behind.
+8. Write once with the existing exact-byte CAS.
+
+**Failure after `create()` succeeded.** Steps 4–8 can fail (no PRF, no results, missing UV flag, a CAS conflict, a lock, a cancelled `get()`) **after the authenticator has already made a credential**. "No vault write" is all Keymesh can guarantee; it cannot delete a credential from an authenticator or provider. On every such path:
+* the vault is unchanged and the in-memory KEK and PRF output are zeroed;
+* the UI names the leftover passkey (user name, display name and creation time chosen by Keymesh, so it is recognisable) and tells the user how to delete it in their authenticator or provider settings;
+* where the client implements it, Keymesh may also call `PublicKeyCredential.signalUnknownCredential()` for that id [WA3 §5.1.10.2]. This is a best-effort hint; the client and authenticator decide what to do, so the manual instruction stays.
+* Tests cover the orphan message for each failure step, including lock during the follow-up `get()`.
 
 **Unlock**
 * Call `get()` with `userVerification: "required"`, `allowCredentials` listing this vault's PRF slots, and `evalByCredential` per credential.
 * Use the returned `rawId` to pick the slot. Fail closed on missing results, a UV flag not set, an unknown credential or an unwrap failure.
 * The user can always fall back to the master password or the recovery code. A failure never downgrades silently to "remembered" access.
 
-**Synced versus device-bound.** Record BE at enrolment and show it:
-* **Device-bound (BE = 0):** "Unlocks on this device only."
-* **Synced (BE = 1):** "Unlocks on every device where this passkey syncs (your <provider> account). Anyone who controls that account and can pass its device unlock can open this vault if they also have the vault data."
+**Backup-eligible versus not.** Record BE (and BS as observed) at enrolment and show what the flags actually mean (constraint 7):
+* **BE = 0:** "This passkey is bound to the authenticator that made it. If that is a security key, it can unlock this vault from any computer it is plugged into."
+* **BE = 1:** "This passkey may be backed up and made available on other devices by its provider. Anyone who controls that provider account and can pass its device unlock may be able to open this vault if they also have the vault data."
+* The provider is named only when it is reliably known (for example the user picked it); flags never identify it. The copy never promises that the passkey **will** work on another device; that depends on the client, provider and transport (§5).
 
-Whether synced passkeys are allowed at all is a product decision (§8, D1). The proposal allows both, with this disclosure.
+Whether backup-eligible passkeys are allowed at all is a product decision (§8, D1). The proposal allows both, with this disclosure.
 
 **What it does not do.** It does not authenticate the user to any server; Keymesh has no login. It does not prove a person is present beyond what the authenticator's UV asserts. It does not replace the recovery code.
 
 ### 4.2 Auto-lock and lifecycle
 
-**Locking rules (browser and CLI session equivalents):**
-* **Reload, close or navigation** always ends the session, because the DEK lives only in page memory. Quick unlock makes this cheap; it is not changed.
-* **Idle timeout:**
-  * default 5 minutes without input, configurable from 1 to 60 minutes, or "never" with a warning;
-  * input events only, never network timers;
-  * stored in the vault's local preferences, not inside the ciphertext.
-* **On hide:**
-  * `visibilitychange` → hidden starts a short grace timer, default 30 seconds, configurable, with "immediately" available;
-  * expiry locks;
-  * coming back before expiry cancels the timer;
-  * on mobile, consider defaulting to immediately.
+**What ends a session.**
+* **Document destruction** (reload, closing the tab, navigating the tab to another document, or the browser discarding a frozen page) ends it, because the DEK lives only in that document's memory.
+* **Same-document navigation does not.** Moving between Keymesh's own routes (the Angular router, `history.pushState`) keeps the same document and the same unlocked session. Only the lock rules below end it.
+* **Back/forward cache.** A document left by navigation may be kept alive in the bfcache and restored later with its memory intact [WD-BFC]. So leaving the page is **not** enough on its own: `pagehide` always locks (proposal), and a `pageshow` with `persisted = true` re-runs the freshness check before anything renders.
+
+**Deadlines, not timers.** Timers may not run while a page is hidden, frozen or in the bfcache (constraint 9). The rules are therefore stated as **deadlines that are checked**, with timers only as a best-effort trigger:
+* **Idle deadline:** `lastInput + idleLimit`. Default 5 minutes without input, configurable from 1 to 60 minutes, or "never" with a warning. Input events only, never network activity. Stored in the vault's local preferences, not inside the ciphertext.
+* **Hidden deadline:** `hiddenAt + hideGrace`, set on `visibilitychange` → hidden. Default 30 seconds, configurable, with "immediately" available (proposed default on mobile).
+* **"Immediately" is enforced synchronously** in the `visibilitychange` handler, which runs before the page can be frozen. This is the only setting that does not depend on later execution.
+* **Freshness check before secret access.** One synchronous check, `sessionFresh()`, compares now with both deadlines and locks first if either has passed. It runs:
+  * on `visibilitychange` → visible, `resume`, `pageshow` (including `persisted = true`) and `focus`;
+  * when a timer fires;
+  * **before every protected operation**: rendering decrypted items or fields, reveal, copy, edit, save, export or backup, and before using the result of any async step that started before the check.
+* **What is honestly promised:** when the page comes back after a deadline, it is locked **before any secret is shown or used**. It is not promised that the lock ran at the exact deadline while the page was hidden or frozen: during that time decrypted data may still be in the suspended page's memory.
+* **Clock policy:** deadlines use both a monotonic clock (`performance.now()`) and wall-clock time (`Date.now()`); the session is expired if **either** says the limit has passed. A wall clock that moved backwards by more than a small tolerance also counts as expired (fail closed). Whether the monotonic clock advances during system sleep differs between platforms, so neither clock alone is trusted.
 
 **What locking does:**
 * Drops the DEK and all decrypted items: Rust zeroizes its buffers, and JS references are cleared.
@@ -135,13 +156,27 @@ Whether synced passkeys are allowed at all is a product decision (§8, D1). The 
 
 **What it does not promise.** JavaScript strings, DOM text, browser caches and copies the engine made inside WASM linear memory cannot be proven erased. Locking removes the app's references and zeroizes what Rust owns. It does not guarantee that every in-memory copy is gone [WC §6.2 notes the same for key material]. The UI must not claim otherwise.
 
+**Future acceptance cases for the lifecycle** (proposed; nothing here is implemented now). The tests drive an injected clock and dispatch lifecycle events directly, so they do not depend on real timers firing:
+1. **Elapsed deadline, timer never fired:** hide, advance both clocks past the grace period without running timers, return to visible. The vault is locked before any item renders, and no decrypted value reaches the DOM.
+2. **Suspended resume:** the same through `freeze`/`resume` (Chromium's DevTools `Page.setWebLifecycleState` can freeze a real page) and through `pageshow` with `persisted = true`.
+3. **Protected operation after expiry:** reveal, copy, edit, save and export each lock and refuse when called past a deadline, even if no lifecycle event arrived.
+4. **Clock changes:** wall clock moved forward past the limit → locked; wall clock moved backwards beyond tolerance → locked; monotonic clock past the limit with an unchanged wall clock → locked.
+5. **Stale async work:** a KDF, IndexedDB read, write or WebAuthn result that completes after an expiry lock is dropped by the epoch check and never rendered or written.
+6. **"Immediately" on hide:** locked synchronously inside the `visibilitychange` handler.
+7. **Same-document navigation:** route changes inside the app keep the session; `pagehide` locks.
+
 ### 4.3 Master-password custody (FlareX decision)
 
 * **Offer to generate the master password at creation.** Show it once, with a "print emergency sheet" action. A user-chosen password stays allowed, subject to the ADR 0002 rules.
 * **Format of the generated password:**
   * Prefer a passphrase from a reviewed, versioned wordlist, which is easier to transcribe. That needs the wordlist work in the roadmap.
   * Until then, use a random-character password of at least 120 bits from the existing generator.
-* **Emergency sheet (printable, local, never uploaded):** vault id, the generated password, instructions, and a reminder to store the recovery code **separately**. The recovery code goes on its own sheet. Two independent slots in different places means losing one does not lose the vault, and stealing one does not open it.
+* **Emergency sheet (generated locally, never uploaded):** vault id, the generated password, instructions, and a reminder to store the recovery code **separately**. The recovery code goes on its own sheet.
+* **What separate custody does and does not do.** The master password and the recovery code each unwrap the same DEK on their own (ADR 0002 §4). So:
+  * **Either sheet plus a copy of the vault data opens the vault.** Stealing one sheet is enough for someone who also has, or later gets, the ciphertext (a backup file, a copied profile). This is **not** two-factor or threshold custody. Each sheet must be protected as if it were the whole vault.
+  * Keeping them apart reduces the chance of **losing both at once** (fire, one lost bag) and means one theft does not expose both. That is its whole benefit.
+  * **The recovery code is useless without the ciphertext.** Recovery needs an encrypted backup (ADR 0001 §4): the sheet must tell the user to keep an up-to-date encrypted backup somewhere other than the browser.
+* **Printing leaves copies Keymesh cannot erase.** Print spoolers, "print to PDF" files, printer memory and the browser's print preview are outside the app. The UI says so and suggests writing the sheet by hand or printing to a local printer the user controls; it never claims the sheet exists only on paper.
 * **Encourage at least two quick-unlock authenticators** (for example phone and laptop), so the offline password is rarely needed.
 
 ### 4.4 Sensitive operations still need the master password
@@ -158,16 +193,20 @@ A recovery-code path remains for each of them where ADR 0002 already allows it.
 ### 4.5 Device loss, revocation and rotation
 
 * **Removing a PRF slot** needs an unlocked vault. Removal deletes the slot entry, but copies made earlier (backups, another browser profile) still carry it.
-* **Lost or stolen authenticator, or a compromised sync account:** remove the slot, and also run a **DEK rotation**:
-  * Rewrap is insufficient, because the old slot still opens old copies.
-  * Rotation follows ADR 0001 §3 staging. Every surviving PRF slot needs a fresh PRF evaluation by its own authenticator, or it is invalidated, never silently kept.
+* **Lost or stolen authenticator, or a compromised sync account:** removing the slot is not enough, because any copy made earlier still has it. The complete response is a **DEK rotation**, but **rotation does not exist today**: `Vault::rotate_data_key` refuses v2 vaults (ADR 0002 §8). Until it does:
+  * the UI must **not** offer or mention rotation as an available action;
+  * it says plainly that removing the slot protects only future copies of this vault, and that copies already taken stay openable with that authenticator;
+  * it advises changing the site credentials stored in the vault.
+  * This gap is why quick unlock stays **experimental and synthetic-data only** until a compromise-response policy is approved (D5): either rotation lands first, or a bounded interim release is approved that states it has no revocation.
+* **When rotation exists** (roadmap item 2): it follows ADR 0001 §3 staging. Every surviving PRF slot needs a fresh PRF evaluation by its own authenticator, or it is invalidated, never silently kept. Rewrap alone is insufficient, because the old slot still opens old copies.
 * **Deleting the passkey at the provider** leaves a stale slot. Unlock fails closed, and the UI offers to remove it.
 * **Rotation never revokes copies an attacker already holds.** It protects revisions written afterwards. Stored site credentials that may have been seen must be changed at those sites.
 
 ## 5. Capability test required before implementation
 
-A small, separate synthetic test page (loopback, or the approved HTTPS origin once gate C is decided) records for each target the following:
-* the `getClientCapabilities()` result;
+A small, separate **synthetic, experimental** test page (loopback, or the approved HTTPS origin once gate C is decided) records for each target the following. It never touches a vault or real data.
+* the actual authenticator (make and kind: platform, security key, phone over hybrid) and the transport used;
+* whether `getClientCapabilities` exists, and its result;
 * `create()` `prf.enabled` and whether results come at creation;
 * whether `get()` returns 32-byte results;
 * the UV flag and the BE/BS flags;
@@ -183,7 +222,7 @@ A small, separate synthetic test page (loopback, or the approved HTTPS origin on
 
 Automated coverage uses Chromium's DevTools-protocol virtual authenticator with PRF enabled, in the existing Playwright suite. This verifies Keymesh's handling, not any real authenticator.
 
-**Exit criterion:** at least one device-bound and one synced path behave as specified on real devices, and the measured results are recorded in this ADR before the implementation task is accepted.
+**Exit criterion:** at least one BE = 0 and one backup-eligible path behave as specified on real devices, and the measured results (authenticator, transport, client version, flags, PRF results) are recorded in this ADR before the implementation task is accepted. These recorded results, not the flags or browser announcements, are the preconditions for offering quick unlock on a given platform.
 
 ## 6. ESP32 and other adapters (future, not prerequisites)
 
@@ -202,18 +241,22 @@ Neither replaces the recovery code, and the vault must stay fully recoverable wi
 * **Daily use:** one device-unlock gesture instead of a long password.
 * **Shared envelope:** the envelope gains an optional slot kind. v2 readers that don't know it must keep refusing unknown kinds, as ADR 0002 does today. Adding the kind is a format revision, reviewed with test vectors.
 * **Dependency on gate C:** quick unlock depends on trusted HTTPS for any non-loopback use.
-* **Synced passkeys** extend trust to the passkey provider's account recovery. The user must be told.
+* **Backup-eligible passkeys** extend trust to the passkey provider's account recovery. The user must be told.
+* **No revocation until rotation exists** (§4.5): a lost authenticator's slot keeps opening copies made earlier.
 
 ## 8. Decisions still needed (human / product)
 
 | # | Decision | Proposal |
 |---|---|---|
-| D1 | Allow synced passkeys for PRF slots? | Allow, with the §4.1 disclosure; a setting may restrict to device-bound |
-| D2 | Offer option E (browser PIN) at all? | **Not in the first implementation**: the device PIN via WebAuthn covers most cases with OS/hardware limits. Revisit for the native app |
-| D3 | Default idle and hide timeouts | 5 min idle, 30 s hidden (desktop); immediate on hide for mobile |
+| D1 | Allow backup-eligible (BE = 1) passkeys for PRF slots? | Allow, with the §4.1 disclosure; a setting may restrict to BE = 0 |
+| D2 | Offer option E (browser PIN) at all? | **Not in the first implementation.** A device PIN used as WebAuthn user verification covers the wish for a short code; its guessing limits depend on the authenticator (§3). Revisit for the native app |
+| D3 | Lifecycle defaults and semantics | 5 min idle, 30 s hidden (desktop), immediate on hide for mobile; `pagehide` locks; deadline checks on resume, `pageshow` and before protected operations (§4.2) |
 | D4 | Trusted HTTPS approach (gate C) | See `docs/DELIVERY.md` §4; needed before any non-loopback quick unlock |
+| D5 | Interim compromise-response gate | Keep quick unlock experimental and synthetic-only until DEK rotation lands, **or** approve a bounded interim release that states it has no revocation. No proposal is assumed approved |
 
 ## 9. Proposed next implementation contract (after this ADR is reviewed)
+
+Nothing below is authorized by this ADR. Each step needs its own task contract, and everything stays synthetic-data only and experimental until D5 is decided.
 
 1. Capability test page and recorded results (§5). No vault changes.
 2. Envelope: `webauthn-prf` slot kind, with test vectors, native and WASM parsing, and bounds.
@@ -228,6 +271,8 @@ Neither replaces the recovery code, and the vault must stay fully recoverable wi
   * §6.1.3 backup flags: `#sctn-credential-backup`
   * §6.2.3 authentication factor capability: `#sctn-authentication-factor-capability`
   * §6.3.2 user verification: `#sctn-op-make-cred`
+  * §1.2.2 single-device credentials on a roaming security key: `#sctn-usecase-workforce-sdc`
+  * §5.1.10.2 `signalUnknownCredential()`: `#sctn-signalUnknownCredential`
 * [MDN-EXT] MDN, *WebAuthn extensions* (`prf`): https://developer.mozilla.org/en-US/docs/Web/API/Web_Authentication_API/WebAuthn_extensions#prf
 * [MDN-GCC] MDN, `PublicKeyCredential.getClientCapabilities()`: https://developer.mozilla.org/en-US/docs/Web/API/PublicKeyCredential/getClientCapabilities_static
 * [MDN-WA] MDN, *Web Authentication API*: https://developer.mozilla.org/en-US/docs/Web/API/Web_Authentication_API
@@ -235,7 +280,10 @@ Neither replaces the recovery code, and the vault must stay fully recoverable wi
 * [WC] W3C, *Web Cryptography API* (Editor's Draft), §6.2 Security considerations for authors: https://w3c.github.io/webcrypto/#security-developers ; §5.2 Key storage: `#concepts-key-storage`
 * [MDN-CK] MDN, `CryptoKey.extractable`: https://developer.mozilla.org/en-US/docs/Web/API/CryptoKey/extractable
 * [MDN-VIS] MDN, `visibilitychange`: https://developer.mozilla.org/en-US/docs/Web/API/Document/visibilitychange_event
-* [CR-I2S] Chromium blink-dev, *Intent to Ship: WebAuthn PRF extension*: https://groups.google.com/a/chromium.org/g/blink-dev/c/iTNOgLwD2bI ; status entry https://chromestatus.com/feature/5138422207348736
+* [CR-LC] Chrome for Developers, *Page Lifecycle API* (frozen state suspends freezable tasks, including JavaScript timers): https://developer.chrome.com/docs/web-platform/page-lifecycle-api
+* [WD-BFC] web.dev, *Back/forward cache* (pending timers and promises paused while cached): https://web.dev/articles/bfcache
+* [MDN-PS] MDN, `pageshow` event (`persisted`): https://developer.mozilla.org/en-US/docs/Web/API/Window/pageshow_event
+* [CR-I2S] Chromium blink-dev, *Intent to Ship: WebAuthn PRF extension* (April 2023; intent, not a shipping record): https://groups.google.com/a/chromium.org/g/blink-dev/c/iTNOgLwD2bI ; status entry https://chromestatus.com/feature/5138422207348736 (renders only with JavaScript; shipping version not verified)
 * [SAF18] Apple, *Safari 18 Release Notes* (Authentication: WebAuthn PRF extension): https://developer.apple.com/documentation/safari-release-notes/safari-18-release-notes
 * [APPLE-FORUM] (developer report, not primary) *PRF Extension Not Supported in Safari's Cross-Device WebAuthn Flow*: https://developer.apple.com/forums/thread/774112
 * web.dev, *Simpler WebAuthn feature detection* (browser versions for `getClientCapabilities`): https://web.dev/articles/webauthn-client-capabilities

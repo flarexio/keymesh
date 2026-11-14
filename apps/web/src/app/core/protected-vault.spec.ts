@@ -30,11 +30,6 @@ function deferred<T = void>() {
   return { promise, resolve, reject };
 }
 
-const flush = async () => {
-  for (let i = 0; i < 20; i++) await Promise.resolve();
-  await new Promise((r) => setTimeout(r, 0));
-};
-
 /** Wait (bounded) until `cond` holds; fake IndexedDB completes on timers. */
 async function until(cond: () => boolean, what = 'condition'): Promise<void> {
   for (let i = 0; i < 200; i++) {
@@ -201,10 +196,28 @@ class ManualKdf implements KdfRunner {
   /** If false, cancel() does not reject (simulates a result racing the lock). */
   rejectOnCancel = true;
   returned: Uint8Array[] = [];
+  private startWaiters: { n: number; resolve: () => void }[] = [];
   derive(password: string, request: string): Promise<Uint8Array> {
     const d = deferred<Uint8Array>();
     this.calls.push({ password, request, d });
+    for (const w of this.startWaiters.filter((x) => this.calls.length >= x.n)) w.resolve();
     return d.promise;
+  }
+  /**
+   * START signal: resolves when the `n`th derivation has begun (its result is
+   * still held). Fails the test after `ms` if it never starts, instead of
+   * guessing how many turns the work before the KDF takes.
+   */
+  started(n = 1, ms = 2000): Promise<void> {
+    if (this.calls.length >= n) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const w = { n, resolve: () => (clearTimeout(timer), resolve()) };
+      const timer = setTimeout(() => {
+        this.startWaiters = this.startWaiters.filter((x) => x !== w);
+        reject(new Error(`KDF derivation ${n} did not start within ${ms} ms`));
+      }, ms);
+      this.startWaiters.push(w);
+    });
   }
   release(i = this.calls.length - 1) {
     const c = this.calls[i];
@@ -405,11 +418,13 @@ describe('VaultService password vault', () => {
       const a = vault.unlockWithPassword(GOOD_PW);
       const b = vault.unlockWithPassword(GOOD_PW);
       await expect(b).rejects.toMatchObject({ code: 'busy' });
-      await flush();
+      // The first unlock reads storage before its KDF; wait for its START, not a guessed number of turns.
+      await kdf.started(1);
       expect(kdf.calls.length).toBe(1);
       expect(vault.credentialBusy()).toBe(true);
       kdf.release();
       await a;
+      expect(kdf.calls.length).toBe(1);
       expect(vault.credentialBusy()).toBe(false);
       expect(vault.status()).toBe('unlocked');
     });
