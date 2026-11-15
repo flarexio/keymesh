@@ -1585,7 +1585,7 @@ mod tests {
             serde_json::json!({"title": "S", "data": {"kind": "secret", "secret": "SYNTH-SECRET"}}),
         ))
         .unwrap();
-        s.create_item(input(serde_json::json!({"title": "C", "data": {"kind": "contact", "full_name": "Ada",
+        s.create_item(input(serde_json::json!({"title": "C", "data": {"kind": "contact", "full_name": "SYNTHADA-Lovelace",
             "emails": [{"label": "w", "value": "a@example.test"}, {"label": null, "value": "b@example.test"}],
             "phones": [{"label": null, "value": "+1 555 0100"}]}}))).unwrap();
         s.create_item(input(
@@ -1609,7 +1609,9 @@ mod tests {
 
         let bytes = persist(&mut s, &k);
         let raw = String::from_utf8(bytes.clone()).unwrap();
-        for m in ["SYNTH", "GEZDGNBV", "example.test", "Ada"] {
+        // Markers are long enough not to occur by chance in base64 ciphertext
+        // (a 3-letter "Ada" did, once in CI).
+        for m in ["SYNTH", "GEZDGNBV", "example.test", "SYNTHADA-Lovelace"] {
             assert!(!raw.contains(m), "{m} in envelope");
         }
         let s2 = Session::open(&bytes, &k).unwrap();
