@@ -491,7 +491,7 @@ export const en = {
   'security.rotate.done': 'Encryption key rotated. Use the new password and recovery code from now on. Older backups still open with the old ones.',
   'errors.samePassword': 'Choose a new password: rotation replaces the current one.',
   'errors.rotatedWhileLocked': 'The rotation was saved before the vault locked. Unlock with the NEW password or recovery code.',
-  'errors.rotationUncertain': 'Keymesh couldn’t confirm whether the rotation was saved, so the vault was locked. Unlock with the new password; if it doesn’t open, the old one still works.',
+  'errors.rotationUncertain': 'Keymesh couldn’t confirm whether the rotation was saved, so the vault was locked. Keep BOTH the NEW and the OLD password and recovery codes; try the NEW one first, then the OLD one. A failed attempt doesn’t tell you which one applies.',
   'errors.signFailed': 'This key could not sign. The stored key may be damaged.',
   'kit.open': 'Emergency kit (print)',
   'kit.lead': 'A sheet to keep offline: what you need to open this vault, and a blank line to write your master password by hand. It is not a backup.',
@@ -513,7 +513,7 @@ export const en = {
   // M5 B review fix: rotation outcome notice on the locked screen
   'notice.title': 'About your last key rotation',
   'notice.rotatedWhileLocked': 'The key rotation was saved just before the vault locked. Unlock with the NEW master password or the NEW recovery code; the old ones no longer open this vault (older backups still open with them).',
-  'notice.rotationUncertain': 'Keymesh couldn’t confirm whether the key rotation was saved, so the vault was locked. Try the NEW master password first; if it doesn’t open the vault, the rotation wasn’t saved and the OLD password still works. Keep both until one opens it, then make a fresh backup.',
+  'notice.rotationUncertain': 'Keymesh couldn’t confirm whether the key rotation was saved, so the vault was locked. Keep BOTH sets, the NEW and the OLD master password and recovery codes, until the vault opens. Carefully try the NEW password first, then the OLD one. A failed attempt doesn’t tell you which one applies: it can also be a typing mistake or storage that can’t be read right now (reload and try again). Once one opens the vault, make a fresh backup.',
   'notice.ack': 'Got it',
 } as const satisfies Record<string, string>;
 

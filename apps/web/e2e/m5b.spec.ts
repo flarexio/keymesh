@@ -461,26 +461,63 @@ test('rotation committed while the user locked: the LOCKED screen says to use th
   await expect(page.getByTestId('credential-notice')).toHaveCount(0);
 });
 
-test('rotation outcome unknown (zh-TW, mobile): vault locked, the locked screen explains how to reconcile', async ({ browser }, testInfo) => {
-  test.setTimeout(120_000);
-  const ctx = await browser.newContext({ locale: 'zh-TW', viewport: { width: 390, height: 844 }, isMobile: true, serviceWorkers: 'block' });
-  const page = await ctx.newPage();
-  const NEW = 'synthetic m5b uncertain passphrase two';
-  await holdRotationWrite(page, 'uncertain');
-  await rotateUntilCodeTypedBack(page, PW, NEW, true);
-  await page.getByTestId('rotate-section').getByTestId('recovery-confirm').click();
-  await expect.poll(() => page.evaluate(() => (window as unknown as Record<string, unknown>)['__landed'] === true)).toBe(true);
-  await page.evaluate(() => ((window as unknown as Record<string, () => void>)['__doRelease'])());
-  const notice = page.getByTestId('credential-notice');
-  await expect(notice).toBeVisible();
-  await expect(notice).toHaveAttribute('data-code', 'rotationUncertain');
-  await expect(notice).toContainText(zhTW['notice.rotationUncertain']);
-  await expect(page.locator('km-backup')).toHaveCount(0);
-  await expect(page.getByTestId('unlock-password')).toBeVisible();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-  await page.screenshot({ path: shot(testInfo, 'm5b-notice-uncertain-zh-TW-mobile.png'), fullPage: true });
-  // Acknowledge: gone; nothing was guessed or reinstalled.
-  await page.getByTestId('credential-notice-ack').click();
-  await expect(notice).toHaveCount(0);
-  await ctx.close();
-});
+/**
+ * Unknown outcome, with the installed-app service worker actually in control
+ * (asserted), in three looks. The rotation REALLY committed; only its result
+ * and later reads are made unavailable. Then the correct NEW password fails
+ * while reads still fail, which is exactly why the notice must not infer
+ * "not saved / old password works" from a failed attempt (review P2). With
+ * reads restored, the same NEW password opens the committed vault; nothing
+ * was retried or guessed.
+ */
+for (const v of [
+  { name: 'en-desktop-light', locale: 'en-US', cat: en, viewport: { width: 1280, height: 900 }, mobile: false, scheme: 'light' as const },
+  { name: 'en-desktop-dark', locale: 'en-US', cat: en, viewport: { width: 1280, height: 900 }, mobile: false, scheme: 'dark' as const },
+  { name: 'zh-TW-mobile', locale: 'zh-TW', cat: zhTW, viewport: { width: 390, height: 844 }, mobile: true, scheme: 'light' as const },
+]) {
+  test(`rotation outcome unknown (${v.name}, service worker in control): notice keeps BOTH credential sets; a failed NEW unlock proves nothing`, async ({ browser }, testInfo) => {
+    test.setTimeout(150_000);
+    const ctx = await browser.newContext({
+      locale: v.locale,
+      viewport: v.viewport,
+      isMobile: v.mobile,
+      colorScheme: v.scheme,
+      serviceWorkers: 'allow',
+    });
+    const page = await ctx.newPage();
+    const NEW = 'synthetic m5b uncertain passphrase two';
+    await holdRotationWrite(page, 'uncertain');
+    await page.goto('/');
+    await page.evaluate(() => navigator.serviceWorker.ready.then(() => undefined));
+    await page.reload();
+    await expect.poll(() => page.evaluate(() => !!navigator.serviceWorker.controller)).toBe(true);
+    await rotateUntilCodeTypedBack(page, PW, NEW, v.mobile);
+    expect(await page.evaluate(() => !!navigator.serviceWorker.controller)).toBe(true);
+    await page.getByTestId('rotate-section').getByTestId('recovery-confirm').click();
+    await expect.poll(() => page.evaluate(() => (window as unknown as Record<string, unknown>)['__landed'] === true)).toBe(true);
+    await page.evaluate(() => ((window as unknown as Record<string, () => void>)['__doRelease'])());
+    const notice = page.getByTestId('credential-notice');
+    await expect(notice).toBeVisible();
+    await expect(notice).toHaveAttribute('data-code', 'rotationUncertain');
+    await expect(notice).toContainText(v.cat['notice.rotationUncertain']);
+    await expect(page.locator('km-backup')).toHaveCount(0);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: shot(testInfo, `m5b-notice-uncertain-${v.name}.png`), fullPage: true });
+
+    // Committed, reads still failing: the CORRECT new password fails too.
+    await page.getByTestId('unlock-password').fill(NEW);
+    await page.getByTestId('unlock-protected').click();
+    await expect(page.getByTestId('protected-error')).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator('km-vault-shell')).toHaveCount(0);
+    await expect(notice).toBeVisible(); // still there: nothing was concluded
+    // Reads back: the same NEW password opens the committed vault.
+    await page.evaluate(() => {
+      (window as unknown as Record<string, unknown>)['__failReads'] = false;
+    });
+    await page.getByTestId('unlock-protected').click();
+    await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected', { timeout: 30_000 });
+    await page.getByTestId('lock').click();
+    await expect(page.getByTestId('credential-notice')).toHaveCount(0);
+    await ctx.close();
+  });
+}

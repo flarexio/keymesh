@@ -106,3 +106,36 @@ describe('I18n service', () => {
     expect(i18n.t('no.such.key' as MessageKey)).toBe(MISSING('no.such.key'));
   });
 });
+
+/**
+ * Safety meaning of the "rotation outcome unknown" instructions (m5b review).
+ * A failed unlock with the NEW password does NOT prove the rotation was not
+ * saved: storage may be unreadable for now, or the password mistyped. The
+ * copy must never infer noncommit / old-password validity from it, and must
+ * tell the user to keep BOTH credential sets until one actually opens it.
+ */
+describe('uncertain rotation instructions never guess which credential applies', () => {
+  const keys = ['notice.rotationUncertain', 'errors.rotationUncertain'] as const;
+
+  it('English: no inference from a failed attempt; keep both; try new, then old', () => {
+    for (const k of keys) {
+      const s = en[k];
+      expect(s, k).not.toMatch(/wasn.t saved|was not saved|not been saved|still works|rolled back|old one works|old password works/i);
+      expect(s, k).toMatch(/\bBOTH\b/);
+      expect(s, k).toMatch(/NEW/);
+      expect(s, k).toMatch(/OLD/);
+      expect(s, k).toMatch(/doesn.t (tell|mean|show)/i);
+    }
+  });
+
+  it('中文: no inference from a failed attempt; keep both; try new, then old', () => {
+    for (const k of keys) {
+      const s = zhTW[k];
+      expect(s, k).not.toMatch(/沒有儲存|未儲存|仍然有效|仍有效|已回復|已還原/);
+      expect(s, k).toContain('兩組');
+      expect(s, k).toContain('新的');
+      expect(s, k).toContain('舊的');
+      expect(s, k).toMatch(/不代表|無法判斷|不表示/);
+    }
+  });
+});

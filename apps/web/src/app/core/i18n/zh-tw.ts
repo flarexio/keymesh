@@ -494,7 +494,7 @@ export const zhTW: Record<MessageKey, string> = {
   'security.rotate.done': '已輪替加密金鑰。今後請使用新的密碼與復原碼。較早的備份仍可用舊的開啟。',
   'errors.samePassword': '請選擇新的密碼：輪替會取代目前的密碼。',
   'errors.rotatedWhileLocked': '輪替已在保險庫鎖定前儲存。請用「新的」密碼或復原碼解鎖。',
-  'errors.rotationUncertain': 'Keymesh 無法確認輪替是否已儲存，因此已鎖定保險庫。請用新密碼解鎖；若無法開啟，舊密碼仍然有效。',
+  'errors.rotationUncertain': 'Keymesh 無法確認輪替是否已儲存，因此已鎖定保險庫。請保留「新的」與「舊的」兩組密碼和復原碼；先試新的，再試舊的。某次無法開啟不代表哪一組有效。',
   'errors.signFailed': '此金鑰無法簽署，儲存的金鑰可能已損壞。',
   'kit.open': '緊急備用卡（列印）',
   'kit.lead': '一張離線保存的紙：開啟此保險庫需要什麼，以及一條空白線讓你手寫主密碼。它不是備份。',
@@ -516,6 +516,6 @@ export const zhTW: Record<MessageKey, string> = {
   // M5 B review fix: rotation outcome notice on the locked screen
   'notice.title': '關於上一次的金鑰輪替',
   'notice.rotatedWhileLocked': '金鑰輪替已在保險庫鎖定前儲存。請用「新的」主密碼或「新的」復原碼解鎖；舊的已無法開啟此保險庫（較早的備份仍可用舊的開啟）。',
-  'notice.rotationUncertain': 'Keymesh 無法確認金鑰輪替是否已儲存，因此已鎖定保險庫。請先試「新的」主密碼；若無法開啟，表示輪替沒有儲存，「舊的」密碼仍然有效。在其中一個能開啟之前請兩個都保留，開啟後再建立新的備份。',
+  'notice.rotationUncertain': 'Keymesh 無法確認金鑰輪替是否已儲存，因此已鎖定保險庫。在保險庫能開啟之前，請保留「新的」與「舊的」兩組主密碼和復原碼。請先仔細試「新的」密碼，再試「舊的」。某次無法開啟不代表哪一組有效：也可能是輸入錯誤，或儲存空間暫時無法讀取（請重新載入後再試）。能開啟後，請建立新的備份。',
   'notice.ack': '知道了',
 };
