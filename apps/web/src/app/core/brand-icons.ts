@@ -1,14 +1,21 @@
 /**
  * Reviewed, bundled brand icons for Login items: SVG path data from Simple
- * Icons (simple-icons, CC0-1.0, pinned devDependency), extracted into
- * brand-icons.data.ts by scripts/make-brand-icons.mjs. Brand names and
+ * Icons (simple-icons, pinned devDependency; package CC0-1.0, and no shipped
+ * icon has its own licence in the package metadata), extracted with each
+ * icon's source and brand guidelines into brand-icons.data.ts by
+ * scripts/make-brand-icons.mjs. Brand names and
  * logos remain trademarks of their owners; they are shown only to identify
  * the site a login belongs to, never as an endorsement.
  *
- * Matching is local: nothing is fetched. `domains` match the host or any
- * subdomain (longest match wins); `names` match the label left of the public
- * suffix (e.g. google.com.tw → "google"). Adding a brand: import its icon,
- * add one row, and add a case to login-icon.spec.ts.
+ * Matching is local: nothing is fetched. `domains` are reviewed, explicit
+ * registrable domains (country variants listed one by one); they match the
+ * host or any subdomain, longest match first. There is no guessing from a
+ * name label, so look-alikes such as google.zip never get a brand icon.
+ * Icons identify a site for the eye only: they are NOT a security or origin
+ * indicator (shared hosts' tenants also match their provider's domain).
+ * Adding a brand: import its icon, add one row, rerun
+ * scripts/make-brand-icons.mjs (it refuses icons with their own licence), and
+ * add a case to login-icon.spec.ts.
  */
 import {
   si1password,
@@ -68,7 +75,6 @@ import {
   siProtonmail,
   siPypi,
   siReddit,
-  siRust,
   siShopee,
   siSignal,
   siSpotify,
@@ -105,26 +111,24 @@ export interface Brand {
   /** 24×24 SVG path. */
   path: string;
   domains: readonly string[];
-  names?: readonly string[];
 }
 
-const b = (icon: SimpleIcon, domains: string[], names?: string[]): Brand => ({
+const b = (icon: SimpleIcon, domains: string[]): Brand => ({
   id: icon.title.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
   title: icon.title,
   hex: '#' + icon.hex,
   path: icon.path,
   domains,
-  names,
 });
 
 export const BRANDS: readonly Brand[] = [
   b(si1password, ['1password.com', '1password.eu', '1password.ca']),
-  b(siAirbnb, ['airbnb.com'], ['airbnb']),
+  b(siAirbnb, ['airbnb.com', 'airbnb.co.uk', 'airbnb.com.tw', 'airbnb.jp', 'airbnb.de', 'airbnb.fr']),
   b(siAlibabadotcom, ['alibaba.com']),
   b(siAnthropic, ['anthropic.com']),
-  b(siApple, ['apple.com'], ['apple']),
+  b(siApple, ['apple.com', 'apple.com.cn']),
   b(siAtlassian, ['atlassian.com', 'atlassian.net']),
-  b(siBinance, ['binance.com'], ['binance']),
+  b(siBinance, ['binance.com', 'binance.us']),
   b(siBitbucket, ['bitbucket.org']),
   b(siBitwarden, ['bitwarden.com', 'bitwarden.eu']),
   b(siBluesky, ['bsky.app', 'bsky.social']),
@@ -136,7 +140,7 @@ export const BRANDS: readonly Brand[] = [
   b(siDocker, ['docker.com', 'docker.io']),
   b(siDropbox, ['dropbox.com']),
   b(siDuckduckgo, ['duckduckgo.com']),
-  b(siEbay, ['ebay.com'], ['ebay']),
+  b(siEbay, ['ebay.com', 'ebay.co.uk', 'ebay.de', 'ebay.com.au', 'ebay.ca', 'ebay.fr']),
   b(siEvernote, ['evernote.com']),
   b(siFacebook, ['facebook.com', 'fb.com', 'messenger.com']),
   b(siFigma, ['figma.com']),
@@ -146,7 +150,7 @@ export const BRANDS: readonly Brand[] = [
   b(siGitlab, ['gitlab.com']),
   b(siGmail, ['gmail.com', 'mail.google.com']),
   b(siGodaddy, ['godaddy.com']),
-  b(siGoogle, ['google.com', 'accounts.google.com'], ['google']),
+  b(siGoogle, ['google.com', 'accounts.google.com', 'google.com.tw', 'google.com.hk', 'google.co.jp', 'google.co.uk', 'google.de', 'google.fr', 'google.ca', 'google.com.au']),
   b(siGooglecloud, ['cloud.google.com', 'console.cloud.google.com']),
   b(siHetzner, ['hetzner.com', 'hetzner.cloud']),
   b(siIcloud, ['icloud.com']),
@@ -158,7 +162,7 @@ export const BRANDS: readonly Brand[] = [
   b(siMastodon, ['mastodon.social', 'joinmastodon.org']),
   b(siMedium, ['medium.com']),
   b(siNamecheap, ['namecheap.com']),
-  b(siNetflix, ['netflix.com'], ['netflix']),
+  b(siNetflix, ['netflix.com']),
   b(siNetlify, ['netlify.com', 'netlify.app']),
   b(siNextcloud, ['nextcloud.com']),
   b(siNordvpn, ['nordvpn.com', 'nordaccount.com']),
@@ -168,15 +172,14 @@ export const BRANDS: readonly Brand[] = [
   b(siOkx, ['okx.com']),
   b(siOvh, ['ovh.com', 'ovhcloud.com']),
   b(siPatreon, ['patreon.com']),
-  b(siPaypal, ['paypal.com', 'paypal.me'], ['paypal']),
+  b(siPaypal, ['paypal.com', 'paypal.me']),
   b(siPlex, ['plex.tv']),
   b(siPorkbun, ['porkbun.com']),
   b(siProton, ['proton.me', 'account.proton.me']),
   b(siProtonmail, ['protonmail.com', 'mail.proton.me']),
   b(siPypi, ['pypi.org']),
   b(siReddit, ['reddit.com']),
-  b(siRust, ['rust-lang.org', 'crates.io']),
-  b(siShopee, ['shopee.com'], ['shopee']),
+  b(siShopee, ['shopee.com', 'shopee.tw', 'shopee.sg', 'shopee.co.id', 'shopee.vn', 'shopee.co.th', 'shopee.ph', 'shopee.com.my', 'shopee.com.br']),
   b(siSignal, ['signal.org']),
   b(siSpotify, ['spotify.com']),
   b(siStackoverflow, ['stackoverflow.com']),
@@ -189,7 +192,7 @@ export const BRANDS: readonly Brand[] = [
   b(siTelegram, ['telegram.org', 't.me']),
   b(siTrello, ['trello.com']),
   b(siTrezor, ['trezor.io']),
-  b(siTripadvisor, ['tripadvisor.com'], ['tripadvisor']),
+  b(siTripadvisor, ['tripadvisor.com', 'tripadvisor.com.tw', 'tripadvisor.co.uk', 'tripadvisor.jp']),
   b(siTwitch, ['twitch.tv']),
   b(siUber, ['uber.com']),
   b(siUbiquiti, ['ui.com', 'ubnt.com']),
@@ -197,7 +200,7 @@ export const BRANDS: readonly Brand[] = [
   b(siWechat, ['wechat.com', 'weixin.qq.com']),
   b(siWhatsapp, ['whatsapp.com']),
   b(siX, ['x.com', 'twitter.com']),
-  b(siYoutube, ['youtube.com', 'youtu.be'], ['youtube']),
-  b(siZoho, ['zoho.com'], ['zoho']),
+  b(siYoutube, ['youtube.com', 'youtu.be']),
+  b(siZoho, ['zoho.com', 'zoho.eu', 'zoho.in']),
   b(siZoom, ['zoom.us', 'zoom.com']),
 ];

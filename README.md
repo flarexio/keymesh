@@ -2,9 +2,13 @@
 
 Local-first encrypted vault core in Rust, with an Angular browser demo running the same core compiled to WebAssembly.
 
-> **Status: M4 experimental — NOT production ready, not independently accepted.** Password vaults (master password + independent recovery code, envelope v2, `docs/adr/0002-envelope-v2.md`) work natively and in the browser, but stay **synthetic-data only until independent acceptance**. Demo vaults keep their public fixture or ephemeral keys. Keymesh's own authentication, accounts and sync don't exist. Trusted remote HTTPS is not set up yet (`docs/DELIVERY.md`).
+> **Status: M4 local unlock + M5 phase A, experimental. NOT production ready and not independently accepted.**
+> * **Password vaults** (master password + independent recovery code, envelope v2, `docs/adr/0002-envelope-v2.md`) work natively and in the browser, but stay **synthetic-data only until independent acceptance**. Demo vaults keep their public fixture or ephemeral keys.
+> * **M5 phase A** (installable offline app, TOTP from QR, TOTP countdown, local login icons) is implemented and Chromium-tested, under review. Phases B and C are not started (`docs/ROADMAP.md`).
+> * **Not built:** Keymesh's own authentication, accounts and sync.
+> * **Private HTTPS:** a private HTTPS endpoint (`https://keymesh.cloud` on the VPN, internal CA) runs, but no real client device has yet been verified to trust it (gate C, `docs/DELIVERY.md`).
 
-## Capability matrix (M1 core, M2 browser slice, M3 UI, M4 local unlock)
+## Capability matrix (M1 core, M2 browser slice, M3 UI, M4 local unlock, M5 phase A)
 
 | Area | State | Notes |
 |---|---|---|
@@ -15,14 +19,14 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | Password change, reset with recovery code, new recovery code | ✅ experimental | Need proof of authority verified by the core; **rewraps, not rotation**: earlier backups keep earlier credentials. Compromise rotation of the data key is deferred |
 | Native CLI unlock | ✅ experimental | `init`, `passwd [--recovery]`, `new-recovery-code`, `recover`; masked terminal input or `--password-stdin`; `init --demo` keeps the v1 demo |
 | Browser password vault | ✅ experimental | Secure contexts only (HTTPS or loopback); Argon2id in a worker; one credential operation at a time; lock cancels it; refused on plain-HTTP LAN/VPN origins, where the demo stays usable |
-| HTTPS serving | ✅ loopback-tested | `serve.mjs` TLS mode; `npm run tls-check` verifies chain/hostname/TLS floor/headers with a throwaway CA. **Trusted remote-browser access is blocked** on a certificate decision (`docs/DELIVERY.md`) |
+| HTTPS serving | ✅ experimental | `serve.mjs` TLS mode (`npm run tls-check`, throwaway CA). A private deployment (`deploy/`) runs Traefik with an internal-CA certificate for `keymesh.cloud`. Chain and headers are verified on the Pi; **a real client device trusting it (gate C) is unverified** (`docs/DELIVERY.md`) |
 | Atomic local persistence, load/edit/save, encrypted backup/restore | ✅ | Fails closed on a wrong key, corruption, truncation or an unknown format; lost-update guard |
 | Password generator (24 default / 32 strong presets, custom length 8–128, character types, custom ASCII-punctuation symbol set, look-alike exclusion, one-of-each-type; unbiased sampling) | ✅ | Same 64-bit floor for custom settings, checked against the generator's exact min-entropy |
 | Random 256-bit secrets (hex / base64url / base32) | ✅ | Local random values, not provider-issued credentials |
 | Passphrase generator | ⏳ pending | No reviewed, versioned wordlist bundled |
 | Ed25519 generation, storage, RFC 8032 vectors, OpenSSH public-key line | ✅ | No signing API; no private-key export formats |
 | RFC 6238 TOTP (SHA1/256/512, 6/8 digits), Base32 and `otpauth://totp` import | ✅ | HOTP and custom modes rejected |
-| TOTP QR decode | ⏳ deferred | Future UI adapter |
+| TOTP QR decode | ✅ experimental (browser) | Image upload/paste anywhere the app runs; live camera only in secure contexts. Decoded locally (zxing-wasm in a worker, self-hosted). Only `otpauth://totp/` is used, and the core validates it on save. Chromium fake-camera tested; **no real camera hardware tested** |
 | Import from 1Password via `op` CLI (explicit item or `op://` ref) | ✅ (fixtures only) | Tested only with a fake `op` and synthetic fixtures; not yet run against a real account |
 | WASM bridge (`crates/keymesh-wasm`, wasm-bindgen 0.2.129) | ✅ runs in browser | Validation, encryption, generators, Ed25519 and TOTP execute in headless Chromium (Playwright E2E) |
 | Angular 22 app (`apps/web`): list/search/filter/create/edit/delete all 7 item types | ✅ | Per-type forms with inline validation; secrets masked, explicit reveal/copy; in-app confirmation for destructive actions; persistent "synthetic demo" warning |
@@ -30,12 +34,13 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | Runtime language: 繁體中文 (zh-TW) / English | ✅ | Typed catalogs (missing key = build error); default from browser language; explicit choice persisted; switching keeps form input and never writes the vault; localized, secret-free error messages |
 | Appearance: System / Light / Dark | ✅ | System follows the OS live; explicit choice overrides it; applied before first paint without inline script; only `{locale, theme}` stored, under `keymesh.settings.v1` |
 | Browser generators → encrypted items | ✅ | Password, random secret, Ed25519 generated inside WASM and stored directly; passphrase still pending |
-| Browser TOTP: live code + remaining time, otpauth URI / Base32 entry | ✅ | Clock injectable (E2E uses Playwright's clock); QR/camera scanning ❌ not implemented |
+| Browser TOTP: live code + circular countdown, otpauth URI / Base32 / QR entry | ✅ | Clock injectable (E2E uses Playwright's clock). The last 5 s are flagged by colour **and** text; reduced motion respected |
+| Login icons | ✅ local only | 81 bundled brand marks (Simple Icons, no per-icon licence; trademarks of their owners) by reviewed domain; server icon for private hosts; category or letter otherwise. No network. **Not a security or origin indicator** |
 | IndexedDB persistence of the encrypted envelope only | ✅ | No plaintext, key or search index stored; E2E checks that planted markers are absent |
 | Browser lock / demo unlock | ✅ | Lock drops the decrypted vault in WASM, bumps an epoch so work started earlier is discarded; unlock is a demo-key transition, not identity |
 | Encrypted backup download / verified restore | ✅ | Restore must decrypt with the current demo key before anything is written; a lock at any point wins; 64 MiB limit enforced on open and seal |
 | Cross-tab writes | ✅ rejected | Exact-snapshot compare-and-swap on every write (mutation, restore, discard) plus a BroadcastChannel stale notice; stale tabs cannot edit or restore until they reload |
-| Offline startup (service worker / PWA) | ⏳ deferred | No service worker; the app needs its origin to load |
+| Installable app / offline startup (PWA) | ✅ experimental | Angular service worker in secure contexts only (HTTPS or loopback; not the plain-HTTP previews). After one online visit it reopens offline and unlocks the vault stored in that browser. Updates are offered, never forced. A failed update keeps the open tab working but prevents offline reopening until a retry succeeds. Damaged cached app files can be repaired online (vault data untouched). Not native autofill or an app store; vaults stay per browser. **Install on real phones/Safari untested** (`docs/DELIVERY.md` §6) |
 | 1Password import in the browser | ❌ by design | Native CLI only; no endpoint runs `op`; the browser shows CLI instructions |
 | Production use of password vaults | ⏳ pending review | Experimental until independent acceptance; lost password **and** recovery code ⇒ data unrecoverable (no escrow, no reset); lost ephemeral demo key ⇒ demo ciphertext unrecoverable |
 | Passkey / PRF, device slots, mnemonic or keycard encodings, compromise rotation | ❌ deferred | ADR 0001 stages 2–4 |
@@ -54,7 +59,7 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 - **Browser key handling (M2):** the demo key provider lives in WASM memory only.
   - With the *ephemeral* key, a reload loses the key, and the stored demo ciphertext becomes permanently inaccessible.
   - The *synthetic fixture* key is public: anyone can decrypt data stored under it.
-- **UI (M3):** E2E runs in Chromium only; Firefox and Safari are untested. Theme tokens use CSS `light-dark()`, which needs Chrome/Edge 123+, Firefox 120+ or Safari 17.5+. Chinese text uses whatever Traditional Chinese system font is installed (no bundled fonts). The zh-TW catalog was written and checked in-project, without a separate professional or native-speaker review.
+- **UI (M3, M5):** E2E runs in Chromium only; Firefox, Safari, real phones, real installs and real cameras are untested. Theme tokens use CSS `light-dark()`, which needs Chrome/Edge 123+, Firefox 120+ or Safari 17.5+. Chinese text uses whatever Traditional Chinese system font is installed (no bundled fonts). The zh-TW catalog was written and checked in-project, without a separate professional or native-speaker review.
 - **Browser memory:** JavaScript and WASM cannot guarantee zeroization. The typed master password is a JavaScript string; revealed or copied values, form inputs and the clipboard are outside Keymesh's control. Lock removes decrypted vault state in WASM and terminates a running key derivation, but the browser may still retain copies.
 - **KDF measurements** are from a Raspberry Pi 4 (native and Chromium WASM). No phone, laptop, Firefox or Safari was measured.
 

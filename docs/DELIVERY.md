@@ -118,7 +118,25 @@ tmux new-session -d -s keymesh-vpn-https \
 **Updates:**
 * A new version is downloaded in the background and offered with **Reload**. Nothing reloads or activates on its own.
 * If the vault is open, or a new vault's recovery code is not yet confirmed, Reload asks first and locks before reloading.
-* A failed download keeps the current version. If the browser evicted a file that a newer deployment removed, the app says it must reload. Stored vaults are never deleted to "fix" the cache.
+* An **ephemeral** demo vault is warned about explicitly: its key exists only in the page, so a reload makes it unreadable.
+
+**A failed update degrades offline reopening.** This is Angular's documented behaviour; see angular.dev, *Service worker in production*, degraded state.
+* If a new version cannot be installed (for example a damaged deployment whose files do not match their hashes), the open tab keeps working.
+* Angular's worker then serves new loads (reload, reopen) from the network only, so **reopening while offline fails (HTTP 504) even though the old files are still cached.**
+* The app shows a warning with **Try again**, and asks before an avoidable reload while offline.
+* It retries at most 3 times per page: on that button, or once when the browser comes back online.
+* A successful retry installs the fixed version and restores normal offline reopening. A full browser restart also restarts the worker.
+* Vault data is never affected.
+
+**Damaged cached app files:**
+* The worker does not re-check the bytes of a cached file. A damaged cached file (for example the core WASM) can therefore stop the app from starting, and a plain reload serves the same damaged copy.
+* The "could not start" screen offers **Repair app files**, after a confirmation. It:
+  * first checks the server is reachable, with a service-worker bypass;
+  * unregisters only this app's root-scope worker;
+  * deletes only its `ngsw:/:` caches;
+  * then reloads.
+* IndexedDB (vaults), localStorage (settings) and other sites' data are never touched.
+* Offline it changes nothing and says so, because missing files can only come from the server.
 
 **Server requirements (`scripts/serve.mjs`):**
 * The SPA fallback answers only extensionless paths. A missing `ngsw.json`, script, WASM or icon gets 404, never `index.html`.

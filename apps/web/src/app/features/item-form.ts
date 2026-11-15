@@ -1,5 +1,5 @@
 import { NgTemplateOutlet } from '@angular/common';
-import { Component, OnDestroy, OnInit, computed, inject, input, output, signal } from '@angular/core';
+import { Component, OnDestroy, OnInit, computed, inject, input, output, signal, viewChild } from '@angular/core';
 import { errorKey } from '../core/errors';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { VaultService } from '../core/vault.service';
@@ -178,7 +178,7 @@ let nextForm = 0;
                 <input [id]="uid + '-setup'" name="totpSetup" type="password" autocomplete="off" class="mono" required
                   [attr.aria-invalid]="!!shownErrors().totpSetup"
                   [attr.aria-describedby]="(shownErrors().totpSetup ? uid + '-setup-err ' : '') + uid + '-setup-hint'"
-                  [value]="m().totpSetup" (input)="set('totpSetup', $event)" />
+                  [value]="m().totpSetup" (input)="set('totpSetup', $event); qr()?.cancelAll()" />
                 @if (shownErrors().totpSetup; as e) {
                   <p class="field-error" [id]="uid + '-setup-err'"><km-icon name="alert" />{{ i18n.t(e) }}</p>
                 }
@@ -359,6 +359,9 @@ export class ItemForm implements OnInit, OnDestroy {
    * pre-fills only empty title/issuer/account fields, which stay editable.
    * Nothing is saved until the user submits; the core validates the URI then.
    */
+  /** Typing a setup by hand cancels a pending QR read (it must not overwrite it). */
+  protected readonly qr = viewChild(QrImport);
+
   protected fromQr(t: TotpFromQr): void {
     this.m.update((m) => ({
       ...m,

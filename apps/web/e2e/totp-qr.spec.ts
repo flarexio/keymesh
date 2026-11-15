@@ -7,7 +7,7 @@
  */
 import { chromium, expect, Page, test } from '@playwright/test';
 import { en } from '../src/app/core/i18n/en';
-import { M, RFC_URI, newItem, openItem, start } from './helpers';
+import { M, RFC_URI, newItem, openItem, start, insecureOrigin } from './helpers';
 import { qrPng, qrY4m } from './qr-fixtures';
 
 async function openTotpForm(page: Page): Promise<void> {
@@ -56,6 +56,18 @@ test('QR image upload fills a masked TOTP setup; the core validates it on save; 
   await expect(page.getByTestId('totp-code')).not.toHaveText('94287082');
   await page.clock.setFixedTime(new Date(66_000));
   await expect(page.getByTestId('totp-remaining')).toHaveText('24s remaining', { timeout: 5000 });
+});
+
+test('a large QR photo (longest side over 1600 px) is scaled down and still read', async ({ page }, testInfo) => {
+  await openTotpForm(page);
+  const big = await qrPng(RFC_URI, 64);
+  const side = big.readUInt32BE(16);
+  expect(side).toBeGreaterThan(1600); // exercises the worker's resize path
+  expect(side).toBeLessThanOrEqual(8192);
+  await upload(page, 'large.png', 'image/png', big);
+  await expect(status(page)).toHaveAttribute('data-state', 'found');
+  expect((await page.locator('input[name=totpSetup]').inputValue()) === RFC_URI).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('qr-large-found.png') });
 });
 
 test('pasting a QR image works; other QR contents and bad files are refused without being used', async ({ page }) => {
@@ -122,7 +134,9 @@ test('pasting a QR image works; other QR contents and bad files are refused with
   await expect(page.locator('#detail-title')).toHaveCount(0); // nothing was saved
 });
 
-test('locking while a QR image is being read cancels it and clears the form', async ({ page }) => {
+// Not a pending-decode test (nothing holds the decoder here); the deterministic
+// lock/hide-while-decoding cases are in qr-lifecycle.spec.ts.
+test('locking with the QR form open removes the form and its setup field', async ({ page }) => {
   await openTotpForm(page);
   await upload(page, 'qr.png', 'image/png', await qrPng(RFC_URI));
   await page.getByTestId('lock').click();
@@ -148,7 +162,7 @@ test('camera: denied permission is explained; unsupported origins show no camera
   const plain = await chromium.launch({ args: ['--host-resolver-rules=MAP keymesh-http.test 127.0.0.1'] });
   try {
     const p2 = await (await plain.newContext()).newPage();
-    await p2.goto('http://keymesh-http.test:4310/');
+    await p2.goto(insecureOrigin(test.info().project.use.baseURL));
     expect(await p2.evaluate(() => isSecureContext)).toBe(false);
     await p2.locator('input[name=mode][value=synthetic-fixture]').check();
     await p2.getByTestId('start-vault').click();
@@ -190,7 +204,7 @@ test('camera: a QR code in the live stream is read, then every track is stopped'
     expect(await page.evaluate(() => (window as unknown as { liveTracks: () => number }).liveTracks())).toBe(0);
     expect((await page.locator('input[name=totpSetup]').inputValue()) === RFC_URI).toBe(true);
 
-    // Cancel and lock both stop the camera.
+    // Cancel and Escape both stop the camera (lock/hide/pagehide: qr-lifecycle.spec.ts).
     await page.locator('input[name=totpSetup]').fill('');
     await page.getByTestId('qr-camera').click();
     await expect.poll(() => page.evaluate(() => (window as unknown as { liveTracks: () => number }).liveTracks())).toBe(1);
@@ -220,4 +234,32 @@ test('the countdown is decorative; seconds are text, and reduced motion stops th
   // The app-wide reduced-motion rule shortens every transition to 0.01 ms.
   const transition = await page.locator('.totp-ring .arc').evaluate((el) => getComputedStyle(el).transitionDuration);
   expect(Math.max(...transition.split(',').map((t) => parseFloat(t)))).toBeLessThan(0.001);
+});
+
+test('a login linked to a 60 s TOTP uses that period for the ring, across a rollover', async ({ page }, testInfo) => {
+  const uri60 = `otpauth://totp/Synth60:acct?secret=${M.totpSecret}&issuer=Synth60&period=60`;
+  await page.clock.setFixedTime(new Date(70_000)); // 60 s window: 50 s left
+  await start(page, 'synthetic-fixture');
+  await newItem(page, 'totp');
+  await page.locator('input[name=title]').fill('Synthetic 60s TOTP');
+  await page.locator('input[name=totpSetup]').fill(uri60);
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.locator('#detail-title')).toHaveText('Synthetic 60s TOTP');
+  await newItem(page, 'login');
+  await page.locator('input[name=title]').fill('Synthetic linked login');
+  await page.locator('select[name=totpItem]').selectOption({ label: 'Synthetic 60s TOTP' });
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.locator('#detail-title')).toHaveText('Synthetic linked login');
+  const arc = page.locator('.totp-ring .arc');
+  const frac = async () => parseFloat((await arc.getAttribute('stroke-dasharray'))!.split(' ')[0]);
+  await expect(page.getByTestId('totp-remaining')).toHaveText('50s remaining');
+  expect(await frac()).toBeCloseTo((50 / 60) * 100, 1); // a 30 s period would clamp to 100
+  await page.screenshot({ path: testInfo.outputPath('linked-60s-ring.png') });
+  await page.clock.setFixedTime(new Date(116_000)); // 4 s left: warning
+  await expect(page.getByTestId('totp-remaining')).toHaveText('4s left — new code soon', { timeout: 5000 });
+  expect(await frac()).toBeCloseTo((4 / 60) * 100, 1);
+  await page.clock.setFixedTime(new Date(121_000)); // next window: 59 s left
+  await expect(page.getByTestId('totp-remaining')).toHaveText('59s remaining', { timeout: 5000 });
+  expect(await frac()).toBeCloseTo((59 / 60) * 100, 1);
+  await expect(page.getByTestId('totp-ring')).toHaveAttribute('data-warn', 'false');
 });

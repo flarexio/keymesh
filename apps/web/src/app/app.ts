@@ -1,5 +1,6 @@
-import { Component, OnInit, effect, inject } from '@angular/core';
-import { I18n } from './core/i18n/i18n.service';
+import { Component, OnInit, effect, inject, signal } from '@angular/core';
+import { AppRepair } from './core/app-repair';
+import { I18n, MessageKey } from './core/i18n/i18n.service';
 import { VaultService } from './core/vault.service';
 import { DisplayPrefs } from './shared/display-prefs';
 import { ConfirmDialog, ConfirmService, Toasts, ToastService } from './shared/feedback';
@@ -52,9 +53,18 @@ import { BrandCatalog } from './shared/brand-catalog';
               <span class="state-icon danger"><km-icon name="alert" /></span>
               <h2>{{ i18n.t('app.failedTitle') }}</h2>
               <p>{{ i18n.t('app.failedBody') }}</p>
-              <button type="button" class="btn btn-primary" (click)="reloadPage()">
-                <km-icon name="refresh" /><span>{{ i18n.t('app.reloadPage') }}</span>
-              </button>
+              <div class="state-actions">
+                <button type="button" class="btn btn-primary" (click)="reloadPage()">
+                  <km-icon name="refresh" /><span>{{ i18n.t('app.reloadPage') }}</span>
+                </button>
+                <button type="button" class="btn" data-testid="repair-app" [disabled]="repairing()" (click)="repairApp()">
+                  <km-icon name="download" /><span>{{ i18n.t(repairing() ? 'repair.working' : 'repair.button') }}</span>
+                </button>
+              </div>
+              <p class="field-hint">{{ i18n.t('repair.hint') }}</p>
+              @if (repairMsg(); as m) {
+                <p class="qr-status error" role="status" data-testid="repair-status">{{ i18n.t(m) }}</p>
+              }
             </section>
           </div>
         }
@@ -99,5 +109,35 @@ export class App implements OnInit {
 
   protected reloadPage(): void {
     location.reload();
+  }
+
+  private readonly repair = inject(AppRepair);
+  protected readonly repairing = signal(false);
+  protected readonly repairMsg = signal<MessageKey | null>(null);
+
+  /**
+   * The app could not start (e.g. a damaged cached file). After the user
+   * confirms, re-download this app's own files: only its service-worker
+   * caches are removed (core/app-repair.ts); vault data is never touched.
+   */
+  protected async repairApp(): Promise<void> {
+    this.repairMsg.set(null);
+    const ok = await this.confirm.ask({
+      title: 'repair.confirmTitle',
+      body: 'repair.confirmBody',
+      confirm: 'repair.confirm',
+    });
+    if (!ok) return;
+    this.repairing.set(true);
+    try {
+      const result = await this.repair.repair();
+      if (result === 'repaired') {
+        location.reload();
+        return;
+      }
+      this.repairMsg.set(result === 'offline' ? 'repair.offline' : 'repair.unavailable');
+    } finally {
+      this.repairing.set(false);
+    }
   }
 }

@@ -2,7 +2,9 @@ import { defineConfig, devices } from '@playwright/test';
 
 // E2E against the real production build and the real compiled WASM core,
 // served on loopback only. No request interception or mocked crypto.
-const PORT = 4310;
+// Loopback port for the test server; override (e.g. an independent run next
+// to a live preview) with KEYMESH_E2E_PORT. Tests derive every URL from it.
+const PORT = Number(process.env['KEYMESH_E2E_PORT'] ?? 4310);
 
 export default defineConfig({
   testDir: './e2e',

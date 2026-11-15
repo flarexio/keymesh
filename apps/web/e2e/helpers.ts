@@ -160,3 +160,12 @@ export async function createAllKinds(page: Page) {
   await create(page, 'Synthetic Ed25519');
   await expect(page.locator('.detail')).toContainText('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5');
 }
+
+/**
+ * The app on a NON-loopback name (mapped to 127.0.0.1 by the browser's
+ * host-resolver rule), on the configured test port: a plain-HTTP origin that
+ * is not a secure context, like the LAN/VPN previews.
+ */
+export function insecureOrigin(baseURL: string | undefined): string {
+  return `http://keymesh-http.test:${new URL(baseURL ?? 'http://127.0.0.1:4310').port}/`;
+}

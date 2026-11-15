@@ -82,9 +82,7 @@ export function brandFor(host: string, brands: readonly Brand[]): Brand | null {
       if ((host === d || host.endsWith('.' + d)) && (!best || d.length > best.len)) best = { brand, len: d.length };
     }
   }
-  if (best) return best.brand;
-  const label = siteLabel(host);
-  return (label && brands.find((b) => b.names?.includes(label))) || null;
+  return best?.brand ?? null;
 }
 
 const CATEGORY_WORDS: [LoginCategory, string[]][] = [

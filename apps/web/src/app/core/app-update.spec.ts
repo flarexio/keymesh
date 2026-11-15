@@ -3,10 +3,10 @@ import { signal } from '@angular/core';
 import { SwUpdate, VersionEvent, UnrecoverableStateEvent } from '@angular/service-worker';
 import { Subject } from 'rxjs';
 import { ConfirmService } from '../shared/feedback';
-import { AppUpdate } from './app-update';
+import { AppUpdate, MAX_UPDATE_RETRIES } from './app-update';
 import { VaultService } from './vault.service';
 
-function setup(opts: { enabled?: boolean; status?: string; confirming?: boolean; answer?: boolean } = {}) {
+function setup(opts: { enabled?: boolean; status?: string; confirming?: boolean; answer?: boolean; keyMode?: string | null } = {}) {
   const versionUpdates = new Subject<VersionEvent>();
   const unrecoverable = new Subject<UnrecoverableStateEvent>();
   const sw = {
@@ -14,10 +14,12 @@ function setup(opts: { enabled?: boolean; status?: string; confirming?: boolean;
     versionUpdates,
     unrecoverable,
     activateUpdate: vi.fn(),
+    checkForUpdate: vi.fn(async () => true),
   };
   const vault = {
     status: signal(opts.status ?? 'empty'),
     confirmingNewVault: signal(opts.confirming ?? false),
+    keyMode: signal(opts.keyMode ?? null),
     lock: vi.fn(),
   };
   const confirm = { ask: vi.fn(async () => opts.answer ?? true) };
@@ -83,6 +85,63 @@ describe('installed-app updates', () => {
       expect(t.vault.lock).not.toHaveBeenCalled();
       expect(t.reload).not.toHaveBeenCalled();
     }
+  });
+
+  it('ephemeral demo vault: always asks (even locked) and says the vault becomes unreadable', async () => {
+    for (const status of ['unlocked', 'locked']) {
+      const t = setup({ status, keyMode: 'ephemeral' });
+      expect(await t.update.apply()).toBe(true);
+      expect(t.confirm.ask).toHaveBeenCalledWith(
+        expect.objectContaining({ body: 'update.confirmBodyEphemeral', danger: true }),
+      );
+    }
+    // Password or fixture vaults keep the normal wording.
+    const p = setup({ status: 'unlocked', keyMode: 'protected' });
+    await p.update.apply();
+    expect(p.confirm.ask).toHaveBeenCalledWith(expect.objectContaining({ body: 'update.confirmBody', danger: false }));
+  });
+
+  it('failed install: retries are bounded; success clears the failure', async () => {
+    const t = setup();
+    const failed = { type: 'VERSION_INSTALLATION_FAILED', version: { hash: 'b' }, error: 'hash mismatch' } as VersionEvent;
+    t.versionUpdates.next(failed);
+    expect(t.update.failed()).toBe(true);
+    for (let i = 0; i < MAX_UPDATE_RETRIES + 2; i++) await t.update.retry();
+    expect(t.sw.checkForUpdate).toHaveBeenCalledTimes(MAX_UPDATE_RETRIES);
+    expect(t.update.canRetry).toBe(false);
+    t.versionUpdates.next(ready);
+    expect(t.update.failed()).toBe(false);
+    expect(t.update.ready()).toBe(true);
+    expect(t.reload).not.toHaveBeenCalled(); // never forced
+  });
+
+  it('failed install: coming back online retries once per event, within the bound', async () => {
+    const t = setup();
+    t.versionUpdates.next({ type: 'VERSION_INSTALLATION_FAILED', version: { hash: 'b' }, error: 'x' } as VersionEvent);
+    dispatchEvent(new Event('online'));
+    await Promise.resolve();
+    expect(t.sw.checkForUpdate).toHaveBeenCalledTimes(1);
+    // Not degraded: online events do nothing.
+    const healthy = setup();
+    dispatchEvent(new Event('online'));
+    await Promise.resolve();
+    expect(healthy.sw.checkForUpdate).not.toHaveBeenCalled();
+  });
+
+  it('degraded and offline: unloading asks first; online or healthy it does not', () => {
+    const t = setup();
+    const unload = () => {
+      const e = new Event('beforeunload', { cancelable: true });
+      dispatchEvent(e);
+      return e.defaultPrevented;
+    };
+    t.update.isOnline = () => false;
+    expect(unload()).toBe(false); // healthy
+    t.versionUpdates.next({ type: 'VERSION_INSTALLATION_FAILED', version: { hash: 'b' }, error: 'x' } as VersionEvent);
+    expect(unload()).toBe(true);
+    t.update.isOnline = () => true;
+    expect(unload()).toBe(false);
+    TestBed.resetTestingModule(); // listeners removed with the injector
   });
 
   it('without a service worker (dev, unsupported) it stays inert', () => {

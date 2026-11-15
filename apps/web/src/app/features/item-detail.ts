@@ -179,9 +179,22 @@ export class ItemDetail implements OnInit, OnDestroy {
     return null;
   });
 
+  /** Period of the TOTP actually shown: the item itself, or the one a login links to. */
   protected readonly period = computed(() => {
+    this.vault.version();
     const v = this.view();
-    return v?.kind === 'totp' ? (v.data['period'] as number) : 30;
+    const id = this.totpId();
+    if (!v || !id) return 30;
+    let totp: ItemView | null = v.kind === 'totp' ? v : null;
+    if (!totp) {
+      try {
+        totp = this.vault.get(id);
+      } catch {
+        return 30;
+      }
+    }
+    const p = totp?.data['period'];
+    return typeof p === 'number' && p > 0 ? p : 30;
   });
 
   protected readonly totp = computed(() => {

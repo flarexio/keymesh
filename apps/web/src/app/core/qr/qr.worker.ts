@@ -6,6 +6,7 @@
  * then terminates. Nothing is logged and no network request carries content.
  */
 import { prepareZXingModule, readBarcodes } from 'zxing-wasm/reader';
+import { decodeSize } from './image-header';
 import { QR_DECODE_SIDE, type QrRequest, type QrResponse } from './qr-messages';
 
 prepareZXingModule({
@@ -16,31 +17,23 @@ prepareZXingModule({
   },
 });
 
+/**
+ * Pixels for the decoder: the image is decoded ONCE, its size is read before
+ * anything is closed, checked against the same bounds as the header check
+ * (a header can lie), then drawn scaled so the longest side is at most
+ * QR_DECODE_SIDE.
+ */
 async function pixels(req: QrRequest): Promise<ImageData> {
-  let bitmap: ImageBitmap;
-  if (req.kind === 'frame') {
-    bitmap = req.bitmap;
-  } else {
-    // Header bounds were checked by the page; still scale while decoding.
-    const probe = await createImageBitmap(req.blob);
-    const scale = Math.min(1, QR_DECODE_SIDE / Math.max(probe.width, probe.height));
-    if (scale === 1) {
-      bitmap = probe;
-    } else {
-      probe.close();
-      bitmap = await createImageBitmap(req.blob, {
-        resizeWidth: Math.max(1, Math.round(probe.width * scale)),
-        resizeHeight: Math.max(1, Math.round(probe.height * scale)),
-        resizeQuality: 'high',
-      });
-    }
-  }
+  const bitmap = req.kind === 'frame' ? req.bitmap : await createImageBitmap(req.blob);
   try {
-    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const size = decodeSize(bitmap.width, bitmap.height, QR_DECODE_SIDE);
+    if (!size) throw new Error('image out of bounds');
+    const canvas = new OffscreenCanvas(size.width, size.height);
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) throw new Error('no 2d context');
-    ctx.drawImage(bitmap, 0, 0);
-    return ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(bitmap, 0, 0, size.width, size.height);
+    return ctx.getImageData(0, 0, size.width, size.height);
   } finally {
     bitmap.close();
   }

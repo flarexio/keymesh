@@ -95,13 +95,16 @@ describe('QR decoder (page side)', () => {
     const d = decoder(() => 'hang');
     const ac = new AbortController();
     const p = d.decodeFile(image(), ac.signal);
-    await new Promise((r) => setTimeout(r, 0)); // header read finished, worker started
+    // Wait until the worker really exists and holds the request (header read done).
+    for (let i = 0; i < 100 && !FakeWorker.all[0]?.received.length; i++) await new Promise((r) => setTimeout(r, 0));
+    expect(FakeWorker.all).toHaveLength(1);
+    expect(FakeWorker.all[0].received).toHaveLength(1);
+    expect(FakeWorker.all[0].terminated).toBe(false);
     ac.abort();
     expect(await p).toEqual({ ok: false, reason: 'cancelled' });
-    expect(FakeWorker.all.every((w) => w.terminated)).toBe(true);
+    expect(FakeWorker.all[0].terminated).toBe(true);
     // Already aborted: no worker at all.
-    const before = FakeWorker.all.length;
     expect(await d.decodeFile(image(), AbortSignal.abort())).toEqual({ ok: false, reason: 'cancelled' });
-    expect(FakeWorker.all.length).toBe(before);
+    expect(FakeWorker.all).toHaveLength(1); // still only the first one
   });
 });

@@ -39,6 +39,14 @@ const ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp';
 const FRAME_SIDE = 1280;
 const FRAME_INTERVAL_MS = 250;
 
+interface CameraRun {
+  /** Operation token this run belongs to. */
+  readonly op: number;
+  stream: MediaStream | null;
+  session: QrSession | null;
+  loop: ReturnType<typeof setTimeout> | null;
+}
+
 /**
  * Add a TOTP from a QR code: image upload, image paste, or live camera.
  * Everything is decoded locally (core/qr). Only a TOTP otpauth URI is passed
@@ -110,12 +118,18 @@ export class QrImport implements OnDestroy {
   private readonly dialog = viewChild.required<ElementRef<HTMLDialogElement>>('cam');
   private readonly video = viewChild<ElementRef<HTMLVideoElement>>('video');
 
+  /**
+   * One QR operation at a time. Upload, paste and camera share this token:
+   * starting any of them, cancelling, locking, hiding the page or destroying
+   * the form bumps it and releases whatever the previous operation owned.
+   * Every continuation re-checks it after each await, so a late file result,
+   * permission grant, play() or frame can never write to the form or install
+   * a worker or timer.
+   */
+  private op = 0;
   private fileAbort: AbortController | null = null;
-  private stream: MediaStream | null = null;
-  private session: QrSession | null = null;
-  private loop: ReturnType<typeof setTimeout> | null = null;
-  /** Bumped by every stop: late frames/results of an old camera run are ignored. */
-  private run = 0;
+  /** Resources of the camera run that owns them; released as one unit. */
+  private cam: CameraRun | null = null;
 
   constructor() {
     // Locking the vault cancels everything in progress here.
@@ -139,12 +153,18 @@ export class QrImport implements OnDestroy {
     void this.decodeImage(file);
   }
 
+  /** Cancel what is running and claim the next operation token. */
+  private begin(): number {
+    this.release();
+    return ++this.op;
+  }
+
   private async decodeImage(file: Blob): Promise<void> {
-    this.fileAbort?.abort();
+    const op = this.begin();
     const ac = (this.fileAbort = new AbortController());
     this.status.set({ key: 'qr.reading', error: false, state: 'reading' });
     const r = await this.decoder.decodeFile(file, ac.signal);
-    if (ac.signal.aborted) return;
+    if (op !== this.op) return; // superseded, cancelled, locked, hidden or destroyed
     this.fileAbort = null;
     this.report(r);
   }
@@ -162,8 +182,10 @@ export class QrImport implements OnDestroy {
 
   protected async startCamera(): Promise<void> {
     if (!this.cameraSupported || this.cameraOpen()) return;
+    const op = this.begin();
+    const cam: CameraRun = { op, stream: null, session: null, loop: null };
+    this.cam = cam;
     this.status.set(null);
-    const run = ++this.run;
     this.cameraMsg.set(null);
     this.cameraOpen.set(true);
     this.dialog().nativeElement.showModal();
@@ -172,34 +194,39 @@ export class QrImport implements OnDestroy {
         audio: false,
         video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
       });
-      if (run !== this.run) {
+      if (op !== this.op) {
         stream.getTracks().forEach((t) => t.stop()); // closed while the permission prompt was up
         return;
       }
-      this.stream = stream;
+      cam.stream = stream;
       const video = this.video()?.nativeElement;
-      if (!video) return this.stopCamera();
+      if (!video) return this.cancelAll();
       video.srcObject = stream;
       await video.play();
-      this.session = this.decoder.session();
-      this.schedule(run);
+      // Cancelled while play() was pending: release() already stopped the
+      // stream; nothing else may be created for this run.
+      if (op !== this.op) return;
+      cam.session = this.decoder.session();
+      this.schedule(cam);
     } catch (e) {
-      if (run !== this.run) return;
+      if (op !== this.op) return;
       const name = e instanceof DOMException ? e.name : '';
-      this.releaseCamera();
+      this.releaseCamera(cam);
       this.cameraMsg.set(name === 'NotAllowedError' || name === 'SecurityError' ? 'qr.cameraDenied' : 'qr.cameraUnavailable');
     }
   }
 
-  private schedule(run: number): void {
-    this.loop = setTimeout(() => void this.scanFrame(run), FRAME_INTERVAL_MS);
+  private schedule(cam: CameraRun): void {
+    if (cam.op !== this.op || this.cam !== cam) return;
+    cam.loop = setTimeout(() => void this.scanFrame(cam), FRAME_INTERVAL_MS);
   }
 
-  private async scanFrame(run: number): Promise<void> {
+  private async scanFrame(cam: CameraRun): Promise<void> {
+    cam.loop = null;
     const video = this.video()?.nativeElement;
-    const session = this.session;
-    if (run !== this.run || !video || !session || session.closed) return;
-    if (video.readyState < 2 || !video.videoWidth) return this.schedule(run);
+    const session = cam.session;
+    if (cam.op !== this.op || !video || !session || session.closed) return;
+    if (video.readyState < 2 || !video.videoWidth) return this.schedule(cam);
     const scale = Math.min(1, FRAME_SIDE / Math.max(video.videoWidth, video.videoHeight));
     let bitmap: ImageBitmap;
     try {
@@ -208,14 +235,14 @@ export class QrImport implements OnDestroy {
         resizeHeight: Math.round(video.videoHeight * scale),
       });
     } catch {
-      return this.schedule(run);
+      return this.schedule(cam); // re-checks ownership itself
     }
-    if (run !== this.run) return bitmap.close();
+    if (cam.op !== this.op) return bitmap.close();
     const r = await session.decode(bitmap, 3000);
-    if (run !== this.run) return;
+    if (cam.op !== this.op) return;
     if (r === 'timeout' || r === 'cancelled') {
-      this.session = this.decoder.session(); // replace a stuck or crashed worker
-      return this.schedule(run);
+      cam.session = this.decoder.session(); // replace a stuck or crashed worker
+      return this.schedule(cam);
     }
     const outcome = r.ok ? outcomeOf(r.text) : null;
     if (outcome?.ok) {
@@ -225,27 +252,32 @@ export class QrImport implements OnDestroy {
     }
     // A QR code that is not a TOTP setup: say so, keep scanning.
     if (outcome && outcome.reason !== 'notFound') this.cameraMsg.set(FAILURES[outcome.reason]);
-    this.schedule(run);
+    this.schedule(cam);
   }
 
-  /** Stop tracks, detach the stream and discard the decoder worker. */
-  private releaseCamera(): void {
-    if (this.loop) clearTimeout(this.loop);
-    this.loop = null;
-    this.stream?.getTracks().forEach((t) => t.stop());
-    this.stream = null;
+  /** Stop the run's tracks, timer and worker, and detach the video. */
+  private releaseCamera(cam: CameraRun): void {
+    if (cam.loop) clearTimeout(cam.loop);
+    cam.loop = null;
+    cam.stream?.getTracks().forEach((t) => t.stop());
+    cam.stream = null;
+    cam.session?.close();
+    cam.session = null;
     const video = this.video()?.nativeElement;
     if (video) {
       video.pause();
       video.srcObject = null;
     }
-    this.session?.close();
-    this.session = null;
   }
 
-  stopCamera(): void {
-    this.run++;
-    this.releaseCamera();
+  /** Release whatever the current operation owns (file decode or camera). */
+  private release(): void {
+    this.fileAbort?.abort();
+    this.fileAbort = null;
+    if (this.cam) {
+      this.releaseCamera(this.cam);
+      this.cam = null;
+    }
     this.cameraMsg.set(null);
     if (this.cameraOpen()) {
       this.cameraOpen.set(false);
@@ -254,14 +286,23 @@ export class QrImport implements OnDestroy {
     }
   }
 
-  protected onHidden(): void {
-    if (document.visibilityState === 'hidden') this.stopCamera();
+  /** Cancel / Escape / pagehide / a successful scan: end the camera run. */
+  stopCamera(): void {
+    this.op++;
+    this.release();
   }
 
-  private cancelAll(): void {
-    this.fileAbort?.abort();
-    this.fileAbort = null;
-    this.stopCamera();
+  protected onHidden(): void {
+    if (document.visibilityState === 'hidden') this.cancelAll();
+  }
+
+  /**
+   * Cancel everything (lock, hide, destroy, or the user typing a setup by
+   * hand): no pending result may reach the form afterwards.
+   */
+  cancelAll(): void {
+    this.op++;
+    this.release();
     this.status.set(null);
   }
 

@@ -88,3 +88,18 @@ export function checkImage(bytes: Uint8Array, byteLength = bytes.length): Header
   }
   return { ok: true, header };
 }
+
+/**
+ * Canvas size for decoding an image of `width`×`height` (already decoded by
+ * the browser): scaled so the longest side is at most `maxSide`, or null if
+ * the decoded size breaks the same bounds as the header check (a header can
+ * lie). Width and height must be read before the bitmap is closed: a closed
+ * ImageBitmap reports 0×0.
+ */
+export function decodeSize(width: number, height: number, maxSide: number): { width: number; height: number } | null {
+  if (!(width >= 1 && height >= 1) || width > QR_MAX_SIDE || height > QR_MAX_SIDE || width * height > QR_MAX_PIXELS) {
+    return null;
+  }
+  const scale = Math.min(1, maxSide / Math.max(width, height));
+  return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) };
+}

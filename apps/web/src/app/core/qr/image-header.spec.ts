@@ -1,4 +1,4 @@
-import { QR_MAX_BYTES, checkImage, readImageHeader } from './image-header';
+import { QR_MAX_BYTES, checkImage, decodeSize, readImageHeader } from './image-header';
 
 const bytes = (...parts: (number[] | string)[]) =>
   new Uint8Array(parts.flatMap((p) => (typeof p === 'string' ? [...p].map((c) => c.charCodeAt(0)) : p)));
@@ -42,5 +42,22 @@ describe('QR image header bounds', () => {
     expect(checkImage(png(10, 10).slice(0, 20))).toEqual({ ok: false, reason: 'unsupported' });
     expect(checkImage(bytes([0xff, 0xd8, 0xff, 0xe0, 0, 1]))).toEqual({ ok: false, reason: 'unsupported' });
     expect(checkImage(new Uint8Array())).toEqual({ ok: false, reason: 'unsupported' });
+  });
+});
+
+describe('QR decode size', () => {
+  it('scales large images down to the decode side, keeping the aspect ratio', () => {
+    expect(decodeSize(1740, 1740, 1600)).toEqual({ width: 1600, height: 1600 });
+    expect(decodeSize(4032, 3024, 1600)).toEqual({ width: 1600, height: 1200 });
+    expect(decodeSize(3024, 4032, 1600)).toEqual({ width: 1200, height: 1600 });
+    expect(decodeSize(800, 600, 1600)).toEqual({ width: 800, height: 600 });
+    expect(decodeSize(16000, 2, 1600)).toBeNull(); // over the side bound
+  });
+
+  it('refuses decoded sizes the header check would refuse (closed bitmaps report 0x0)', () => {
+    expect(decodeSize(0, 0, 1600)).toBeNull();
+    expect(decodeSize(9000, 100, 1600)).toBeNull();
+    expect(decodeSize(6000, 6000, 1600)).toBeNull();
+    expect(decodeSize(Number.NaN, 10, 1600)).toBeNull();
   });
 });

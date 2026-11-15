@@ -27,7 +27,15 @@ describe('login icons (local only)', () => {
     expect(brandOf('https://www.google.com.tw')).toBe('Google');
     expect(brandOf('https://shopee.tw')).toBe('Shopee');
     expect(brandOf('https://twitter.com')).toBe('X');
-    // Look-alikes do not match.
+    expect(brandOf('https://www.google.co.jp')).toBe('Google');
+    expect(brandOf('https://shopee.sg')).toBe('Shopee');
+    // Look-alikes and unreviewed TLDs do not match (no label guessing).
+    expect(brandFor('google.zip', BRANDS)).toBeNull();
+    expect(brandFor('paypal.example.com', BRANDS)).toBeNull();
+    expect(brandFor('shopee.evil', BRANDS)).toBeNull();
+    // Removed: an icon with its own licence (CC-BY-SA-4.0) is not bundled.
+    expect(brandFor('rust-lang.org', BRANDS)).toBeNull();
+    expect(BRANDS.length).toBe(81);
     expect(brandFor('notgithub.com', BRANDS)).toBeNull();
     expect(brandFor('github.com.evil.example', BRANDS)).toBeNull();
     // Without the catalogue (not loaded yet) a login still gets a category or letter.

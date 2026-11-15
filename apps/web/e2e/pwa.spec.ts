@@ -15,7 +15,7 @@ import { ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { cpSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { en } from '../src/app/core/i18n/en';
-import { M, RFC_URI, newItem, start } from './helpers';
+import { M, RFC_URI, newItem, start, storedBytes } from './helpers';
 import { qrPng } from './qr-fixtures';
 
 const DIST = join(__dirname, '../dist/web/browser');
@@ -284,34 +284,188 @@ test('update: v1 → v2 is offered, never forced; an open vault asks and locks f
   }
 });
 
-test('a failed update download changes nothing: no banner, current version keeps working offline', async ({ browser }, testInfo) => {
+test('update with an ephemeral demo vault: the warning says the vault becomes unreadable; declining keeps it', async ({ browser }, testInfo) => {
+  const s = await site(testInfo.outputPath(), 4325);
+  const ctx = await browser.newContext({ baseURL: s.origin });
+  const page = await ctx.newPage();
+  try {
+    await page.goto('/');
+    await installed(page);
+    deploy(s, (root) => {
+      writeFileSync(join(root, 'index.html'), readFileSync(join(root, 'index.html'), 'utf8').replace('<head>', '<head><meta name="km-e2e" content="v2">'));
+    });
+    await page.reload(); // the worker finds v2; this page still runs v1
+    await page.locator('input[name=mode][value=ephemeral]').check();
+    await page.getByTestId('start-vault').click();
+    await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'ephemeral');
+    await expect(page.getByTestId('update-banner')).toHaveAttribute('data-state', 'ready', { timeout: 30_000 });
+    // Even locked, a reload would lose the in-memory key.
+    await page.getByTestId('lock').click();
+    await page.getByTestId('update-reload').click();
+    await expect(page.locator('#confirm-body')).toHaveText(en['update.confirmBodyEphemeral']);
+    await page.screenshot({ path: testInfo.outputPath('update-ephemeral-warning.png') });
+    await page.locator('dialog[open]').getByRole('button', { name: en['common.cancel'] }).click();
+    await expect(page.locator('meta[name=km-e2e]')).toHaveCount(0);
+    await page.getByTestId('unlock').click();
+    await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'ephemeral');
+  } finally {
+    await ctx.close();
+    await s.stop();
+  }
+});
+
+/** Record the service worker's version events on this page (real events, not debug text). */
+async function recordSwEvents(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const w = window as unknown as { swEvents: string[] };
+    w.swEvents = [];
+    navigator.serviceWorker.addEventListener('message', (ev) => {
+      if (typeof ev.data?.type === 'string') w.swEvents.push(ev.data.type);
+    });
+  });
+}
+const swEvents = (page: Page) => page.evaluate(() => (window as unknown as { swEvents: string[] }).swEvents);
+const count = async (page: Page, type: string) => (await swEvents(page)).filter((t) => t === type).length;
+const swState = (page: Page) => page.evaluate(async () => (await (await fetch('/ngsw/state')).text()).match(/Driver state: (\w+)/)?.[1]);
+
+test('a genuinely failed update: real failure event, degraded warning, bounded retry, online recovery, then offline reopen; ciphertext unchanged', async ({ browser }, testInfo) => {
   const s = await site(testInfo.outputPath(), 4323);
   const ctx = await browser.newContext({ baseURL: s.origin });
   const page = await ctx.newPage();
   try {
-    await start(page, 'synthetic-fixture');
+    await page.goto('/');
     await installed(page);
-    // v2 whose main bundle does not match its manifest hash (a broken deployment).
+    await createPasswordVault(page);
+    const before = await storedBytes(page, 'keymesh-vault');
+    expect(before.length).toBeGreaterThan(0);
+    await recordSwEvents(page);
+
+    // v2 with a NEW main bundle (new expected hash in ngsw.json) ...
     deploy(s, (root) => {
       writeFileSync(join(root, 'index.html'), readFileSync(join(root, 'index.html'), 'utf8').replace('<head>', '<head><meta name="km-e2e" content="v2">'));
+      writeFileSync(join(root, mainJs(root)), readFileSync(join(root, mainJs(root)), 'utf8') + '\n;window.__kmVersion=2;\n');
     });
-    writeFileSync(join(s.root, mainJs(s.root)), readFileSync(join(s.root, mainJs(s.root)), 'utf8') + '\n;/* corrupted after hashing */\n');
-    await page.reload();
-    // The worker tried and rejected v2 (its own debug page says so).
-    await expect
-      .poll(() => page.evaluate(async () => (await (await fetch('/ngsw/state')).text())), { timeout: 30_000 })
-      .toMatch(/Last update check: (?!never)/);
-    await expect(page.getByTestId('update-banner')).toHaveCount(0);
-    await expect(page.locator('meta[name=km-e2e]')).toHaveCount(0);
-    await page.getByRole('button', { name: en['start.stored.open'] }).click();
-    await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'synthetic-fixture');
-    // v1 is still complete offline.
+    const goodMain = readFileSync(join(s.root, mainJs(s.root)));
+    // ... whose served main is then damaged: the download cannot match its hash.
+    writeFileSync(join(s.root, mainJs(s.root)), Buffer.concat([goodMain, Buffer.from('\n/* damaged after hashing */\n')]));
+
+    const other = await ctx.newPage();
+    await other.goto('/'); // a navigation makes the worker check for updates
+    await other.close();
+    await expect.poll(() => count(page, 'VERSION_INSTALLATION_FAILED'), { timeout: 30_000 }).toBe(1);
+    expect(await count(page, 'VERSION_READY')).toBe(0);
+    expect(await swState(page)).toBe('EXISTING_CLIENTS_ONLY');
+    await expect(page.getByTestId('update-banner')).toHaveAttribute('data-state', 'failed');
+    await expect(page.getByTestId('update-banner')).toContainText(en['update.failed']);
+    await page.screenshot({ path: testInfo.outputPath('update-failed.png') });
+    expect((await storedBytes(page, 'keymesh-vault')).equals(before)).toBe(true);
+
+    // A retry while the server is still broken fails again (bounded, reported).
+    await page.getByTestId('update-retry').click();
+    await expect.poll(() => count(page, 'VERSION_INSTALLATION_FAILED'), { timeout: 30_000 }).toBe(2);
+    await expect(page.getByTestId('update-banner')).toHaveAttribute('data-state', 'failed');
+
+    // Degraded and offline: an avoidable reload is warned about first.
+    await ctx.setOffline(true);
+    const dialog = page.waitForEvent('dialog');
+    void page.evaluate(() => location.reload());
+    const d = await dialog;
+    expect(d.type()).toBe('beforeunload');
+    await d.dismiss();
+    await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected'); // same page, still open
+
+    // The deployment is fixed; coming back online retries once by itself.
+    writeFileSync(join(s.root, mainJs(s.root)), goodMain);
+    await ctx.setOffline(false);
+    await expect.poll(() => count(page, 'VERSION_READY'), { timeout: 30_000 }).toBe(1);
+    expect(await swState(page)).toBe('NORMAL');
+    await expect(page.getByTestId('update-banner')).toHaveAttribute('data-state', 'ready');
+
+    // Confirmed reload (vault open: ask, lock) into v2 as a whole.
+    await page.getByTestId('update-reload').click();
+    await Promise.all([page.waitForEvent('load'), page.getByTestId('confirm-accept').click()]);
+    await expect(page.locator('meta[name=km-e2e]')).toHaveAttribute('content', 'v2');
+    expect(await page.evaluate(() => (window as { __kmVersion?: number }).__kmVersion)).toBe(2);
+
+    // After recovery the app reopens offline again and unlocks; bytes unchanged.
+    await s.stop();
+    await ctx.setOffline(true);
+    const doc = await page.reload();
+    expect(doc?.status()).toBe(200);
+    await unlock(page);
+    expect((await storedBytes(page, 'keymesh-vault')).equals(before)).toBe(true);
+  } finally {
+    await ctx.close();
+    await s.stop();
+  }
+});
+
+test('damaged cached app file (core WASM bytes): start fails, Reload alone cannot fix it; confirmed online repair restores the app; vault and settings byte-identical', async ({ browser }, testInfo) => {
+  const s = await site(testInfo.outputPath(), 4326);
+  const ctx = await browser.newContext({ baseURL: s.origin });
+  const page = await ctx.newPage();
+  const wasmBytes = readFileSync(join(s.root, 'wasm', 'keymesh_wasm_bg.wasm'));
+  try {
+    await page.goto('/');
+    await installed(page);
+    await createPasswordVault(page);
+    await page.locator('[data-theme-option="dark"]').click();
     await page.getByTestId('lock').click();
+    const before = await storedBytes(page, 'keymesh-vault');
+    const prefs = await page.evaluate(() => JSON.stringify(Object.entries(localStorage)));
+    expect(prefs).toContain('dark');
+
+    // Damage the cached core WASM response body (same URL and MIME type).
+    const damaged = await page.evaluate(async () => {
+      let n = 0;
+      for (const k of await caches.keys()) {
+        if (!k.endsWith(':assets:app:cache')) continue;
+        const c = await caches.open(k);
+        if (!(await c.match('/wasm/keymesh_wasm_bg.wasm'))) continue;
+        await c.put('/wasm/keymesh_wasm_bg.wasm', new Response(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 255, 255]), { headers: { 'content-type': 'application/wasm' } }));
+        n++;
+      }
+      return n;
+    });
+    expect(damaged).toBe(1);
+    const cacheNames = () => page.evaluate(async () => (await caches.keys()).sort());
+    const cachesBefore = await cacheNames();
+
+    // Offline: cannot start, and cannot be repaired; nothing is changed.
     await s.stop();
     await ctx.setOffline(true);
     await page.reload();
-    await page.getByRole('button', { name: en['start.stored.open'] }).click();
-    await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'synthetic-fixture');
+    await expect(page.getByRole('heading', { name: en['app.failedTitle'] })).toBeVisible();
+    await page.getByTestId('repair-app').click();
+    await expect(page.locator('#confirm-body')).toHaveText(en['repair.confirmBody']);
+    await page.getByTestId('confirm-accept').click();
+    await expect(page.getByTestId('repair-status')).toHaveText(en['repair.offline']);
+    await page.screenshot({ path: testInfo.outputPath('repair-offline.png') });
+    expect(await cacheNames()).toEqual(cachesBefore);
+
+    // Online again: the ordinary Reload still serves the damaged cached file.
+    await s.restart();
+    await ctx.setOffline(false);
+    await page.getByRole('button', { name: en['app.reloadPage'] }).click();
+    await expect(page.getByRole('heading', { name: en['app.failedTitle'] })).toBeVisible();
+    // Declining the repair changes nothing.
+    await page.getByTestId('repair-app').click();
+    await page.locator('dialog[open]').getByRole('button', { name: en['common.cancel'] }).click();
+    expect(await cacheNames()).toEqual(cachesBefore);
+    await page.screenshot({ path: testInfo.outputPath('repair-offered.png') });
+
+    // Confirmed repair: only this app's own caches and worker are replaced.
+    await Promise.all([page.waitForEvent('load'), page.getByTestId('repair-app').click().then(() => page.getByTestId('confirm-accept').click())]);
+    await unlock(page);
+    expect((await storedBytes(page, 'keymesh-vault')).equals(before)).toBe(true);
+    expect(await page.evaluate(() => JSON.stringify(Object.entries(localStorage)))).toBe(prefs);
+    // Fresh, verified files are cached again (the core WASM matches the server).
+    await installed(page);
+    const cached = await page.evaluate(async () => {
+      const r = await caches.match('/wasm/keymesh_wasm_bg.wasm');
+      return r ? Array.from(new Uint8Array(await r.arrayBuffer()).slice(0, 64)) : null;
+    });
+    expect(Buffer.from(cached!).equals(wasmBytes.subarray(0, 64))).toBe(true);
   } finally {
     await ctx.close();
     await s.stop();

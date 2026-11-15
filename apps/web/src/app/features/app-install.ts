@@ -1,21 +1,33 @@
-import { Component, DestroyRef, inject, signal } from '@angular/core';
+import { Component, DestroyRef, computed, inject, signal } from '@angular/core';
 import { AppUpdate } from '../core/app-update';
-import { I18n } from '../core/i18n/i18n.service';
+import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { Icon } from '../shared/icon';
 
-/** Update notice: shown when a new version is ready, or the running one is broken. */
+/**
+ * Update notice: a new version is ready, the running one is broken, or an
+ * update failed to install (degraded: this tab works, but reopening while
+ * offline does not until a retry succeeds).
+ */
 @Component({
   selector: 'km-update-banner',
   imports: [Icon],
   template: `
-    @if (update.broken() || update.ready()) {
-      <div class="update-strip" role="status" data-testid="update-banner"
-        [attr.data-state]="update.broken() ? 'broken' : 'ready'">
-        <km-icon [name]="update.broken() ? 'alert' : 'refresh'" />
-        <p>{{ i18n.t(update.broken() ? 'update.broken' : 'update.ready') }}</p>
-        <button type="button" class="btn btn-sm btn-primary" data-testid="update-reload" (click)="update.apply()">
-          {{ i18n.t('update.reloadNow') }}
-        </button>
+    @if (state(); as st) {
+      <div class="update-strip" role="status" data-testid="update-banner" [attr.data-state]="st">
+        <km-icon [name]="st === 'ready' ? 'refresh' : 'alert'" />
+        <p>{{ i18n.t(message()) }}</p>
+        @if (st === 'failed') {
+          @if (update.canRetry || update.retrying()) {
+            <button type="button" class="btn btn-sm btn-primary" data-testid="update-retry"
+              [disabled]="update.retrying()" (click)="update.retry()">
+              {{ i18n.t(update.retrying() ? 'update.retrying' : 'update.retry') }}
+            </button>
+          }
+        } @else {
+          <button type="button" class="btn btn-sm btn-primary" data-testid="update-reload" (click)="update.apply()">
+            {{ i18n.t('update.reloadNow') }}
+          </button>
+        }
       </div>
     }
   `,
@@ -23,6 +35,19 @@ import { Icon } from '../shared/icon';
 export class UpdateBanner {
   protected readonly update = inject(AppUpdate);
   protected readonly i18n = inject(I18n);
+  protected readonly state = computed(() =>
+    this.update.broken() ? 'broken' : this.update.ready() ? 'ready' : this.update.failed() ? 'failed' : null,
+  );
+  protected readonly message = computed<MessageKey>(() => {
+    switch (this.state()) {
+      case 'broken':
+        return 'update.broken';
+      case 'failed':
+        return this.update.canRetry || this.update.retrying() ? 'update.failed' : 'update.failedLimit';
+      default:
+        return 'update.ready';
+    }
+  });
 }
 
 /** The browser's install event (Chromium only; not in TypeScript's DOM lib). */

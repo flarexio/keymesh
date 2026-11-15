@@ -18,7 +18,7 @@
 
 ## M5 checklist (versioned)
 
-**v1, 2026-11-15**, on branch `feature/m5-pwa-product-features`. The exact commit is listed in the draft PR.
+**v2, 2026-11-15** (after Phase A review fixes), on branch `feature/m5-pwa-product-features`. The exact commit is listed in the draft PR.
 * **States:** *implemented* · *tested* (automated, Chromium on the Pi) · *deployed* (private `keymesh.cloud` image) · *blocked*.
 * **Not covered by "tested":** real phones, Safari and Firefox; iOS install; and real camera hardware. Those need human device checks.
 
@@ -26,11 +26,11 @@
 |---|---|---|---|---|---|
 | A | PWA: manifest, icons (incl. maskable), install button/hint | yes | yes | no | Chromium only. The `beforeinstallprompt` flow and the iOS hint were not verified on real devices |
 | A | Offline reopen and unlock after one online visit | yes | yes | no | Tested with the server stopped. A cold first visit offline is not supported |
-| A | Updates offered, never forced; lock before reload | yes | yes | no | Covers v1→v2, failed download and the unrecoverable chunk state |
+| A | Updates offered, never forced; lock before reload | yes | yes | no | Covers v1→v2, the ephemeral-vault warning and the unrecoverable chunk state. A genuinely failed install degrades offline reopening until a bounded retry succeeds (tested). Damaged cached files: online repair (tested) |
 | A | TOTP from QR: image upload and paste | yes | yes | no | zxing-wasm in a worker, self-hosted. Header bounds checked before decoding |
 | A | TOTP from QR: live camera | yes | Chromium fake camera | no | Real camera hardware is untested |
 | A | Circular TOTP countdown (last 5 s warning) | yes | yes | no | Fixed-clock unit and E2E tests; reduced motion |
-| A | Local login icons (brand, private host, category, letter) | yes | yes | no | 82 reviewed Simple Icons (CC0). No network |
+| A | Local login icons (brand, private host, category, letter) | yes | yes | no | 81 reviewed Simple Icons: no per-icon licence (Rust, CC-BY-SA-4.0, removed); explicit domain aliases. No network. Not a security indicator |
 | B | Ed25519 Base58 public key, sign and verify | no | no | no | |
 | B | DEK rotation | no | no | no | Needs a format/core review and vectors before deployment |
 | B | Passphrase wordlist and emergency kit | no | no | no | |
@@ -128,7 +128,10 @@
   * The signed bytes are shown before signing.
 
 ### 6. Login item icons — step 1 implemented (M5 phase A); step 2 is phase C
-* **Implemented:** `core/login-icon.ts`, `core/brand-icons.ts` (82 reviewed Simple Icons, CC0, as a lazy chunk) and `shared/item-icon.ts`. Tests: `core/login-icon.spec.ts`, `e2e/login-icons.spec.ts` (no request leaves the origin).
+* **Implemented:** `core/login-icon.ts`, `core/brand-icons.ts` and `shared/item-icon.ts`.
+  * **Icon set:** 81 reviewed Simple Icons in a lazy chunk. The package is CC0, and the generator refuses any icon with its own licence (Rust, CC-BY-SA-4.0, was removed). Each icon's source and guidelines are recorded.
+  * **Matching:** explicit domain aliases only, never name guessing.
+  * **Icons are not a security or origin indicator.** Tests: `core/login-icon.spec.ts`, `e2e/login-icons.spec.ts` (no request leaves the origin).
 **Latest direction (2026-11-14). It supersedes the earlier GPT-API idea and the idea of a separate service.**
 1. **Deterministic local matching:**
    * a bundled brand-icon set (e.g. a CC0 Simple Icons subset) keyed by registrable domain;
