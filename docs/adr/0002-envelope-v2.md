@@ -16,7 +16,7 @@
 * Accounts, sign-in, sync and remote identity.
 * Wallet-derived keys, passkeys/PRF and device slots (ADR 0001 stages 2–4).
 * Key escrow and support resets.
-* Compromise rotation of the data key (§8).
+* Rotation to other slot kinds (§8 covers password and recovery only).
 * Migration of demo data (§10).
 
 ## 2. Standards and libraries (checked 2026-11-02)
@@ -197,7 +197,33 @@ Changing a password or recovery code is a **rewrap, not a rotation**:
 * Data that was already read stays read.
 * The UI and CLI say this. A recovery-code reset leaves the recovery code unchanged.
 
-**Compromise rotation is deferred.** That means a new DEK, every item re-encrypted, and every surviving slot re-established. `Vault::rotate_data_key` refuses v2 vaults, and nothing advertises revocation.
+**Compromise rotation (M5 B, implemented; independent review pending).**
+* **Format:** no change. The result is an ordinary v2 file under this ADR's format.
+* **Authority:** the current password or the recovery code. The core then generates:
+  * a fresh DEK, which must differ from the old one;
+  * a new password slot, from fresh core-issued parameters;
+  * a new recovery code and its slot.
+* **Binding:** the pending rotation is bound to the vault id **and** to the SHA-256 digest of the exact slots the authority was checked against. It can only finish on that credential state.
+* **Confirmation:** the new code must be typed back before anything is sealed.
+* **Result:** `finish_rotation` returns a new `Vault` value with the same id, items, revision and snapshot digest, so the existing compare-and-swap guards apply to the save. Sealing re-encrypts every item and the manifest with fresh nonces. The vault it came from is unchanged until the caller replaces it after a successful write.
+* **Pending recovery codes:** one made before the rotation is refused afterwards, because it wraps the old DEK.
+* **Same password:** the CLI and browser refuse a new password equal (NFC) to the current one.
+* **Not revoked:**
+  * Backups made before the rotation still open with the old password and code.
+  * Copies an attacker already holds, and plaintext already read, cannot be revoked.
+  * The UI and CLI say this, and suggest changing stored service credentials.
+* **Extension point:** only password and recovery slots exist. A later slot kind (PRF, device) must be re-established from a re-authenticated capability or explicitly revoked during rotation. Unknown slot kinds still fail closed in the parser.
+* **Browser persistence:** one exact-byte compare-and-swap that **requests** `durability: "strict"`. That is a hint: browsers without the option ignore it, and no browser reports a durability failure after `complete`, so nothing stronger is claimed. Other writes keep the default.
+* **Settling:** the store's write promise settles only after its transaction completed or aborted, or before any `put` was issued; an IndexedDB `error` event is recorded, not treated as the end.
+* **Read-back after a failed write:** the stored record is compared byte for byte:
+  * the new bytes: committed;
+  * the old bytes: not committed, rolled back;
+  * other bytes: another writer (conflict, the tab goes stale);
+  * the read fails: unknown, so the vault is **locked** and the user unlocks with whichever credential works. Nothing is rolled back or reinstalled on a guess.
+* **Locked while writing:** a lock always wins. If the write had landed, the user is told the new credentials are required, and no session is reinstalled.
+* **Native:** unchanged §9 semantics; `DurabilityUncertain` → exit 3.
+* **Vectors:** `tests/fixtures/v2/rotation.json` is checked natively and with Node/OpenSSL.
+* **Demo vaults:** `Vault::rotate_data_key` still applies only to v1 demo vaults, and never relabels one.
 
 ## 9. Persistence and concurrency
 

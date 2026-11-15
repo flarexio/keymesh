@@ -24,8 +24,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use keymesh::crypto::SyntheticDemoKeyProvider;
 use keymesh::ed25519::Ed25519KeyPair;
 use keymesh::generate::{
-    generate_passphrase, generate_password, generate_secret, PasswordPolicy, PasswordProfile,
-    SecretEncoding,
+    generate_password, generate_secret, PasswordPolicy, PasswordProfile, SecretEncoding,
 };
 use keymesh::import::op::{plan, ConflictPolicy, OpTarget};
 use keymesh::import::process::ProcessOpRunner;
@@ -35,6 +34,7 @@ use keymesh::model::{
     Contact, CryptoWalletRecord, Ed25519KeyRecord, Item, ItemData, ItemId, LabeledValue, Login,
     SecretCredential, SecretFormat, SecretOrigin, SecureNote, TotpRecord,
 };
+use keymesh::passphrase::{generate_passphrase, PassphraseOptions, Separator};
 use keymesh::recovery::RecoveryCode;
 use keymesh::rng::OsRandom;
 use keymesh::secret::SecretString;
@@ -91,6 +91,11 @@ enum Cmd {
     /// Replace the recovery code (needs the current password). Older backups
     /// keep the old code.
     NewRecoveryCode,
+    /// Compromise rotation: a new data key, every item re-encrypted, a new
+    /// master password and a new recovery code (both required). Backups made
+    /// before stay readable with the OLD password and code; copies cannot be
+    /// revoked.
+    RotateKey,
     /// Open a backup with its recovery code, set a new password and write it
     /// to --vault (refuses to overwrite without --force).
     Recover {
@@ -258,8 +263,20 @@ enum GenCmd {
         #[arg(long, value_enum, default_value_t = Enc::Hex)]
         encoding: Enc,
     },
-    /// Pending: no reviewed wordlist bundled.
-    Passphrase,
+    /// Passphrase from the EFF Long Wordlist (≈ 12.9 bits per word).
+    Passphrase {
+        /// Number of words (4–12).
+        #[arg(long, default_value_t = keymesh::passphrase::DEFAULT_WORDS)]
+        words: usize,
+        #[arg(long, value_enum, default_value_t = Sep::Space)]
+        separator: Sep,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Sep {
+    Space,
+    Period,
 }
 
 #[derive(Args)]
@@ -581,6 +598,45 @@ fn run(cli: Cli) -> R<()> {
             println!("recovery code replaced");
             println!("Backups made before this change still open with the old recovery code.");
         }
+        Cmd::RotateKey => {
+            let path = vault_path(&cli)?;
+            let bytes = storage::read_envelope(&path)?;
+            if read_header(&bytes)?.version == 1 {
+                return Err(usage("demo vaults are not rotated; they protect nothing"));
+            }
+            eprintln!("{EXPERIMENTAL}");
+            let req = password_request(&bytes)?;
+            let pw = read_credential(&cli, "Current master password: ")?;
+            let key = req.setup.derive(&pw)?;
+            let v = Vault::open_with_password_key(&bytes, &key)?;
+            eprintln!(
+                "Rotation replaces the data key, re-encrypts every item and needs a NEW password and recovery code."
+            );
+            let new_pw = read_new_password(&cli)?;
+            if *keymesh::kdf::normalize_password(&new_pw)?
+                == *keymesh::kdf::normalize_password(&pw)?
+            {
+                return Err(usage(
+                    "choose a different password: rotation replaces both credentials",
+                ));
+            }
+            let setup = PasswordSetup::generate(&mut OsRandom)?;
+            let new_key = setup.derive(&new_pw)?;
+            let pending = v.begin_rotation(
+                Authority::PasswordKey(&key),
+                &setup,
+                &new_key,
+                &mut OsRandom,
+            )?;
+            let code = RecoveryCode::parse(&pending.code().to_text())?;
+            let back = show_and_confirm_code(&cli, &code)?;
+            let mut rotated = v.finish_rotation(&pending, &back)?;
+            storage::save_protected(&path, &mut rotated, &mut OsRandom)?;
+            println!("data key rotated; every item was re-encrypted");
+            println!("Use the new password and recovery code from now on.");
+            println!("Backups made before still open with the OLD password and code; delete them if they may be exposed.");
+            println!("Stored website and service credentials may need changing too if they were exposed.");
+        }
         Cmd::Recover { from, force } => {
             let dest = vault_path(&cli)?;
             if dest.exists() && !force {
@@ -681,7 +737,27 @@ fn run(cli: Cli) -> R<()> {
                 GenCmd::Secret { bytes, encoding } => {
                     generate_secret(*bytes, (*encoding).into(), &mut OsRandom)?
                 }
-                GenCmd::Passphrase => generate_passphrase()?,
+                GenCmd::Passphrase { words, separator } => {
+                    let opts = PassphraseOptions {
+                        words: *words,
+                        separator: match separator {
+                            Sep::Space => Separator::Space,
+                            Sep::Period => Separator::Period,
+                        },
+                    };
+                    let s = opts.summary()?;
+                    eprintln!(
+                        "keymesh: {} words from the EFF Long Wordlist, {:.1} bits{}",
+                        s.words,
+                        s.entropy_bits,
+                        if s.master_ok {
+                            ""
+                        } else {
+                            " (too few words for a master password)"
+                        }
+                    );
+                    generate_passphrase(&opts, &mut OsRandom)?
+                }
             };
             println!("{}", s.expose());
         }

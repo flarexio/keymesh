@@ -128,40 +128,66 @@ function decodeCode(t) {
 }
 
 // Envelope: unwrap each slot independently, then open the manifest.
-const e = v.envelope;
-const file = JSON.parse(e.json);
-check('envelope header', file.format === 'keymesh.vault' && file.version === 2 && file.vault_id === e.vault_id);
-const canon = (k) =>
-  k.alg === 'argon2id'
-    ? fields('argon2id', u32(k.v), u32(k.m_kib), u32(k.t), u32(k.p), b64u(k.salt))
-    : fields('hkdf-sha256', b64u(k.salt));
-const slotAad = (s) => fields('keymesh.vault', '2', 'slot', file.aead, file.vault_id, s.id, s.kind, canon(s.kdf));
-const pw = file.slots.find((s) => s.kind === 'password');
-const rc = file.slots.find((s) => s.kind === 'recovery');
-const pwIkm = argon(e.password, b64u(pw.kdf.salt), pw.kdf.m_kib, pw.kdf.t, pw.kdf.p);
-const dekA = xopen(kek(pwIkm, null, 'password', file.vault_id, pw.id), b64u(pw.wrapped.nonce), b64u(pw.wrapped.ct), slotAad(pw));
-const dekB = xopen(
-  kek(decodeCode(e.recovery_code), b64u(rc.kdf.salt), 'recovery', file.vault_id, rc.id),
-  b64u(rc.wrapped.nonce),
-  b64u(rc.wrapped.ct),
-  slotAad(rc),
-);
-check('both slots unwrap the same 32-byte DEK', dekA.length === 32 && dekA.equals(dekB));
+function openEnvelope(name, e) {
+  const file = JSON.parse(e.json);
+  check(`${name}: header`, file.format === 'keymesh.vault' && file.version === 2 && file.vault_id === e.vault_id);
+  const canon = (k) =>
+    k.alg === 'argon2id'
+      ? fields('argon2id', u32(k.v), u32(k.m_kib), u32(k.t), u32(k.p), b64u(k.salt))
+      : fields('hkdf-sha256', b64u(k.salt));
+  const slotAad = (s) => fields('keymesh.vault', '2', 'slot', file.aead, file.vault_id, s.id, s.kind, canon(s.kdf));
+  const pw = file.slots.find((s) => s.kind === 'password');
+  const rc = file.slots.find((s) => s.kind === 'recovery');
+  const unwrapPw = (password) =>
+    xopen(
+      kek(argon(password, b64u(pw.kdf.salt), pw.kdf.m_kib, pw.kdf.t, pw.kdf.p), null, 'password', file.vault_id, pw.id),
+      b64u(pw.wrapped.nonce),
+      b64u(pw.wrapped.ct),
+      slotAad(pw),
+    );
+  const unwrapRc = (code) =>
+    xopen(kek(decodeCode(code), b64u(rc.kdf.salt), 'recovery', file.vault_id, rc.id), b64u(rc.wrapped.nonce), b64u(rc.wrapped.ct), slotAad(rc));
+  const dekA = unwrapPw(e.password);
+  const dekB = unwrapRc(e.recovery_code);
+  check(`${name}: both slots unwrap the same 32-byte DEK`, dekA.length === 32 && dekA.equals(dekB));
 
-const digest = createHash('sha256').update(u32(file.slots.length));
-for (const s of file.slots) {
-  digest.update(fields(s.id, s.kind, canon(s.kdf), b64u(s.wrapped.nonce), b64u(s.wrapped.ct)));
+  const digest = createHash('sha256').update(u32(file.slots.length));
+  for (const s of file.slots) {
+    digest.update(fields(s.id, s.kind, canon(s.kdf), b64u(s.wrapped.nonce), b64u(s.wrapped.ct)));
+  }
+  const maad = fields('keymesh.vault', '2', 'manifest', file.aead, file.vault_id, u64(file.revision), digest.digest());
+  const manifest = JSON.parse(xopen(dekA, b64u(file.manifest.nonce), b64u(file.manifest.ct), maad));
+  check(`${name}: manifest opens and matches header`, manifest.vault_id === file.vault_id && manifest.revision === file.revision);
+  const titles = file.items
+    .map((it) => {
+      const aad = fields('keymesh.vault', '2', 'item', file.aead, file.vault_id, it.id, u64(it.rev));
+      return JSON.parse(xopen(dekA, b64u(it.sealed.nonce), b64u(it.sealed.ct), aad)).title;
+    })
+    .sort();
+  check(`${name}: items decrypt to the expected titles`, JSON.stringify(titles) === JSON.stringify(e.titles));
+  const fails = (f) => {
+    try {
+      f();
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  return { file, dek: dekA, pw, slotAad, unwrapPw, unwrapRc, fails };
 }
-const maad = fields('keymesh.vault', '2', 'manifest', file.aead, file.vault_id, u64(file.revision), digest.digest());
-const manifest = JSON.parse(xopen(dekA, b64u(file.manifest.nonce), b64u(file.manifest.ct), maad));
-check('manifest opens and matches header', manifest.vault_id === file.vault_id && manifest.revision === file.revision);
-const titles = file.items
-  .map((it) => {
-    const aad = fields('keymesh.vault', '2', 'item', file.aead, file.vault_id, it.id, u64(it.rev));
-    return JSON.parse(xopen(dekA, b64u(it.sealed.nonce), b64u(it.sealed.ct), aad)).title;
-  })
-  .sort();
-check('items decrypt to the expected titles', JSON.stringify(titles) === JSON.stringify(e.titles));
+
+const e = v.envelope;
+const before = openEnvelope('envelope', e);
+const { file, pw, slotAad } = before;
+
+// Rotation vector: same vault, new DEK and slots; credentials do not cross.
+const rot = JSON.parse(readFileSync(new URL('../tests/fixtures/v2/rotation.json', import.meta.url), 'utf8'));
+const after = openEnvelope('rotated envelope', rot.after);
+check('rotation keeps the vault id and advances the revision', after.file.vault_id === file.vault_id && after.file.revision === file.revision + 1);
+check('rotation uses a different DEK', !after.dek.equals(before.dek));
+check('old password does not open the rotated slot', after.fails(() => after.unwrapPw(e.password)));
+check('old recovery code does not open the rotated slot', after.fails(() => after.unwrapRc(e.recovery_code)));
+check('new recovery code does not open the old slot', before.fails(() => before.unwrapRc(rot.after.recovery_code)));
 
 let wrongRejected = false;
 try {

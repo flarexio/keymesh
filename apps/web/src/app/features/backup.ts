@@ -5,6 +5,7 @@ import { VaultService } from '../core/vault.service';
 import { Icon } from '../shared/icon';
 import { RecoveryConfirm } from '../shared/recovery-confirm';
 import { SecretInput } from '../shared/secret-input';
+import { PassphraseSuggest } from '../shared/passphrase-suggest';
 import { ProtectedRestore } from './protected-restore';
 
 /**
@@ -16,7 +17,7 @@ import { ProtectedRestore } from './protected-restore';
  */
 @Component({
   selector: 'km-backup',
-  imports: [Icon, RecoveryConfirm, SecretInput, ProtectedRestore],
+  imports: [Icon, RecoveryConfirm, SecretInput, ProtectedRestore, PassphraseSuggest],
   template: `
     <div class="page">
       <header class="page-head">
@@ -63,6 +64,7 @@ import { ProtectedRestore } from './protected-restore';
               <km-secret-input label="protected.newPassword" name="newPassword" autocomplete="new-password" testid="change-new"
                 hint="protected.passwordHint" [(value)]="next" />
               <km-secret-input label="protected.passwordConfirm" name="newPasswordConfirm" autocomplete="new-password" testid="change-confirm" [(value)]="again" />
+              <km-passphrase-suggest (chosen)="next.set($event); again.set($event)" />
               <div class="form-actions">
                 <button type="submit" class="btn btn-primary" data-testid="change-password" [disabled]="busy()">
                   <km-icon name="key" /><span>{{ i18n.t(busy() ? 'protected.working' : 'security.change.button') }}</span>
@@ -73,7 +75,7 @@ import { ProtectedRestore } from './protected-restore';
           <section class="card tool-card" aria-labelledby="new-recovery">
             <h3 id="new-recovery" class="card-title"><km-icon name="shield" />{{ i18n.t('security.recovery.title') }}</h3>
             @if (newCode(); as code) {
-              <km-recovery-confirm [code]="code" lead="security.recovery.body" confirmLabel="security.recovery.button" [busy]="busy()"
+              <km-recovery-confirm [code]="code" [vaultId]="vault.protectedStored()?.vault_id ?? null" lead="security.recovery.body" confirmLabel="security.recovery.button" [busy]="busy()"
                 (confirmed)="finishRecovery($event)" (cancelled)="cancelRecovery()" />
             } @else {
               <p>{{ i18n.t('security.recovery.body') }}</p>
@@ -89,6 +91,32 @@ import { ProtectedRestore } from './protected-restore';
           </section>
         </div>
         <div class="callout callout-warn" role="note" data-testid="rotation-note"><km-icon name="info" /><p>{{ i18n.t('security.rotation') }}</p></div>
+        <section class="card tool-card" aria-labelledby="rotate-title" data-testid="rotate-section">
+          <h3 id="rotate-title" class="card-title"><km-icon name="refresh" />{{ i18n.t('security.rotate.title') }}</h3>
+          @if (rotateCode(); as code) {
+            <km-recovery-confirm [code]="code" [vaultId]="vault.protectedStored()?.vault_id ?? null" lead="security.rotate.codeLead" confirmLabel="security.rotate.finish" [busy]="busy()"
+              (confirmed)="finishRotation($event)" (cancelled)="cancelRotation()" />
+          } @else {
+            <p>{{ i18n.t('security.rotate.body') }}</p>
+            <ul class="hint-list">
+              <li>{{ i18n.t('security.rotate.backups') }}</li>
+              <li>{{ i18n.t('security.rotate.copies') }}</li>
+              <li>{{ i18n.t('security.rotate.services') }}</li>
+            </ul>
+            <form class="form-stack" (submit)="beginRotation($event)">
+              <km-secret-input label="security.current" name="rotateCurrent" autocomplete="current-password" testid="rotate-current" [(value)]="rotCurrent" />
+              <km-secret-input label="protected.newPassword" name="rotateNew" autocomplete="new-password" testid="rotate-new"
+                hint="security.rotate.newHint" [(value)]="rotNext" />
+              <km-secret-input label="protected.passwordConfirm" name="rotateConfirm" autocomplete="new-password" testid="rotate-confirm" [(value)]="rotAgain" />
+              <km-passphrase-suggest (chosen)="rotNext.set($event); rotAgain.set($event)" />
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary" data-testid="begin-rotation" [disabled]="busy()">
+                  <km-icon name="refresh" /><span>{{ i18n.t(busy() ? 'protected.working' : 'security.rotate.button') }}</span>
+                </button>
+              </div>
+            </form>
+          }
+        </section>
       }
       @if (message(); as m) {
         <div class="callout callout-success" role="status" data-testid="backup-status"><km-icon name="check" /><p>{{ i18n.t(m) }}</p></div>
@@ -151,6 +179,10 @@ export class Backup implements OnDestroy {
   protected readonly again = signal('');
   protected readonly recoveryCurrent = signal('');
   protected readonly newCode = signal<string | null>(null);
+  protected readonly rotCurrent = signal('');
+  protected readonly rotNext = signal('');
+  protected readonly rotAgain = signal('');
+  protected readonly rotateCode = signal<string | null>(null);
   private readonly working = signal(false);
   protected readonly busy = computed(() => this.working() || this.vault.credentialBusy());
 
@@ -210,7 +242,48 @@ export class Backup implements OnDestroy {
     this.newCode.set(null);
   }
 
+  protected beginRotation(ev: Event): void {
+    ev.preventDefault();
+    try {
+      this.vault.checkNewPassword(this.rotNext());
+    } catch (e) {
+      this.error.set(errorKey(e));
+      return;
+    }
+    if (this.rotNext() !== this.rotAgain()) {
+      this.error.set('protected.mismatch');
+      return;
+    }
+    void this.act(async () => {
+      const code = await this.vault.beginRotation(this.rotCurrent(), this.rotNext());
+      this.rotCurrent.set('');
+      this.rotNext.set('');
+      this.rotAgain.set('');
+      this.rotateCode.set(code);
+    });
+  }
+
+  protected finishRotation(code: string): void {
+    void this.act(async () => {
+      try {
+        await this.vault.finishRotation(code);
+      } catch (e) {
+        // A mistyped code keeps the rotation pending; anything else ends it.
+        if (errorKey(e) !== 'errors.recoveryMismatch' && errorKey(e) !== 'errors.recoveryInvalid') this.rotateCode.set(null);
+        throw e;
+      }
+      this.rotateCode.set(null);
+      this.message.set('security.rotate.done');
+    });
+  }
+
+  protected cancelRotation(): void {
+    this.vault.cancelRotation();
+    this.rotateCode.set(null);
+  }
+
   ngOnDestroy(): void {
     if (this.newCode()) this.vault.cancelRecoveryChange();
+    if (this.rotateCode()) this.vault.cancelRotation();
   }
 }

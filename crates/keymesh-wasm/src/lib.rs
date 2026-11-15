@@ -235,6 +235,31 @@ impl VaultSession {
         self.inner.finish_recovery_change(code).map_err(err)
     }
 
+    /// Data-key rotation: authority is the current password's key; `new_key`
+    /// is derived for `beginPasswordChange`'s request. The new recovery code
+    /// is then shown by `shownRecoveryCode`.
+    #[wasm_bindgen(js_name = beginRotation)]
+    pub fn begin_rotation(&mut self, current_key: &[u8], new_key: &[u8]) -> Result<(), JsError> {
+        self.inner.begin_rotation(current_key, new_key).map_err(err)
+    }
+
+    /// The new code typed back: switch to the rotated vault (then seal,
+    /// store with CAS and commit, or `rollback`).
+    #[wasm_bindgen(js_name = finishRotation)]
+    pub fn finish_rotation(&mut self, code: &str) -> Result<(), JsError> {
+        self.inner.finish_rotation(code).map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = cancelRotation)]
+    pub fn cancel_rotation(&mut self) {
+        self.inner.cancel_rotation();
+    }
+
+    #[wasm_bindgen(js_name = rotationPending)]
+    pub fn rotation_pending(&self) -> bool {
+        self.inner.rotation_pending()
+    }
+
     #[wasm_bindgen(js_name = cancelRecoveryChange)]
     pub fn cancel_recovery_change(&mut self) {
         self.inner.cancel_recovery_change();
@@ -336,6 +361,18 @@ impl VaultSession {
         self.inner.generate_ed25519(title, comment).map_err(err)
     }
 
+    /// Sign the exact bytes of `message` (`encoding`: "utf8" | "hex") with
+    /// Ed25519 item `id`; JSON `{hex, base58, message_bytes}`.
+    #[wasm_bindgen(js_name = signEd25519)]
+    pub fn sign_ed25519(&self, id: &str, message: &str, encoding: &str) -> Result<String, JsError> {
+        json(
+            &self
+                .inner
+                .sign_ed25519(id, message, encoding)
+                .map_err(err)?,
+        )
+    }
+
     #[wasm_bindgen(js_name = generateSecretItem)]
     pub fn generate_secret_item(
         &mut self,
@@ -381,6 +418,18 @@ impl VaultSession {
         Ok(self
             .inner
             .preview_password(options)
+            .map_err(err)?
+            .as_str()
+            .to_owned())
+    }
+
+    /// Generate a passphrase (JSON `{words, separator}`) and keep it as the
+    /// current preview; save with `savePreview("passphrase", …)`.
+    #[wasm_bindgen(js_name = previewPassphrase)]
+    pub fn preview_passphrase(&mut self, options: &str) -> Result<String, JsError> {
+        Ok(self
+            .inner
+            .preview_passphrase(options)
             .map_err(err)?
             .as_str()
             .to_owned())
@@ -494,6 +543,41 @@ pub fn generate_random_secret(n_bytes: u32, encoding: &str) -> Result<String, Js
         .map_err(err)?
         .expose()
         .to_owned())
+}
+
+/// Strict Ed25519 verification; returns "valid" | "invalid" |
+/// "bad_public_key" | "bad_signature" | "bad_message". Needs no vault.
+#[wasm_bindgen(js_name = verifyEd25519)]
+pub fn verify_ed25519(public_key: &str, message: &str, encoding: &str, signature: &str) -> String {
+    match bridge::verify_ed25519(public_key, message, encoding, signature) {
+        bridge::Verdict::Valid => "valid",
+        bridge::Verdict::Invalid => "invalid",
+        bridge::Verdict::BadPublicKey => "bad_public_key",
+        bridge::Verdict::BadSignature => "bad_signature",
+        bridge::Verdict::BadMessage => "bad_message",
+    }
+    .into()
+}
+
+/// The exact bytes of a message: JSON `{bytes, hex, truncated}`.
+#[wasm_bindgen(js_name = messagePreview)]
+pub fn message_preview(message: &str, encoding: &str) -> Result<String, JsError> {
+    json(&bridge::message_preview(message, encoding).map_err(err)?)
+}
+
+/// Passphrase from JSON `{words, separator: "space" | "period"}` (EFF Long Wordlist).
+#[wasm_bindgen(js_name = generatePassphrase)]
+pub fn generate_passphrase(options: &str) -> Result<String, JsError> {
+    Ok(bridge::gen_passphrase(options)
+        .map_err(err)?
+        .expose()
+        .to_owned())
+}
+
+/// JSON `{words, list_size, entropy_bits, master_ok}`; draws nothing.
+#[wasm_bindgen(js_name = passphraseSummary)]
+pub fn passphrase_summary(options: &str) -> Result<String, JsError> {
+    json(&bridge::passphrase_summary(options).map_err(err)?)
 }
 
 #[wasm_bindgen(js_name = maxEnvelopeBytes)]

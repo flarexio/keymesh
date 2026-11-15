@@ -17,6 +17,7 @@ import { Icon } from '../shared/icon';
 import { ItemIcon } from '../shared/item-icon';
 import { SecretField } from './secret-field';
 import { TotpCountdown, countdownState } from '../shared/totp-countdown';
+import { Ed25519Sign } from './ed25519-tools';
 
 /** Core slot keys → localized labels; custom fields keep the user's label. */
 const SLOT_LABELS: Record<string, MessageKey> = {
@@ -40,7 +41,7 @@ interface PlainField {
 
 @Component({
   selector: 'km-item-detail',
-  imports: [TotpCountdown, SecretField, Icon, ItemIcon],
+  imports: [TotpCountdown, SecretField, Icon, ItemIcon, Ed25519Sign],
   template: `
     @if (view(); as v) {
       <article class="detail" aria-labelledby="detail-title">
@@ -90,6 +91,10 @@ interface PlainField {
               }
             </dl>
           </section>
+        }
+
+        @if (v.kind === 'ed25519_key' && v.data['public_key_base58']) {
+          <km-ed25519-sign [itemId]="v.id" [base58]="$any(v.data['public_key_base58'])" />
         }
 
         @for (l of lists(); track l.label) {

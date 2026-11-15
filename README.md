@@ -8,7 +8,7 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 > * **Not built:** Keymesh's own authentication, accounts and sync.
 > * **Private HTTPS:** a private HTTPS endpoint (`https://keymesh.cloud` on the VPN, internal CA) runs, but no real client device has yet been verified to trust it (gate C, `docs/DELIVERY.md`).
 
-## Capability matrix (M1 core, M2 browser slice, M3 UI, M4 local unlock, M5 phase A)
+## Capability matrix (M1 core, M2 browser slice, M3 UI, M4 local unlock, M5 phases A and B)
 
 | Area | State | Notes |
 |---|---|---|
@@ -16,15 +16,17 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | AEAD encryption (XChaCha20-Poly1305), versioned envelope, AAD binding | ✅ | KEK → random DEK; per-item records plus an encrypted manifest; see `docs/ARCHITECTURE.md` |
 | Key-provider port (v1 demo vaults) | ✅ | Ephemeral (tests) and **synthetic demo** (CLI env var) only |
 | Password vault (envelope v2): master password + recovery code key slots | ✅ experimental | Argon2id 64 MiB/t=3/p=1 → HKDF-SHA256; 256-bit recovery code (Base32, version + check digits) confirmed before first save; bounds checked before derivation; shared vectors checked natively, in WASM and independently with Node/OpenSSL |
-| Password change, reset with recovery code, new recovery code | ✅ experimental | Need proof of authority verified by the core; **rewraps, not rotation**: earlier backups keep earlier credentials. Compromise rotation of the data key is deferred |
-| Native CLI unlock | ✅ experimental | `init`, `passwd [--recovery]`, `new-recovery-code`, `recover`; masked terminal input or `--password-stdin`; `init --demo` keeps the v1 demo |
+| Password change, reset with recovery code, new recovery code | ✅ experimental | Need proof of authority verified by the core; **rewraps, not rotation**: earlier backups keep earlier credentials |
+| Data-key rotation (M5 B) | ✅ experimental, **review pending** | New random data key, every item re-encrypted, new password **and** new recovery code (typed back first); same envelope format. Browser: exact-byte CAS with read-back reconciliation; native: check-then-rename, single writer. Older backups still open with the old credentials; copies can't be revoked. `keymesh rotate-key` in the CLI |
+| Native CLI unlock | ✅ experimental | `init`, `passwd [--recovery]`, `new-recovery-code`, `rotate-key`, `recover`; masked terminal input or `--password-stdin`; `init --demo` keeps the v1 demo |
 | Browser password vault | ✅ experimental | Secure contexts only (HTTPS or loopback); Argon2id in a worker; one credential operation at a time; lock cancels it; refused on plain-HTTP LAN/VPN origins, where the demo stays usable |
 | HTTPS serving | ✅ experimental | `serve.mjs` TLS mode (`npm run tls-check`, throwaway CA). A private deployment (`deploy/`) runs Traefik with an internal-CA certificate for `keymesh.cloud`. Chain and headers are verified on the Pi; **a real client device trusting it (gate C) is unverified** (`docs/DELIVERY.md`) |
 | Atomic local persistence, load/edit/save, encrypted backup/restore | ✅ | Fails closed on a wrong key, corruption, truncation or an unknown format; lost-update guard |
 | Password generator (24 default / 32 strong presets, custom length 8–128, character types, custom ASCII-punctuation symbol set, look-alike exclusion, one-of-each-type; unbiased sampling) | ✅ | Same 64-bit floor for custom settings, checked against the generator's exact min-entropy |
 | Random 256-bit secrets (hex / base64url / base32) | ✅ | Local random values, not provider-issued credentials |
-| Passphrase generator | ⏳ pending | No reviewed, versioned wordlist bundled |
-| Ed25519 generation, storage, RFC 8032 vectors, OpenSSH public-key line | ✅ | No signing API; no private-key export formats |
+| Passphrase generator (M5 B) | ✅ experimental, **review pending** | EFF Long Wordlist (7776 words, CC BY 3.0 US), vendored and SHA-256 pinned; each word uniform from the OS CSPRNG (≈ 12.9 bits/word; 6 words by default). Also offered as a master-password suggestion, with an "I stored it" confirmation, and a printable emergency kit that never prints the password |
+| Ed25519 generation, storage, RFC 8032 vectors, OpenSSH public-key line | ✅ | No private-key export formats |
+| Ed25519 raw Base58 public key, signing, strict verification (M5 B) | ✅ experimental, **review pending** | Base58 = the raw 32 bytes, Bitcoin alphabet, no prefix or checksum. Signs exactly the shown UTF-8 or hex bytes (≤ 64 KiB) on an unlocked vault; `verify_strict` for any key. No chain RPC, transactions or login |
 | RFC 6238 TOTP (SHA1/256/512, 6/8 digits), Base32 and `otpauth://totp` import | ✅ | HOTP and custom modes rejected |
 | TOTP QR decode | ✅ experimental (browser) | Image upload/paste anywhere the app runs; live camera only in secure contexts. Decoded locally (zxing-wasm in a worker, self-hosted). Only `otpauth://totp/` is used, and the core validates it on save. Chromium fake-camera tested; **no real camera hardware tested** |
 | Import from 1Password via `op` CLI (explicit item or `op://` ref) | ✅ (fixtures only) | Tested only with a fake `op` and synthetic fixtures; not yet run against a real account |
@@ -33,7 +35,7 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | UI design system (M3) | ✅ | Semantic tokens, local icon set, system fonts; desktop sidebar + list/detail, mobile single column with bottom navigation; keyboard and screen-reader labels, visible focus, reduced motion; see `docs/DESIGN.md` |
 | Runtime language: 繁體中文 (zh-TW) / English | ✅ | Typed catalogs (missing key = build error); default from browser language; explicit choice persisted; switching keeps form input and never writes the vault; localized, secret-free error messages |
 | Appearance: System / Light / Dark | ✅ | System follows the OS live; explicit choice overrides it; applied before first paint without inline script; only `{locale, theme}` stored, under `keymesh.settings.v1` |
-| Browser generators → encrypted items | ✅ | Password, random secret, Ed25519 generated inside WASM and stored directly; passphrase still pending |
+| Browser generators → encrypted items | ✅ | Password, passphrase, random secret and Ed25519 generated inside WASM and stored directly |
 | Browser TOTP: live code + circular countdown, otpauth URI / Base32 / QR entry | ✅ | Clock injectable (E2E uses Playwright's clock). The last 5 s are flagged by colour **and** text; reduced motion respected |
 | Login icons | ✅ local only | 81 bundled brand marks (Simple Icons, no per-icon licence; trademarks of their owners) by reviewed domain; server icon for private hosts; category or letter otherwise. No network. **Not a security or origin indicator** |
 | IndexedDB persistence of the encrypted envelope only | ✅ | No plaintext, key or search index stored; E2E checks that planted markers are absent |
@@ -43,14 +45,14 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | Installable app / offline startup (PWA) | ✅ experimental | Angular service worker in secure contexts only (HTTPS or loopback; not the plain-HTTP previews). After one online visit it reopens offline and unlocks the vault stored in that browser. Updates are offered, never forced. A failed update keeps the open tab working but prevents offline reopening until a retry succeeds. Damaged cached app files can be repaired online (vault data untouched). Not native autofill or an app store; vaults stay per browser. **Install on real phones/Safari untested** (`docs/DELIVERY.md` §6) |
 | 1Password import in the browser | ❌ by design | Native CLI only; no endpoint runs `op`; the browser shows CLI instructions |
 | Production use of password vaults | ⏳ pending review | Experimental until independent acceptance; lost password **and** recovery code ⇒ data unrecoverable (no escrow, no reset); lost ephemeral demo key ⇒ demo ciphertext unrecoverable |
-| Passkey / PRF, device slots, mnemonic or keycard encodings, compromise rotation | ❌ deferred | ADR 0001 stages 2–4 |
+| Passkey / PRF, device slots, mnemonic or keycard encodings | ❌ deferred | ADR 0001 stages 2–4 (PRF quick unlock is M5 phase C) |
 | Keymesh login (mnemonic, image keycards), wallet/identity/KMS, NATS, blockchain | ❌ deferred | Out of scope |
 | Sync between devices; CLI ↔ browser vault transfer | ❌ deferred | |
 
 ## Known limitations
 
 - **Experimental password vaults:** implemented to a reviewed-format proposal (ADR 0002); partially reviewed, not independently accepted. Synthetic data only.
-- **Rewrap, not rotation:** changing the password or recovery code doesn't revoke older backups or data already read. Compromise rotation is not implemented.
+- **Rewrap vs rotation:** changing the password or recovery code doesn't revoke older backups or data already read. Rotation (M5 B, review pending) replaces the data key for the stored vault, but older backups still open with their old credentials and anything already copied can't be taken back.
 - **Weak passwords stay guessable offline:** anyone with the file can try passwords at about one Argon2id (64 MiB, t=3) per guess. Use a long passphrase; the recovery code itself cannot be guessed.
 - **Single writer:** `save` refuses unless the file is byte for byte what was loaded, but there is no file lock. Two writers racing during the save can still conflict.
 - **Durability:** if the system can't sync the directory after the new file is in place, the CLI exits with status 3 and says the change is in effect but durability is unconfirmed. A failure before that point leaves the old file untouched.

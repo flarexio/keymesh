@@ -125,3 +125,33 @@ export interface EnvelopeInfo {
 
 export const FIXTURE_KEY_ID = 'synthetic-fixture-v1';
 export const EPHEMERAL_KEY_ID = 'browser-ephemeral-demo-v1';
+
+// --- M5 B: Ed25519 signing and passphrases ----------------------------------
+
+export type MessageEncoding = 'utf8' | 'hex';
+
+export interface SignatureOut {
+  hex: string;
+  base58: string;
+  message_bytes: number;
+}
+
+export type Verdict = 'valid' | 'invalid' | 'bad_public_key' | 'bad_signature' | 'bad_message';
+
+export interface MessagePreview {
+  bytes: number;
+  hex: string;
+  truncated: boolean;
+}
+
+export interface PassphraseOptions {
+  words: number;
+  separator: 'space' | 'period';
+}
+
+export interface PassphraseSummary {
+  words: number;
+  list_size: number;
+  entropy_bits: number;
+  master_ok: boolean;
+}

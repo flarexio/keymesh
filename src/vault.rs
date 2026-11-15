@@ -332,6 +332,28 @@ impl PendingRecovery {
     }
 }
 
+/// A data-key rotation waiting for its new recovery code to be typed back.
+/// Holds the new DEK and the new password and recovery slots; the vault it
+/// came from is unchanged until [`Vault::finish_rotation`].
+pub struct PendingRotation {
+    vault_id: String,
+    /// Digest of the slots the authority was verified against, and the data
+    /// key it unwrapped: the rotation can only finish on that exact vault and
+    /// credential state (never on another vault, or after another change).
+    source_slots: [u8; 32],
+    source_dek: Key256,
+    dek: Key256,
+    slots: SlotSet,
+    code: RecoveryCode,
+}
+
+impl PendingRotation {
+    /// The new recovery code, shown once.
+    pub fn code(&self) -> &RecoveryCode {
+        &self.code
+    }
+}
+
 /// `Clone` lets storage adapters keep a last-committed checkpoint; clones hold
 /// their own copy of the data key, zeroized on drop like the original.
 #[derive(Clone)]
@@ -560,6 +582,89 @@ impl Vault {
             *recovery_confirmed = true;
         }
         Ok(())
+    }
+
+    /// Start a compromise rotation of a v2 vault: a fresh data key, and fresh
+    /// password and recovery slots for it (ADR 0002 §8). Needs `authority`
+    /// over this vault; `setup` must be fresh (new slot id and salt) and
+    /// `new_password_key` its Argon2id output. A new recovery code is always
+    /// generated. Nothing changes in `self`.
+    ///
+    /// Extension point: only password and recovery slots exist today. When
+    /// other slot kinds are added, each must be re-established here from a
+    /// re-authenticated capability or explicitly revoked by the caller; the
+    /// parser keeps refusing unknown kinds, so none can be dropped silently.
+    pub fn begin_rotation(
+        &self,
+        authority: Authority<'_>,
+        setup: &PasswordSetup,
+        new_password_key: &[u8; 32],
+        rng: &mut dyn RandomSource,
+    ) -> Result<PendingRotation> {
+        let slots = self.slots()?;
+        authority.verify(&self.vault_id, slots, &self.dek)?;
+        let old = slots.get(SlotKind::Password).password_setup()?;
+        if old.slot_id == setup.slot_id || bool::from(old.salt.ct_eq(&setup.salt)) {
+            return Err(Error::validation("a new password needs a fresh salt"));
+        }
+        let dek = Key256::generate(rng)?;
+        if bool::from(dek.as_bytes().ct_eq(self.dek.as_bytes())) {
+            return Err(Error::Rng);
+        }
+        let code = RecoveryCode::generate(rng)?;
+        let pw = Slot::new_password(&self.vault_id, setup, new_password_key, &dek, rng)?;
+        let rc = Slot::new_recovery(&self.vault_id, &code, &dek, rng)?;
+        Ok(PendingRotation {
+            vault_id: self.vault_id.clone(),
+            source_slots: slots.digest(),
+            source_dek: self.dek.clone(),
+            dek,
+            slots: SlotSet::new(pw, rc)?,
+            code,
+        })
+    }
+
+    /// Finish a rotation once the new recovery code was typed back. Returns
+    /// the rotated vault: same id, items, revision and snapshot (so the
+    /// usual compare-and-swap applies when it is saved), with the new data
+    /// key and slots. `self` stays as it was; the caller saves the rotated
+    /// vault and only then replaces its own. The pending rotation is only
+    /// borrowed, so a mistyped code can be retried.
+    pub fn finish_rotation(
+        &self,
+        pending: &PendingRotation,
+        confirmation: &RecoveryCode,
+    ) -> Result<Vault> {
+        let same_source = match self.slots() {
+            Ok(slots) => {
+                pending.vault_id == self.vault_id
+                    && slots.digest() == pending.source_slots
+                    && bool::from(pending.source_dek.as_bytes().ct_eq(self.dek.as_bytes()))
+            }
+            Err(_) => false,
+        };
+        if !same_source {
+            return Err(Error::validation(
+                "this rotation was started for another vault or credential state",
+            ));
+        }
+        if !pending.code.ct_eq(confirmation) {
+            return Err(Error::validation("recovery code does not match"));
+        }
+        Authority::Recovery(confirmation)
+            .verify(&self.vault_id, &pending.slots, &pending.dek)
+            .map_err(|_| Error::validation("recovery code does not match"))?;
+        Ok(Vault {
+            vault_id: self.vault_id.clone(),
+            keys: Keys::Slots {
+                slots: pending.slots.clone(),
+                recovery_confirmed: true,
+            },
+            loaded_revision: self.loaded_revision,
+            snapshot: self.snapshot,
+            dek: pending.dek.clone(),
+            items: self.items.clone(),
+        })
     }
 
     /// Decrypt and fully verify a v1 vault file with a key provider. Any
@@ -825,8 +930,8 @@ impl Vault {
     }
 
     /// v1 only: replace the data key; all items are re-encrypted on the next
-    /// save. For v2 vaults, compromise rotation (new DEK with every slot
-    /// re-established) is deferred and refused here.
+    /// save. v2 vaults rotate with [`Vault::begin_rotation`], which also
+    /// replaces every slot; this never relabels a demo vault.
     pub fn rotate_data_key(&mut self, rng: &mut dyn RandomSource) -> Result<()> {
         if self.is_protected() {
             return Err(Error::validation(
@@ -1488,6 +1593,184 @@ mod tests {
             &mut OsRandom,
         )
         .unwrap();
+    }
+
+    /// A rotated vault's plaintext, item by item (JSON of each item).
+    fn plaintext(v: &Vault) -> Vec<String> {
+        v.items()
+            .map(|i| serde_json::to_string(i).unwrap())
+            .collect()
+    }
+
+    fn rotate(v: &Vault, code: &RecoveryCode, new_pw: &str) -> (Vault, RecoveryCode) {
+        let setup = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let key = setup.derive(new_pw).unwrap();
+        let p = v
+            .begin_rotation(Authority::Recovery(code), &setup, &key, &mut OsRandom)
+            .unwrap();
+        let new_code = RecoveryCode::parse(&p.code().to_text()).unwrap();
+        let r = v.finish_rotation(&p, &new_code).unwrap();
+        (r, new_code)
+    }
+
+    #[test]
+    fn v2_rotation_replaces_the_data_key_and_every_slot() {
+        let (mut v, code, old_bytes) = protected();
+        for d in crate::model::tests::every_kind_data() {
+            v.insert(Item::new("Synthetic every kind", d, &mut OsRandom).unwrap())
+                .unwrap();
+        }
+        let (b1, r1) = v.seal_next_protected(&mut OsRandom).unwrap();
+        v.mark_written(r1, &b1).unwrap();
+        let before = plaintext(&v);
+        let new_pw = "synthetic rotated passphrase";
+        let (mut rv, new_code) = rotate(&v, &code, new_pw);
+        // Same identity and CAS snapshot; different data key.
+        assert_eq!(rv.vault_id(), v.vault_id());
+        assert_eq!(rv.revision(), v.revision());
+        assert_eq!(rv.snapshot_digest(), v.snapshot_digest());
+        assert!(!bool::from(rv.dek.as_bytes().ct_eq(v.dek.as_bytes())));
+        let (b2, r2) = rv.seal_next_protected(&mut OsRandom).unwrap();
+        rv.mark_written(r2, &b2).unwrap();
+        assert_eq!(r2, r1 + 1);
+
+        // New file: new credentials only.
+        let w = Vault::open_with_password(&b2, new_pw).unwrap();
+        assert_eq!(plaintext(&w), before);
+        assert_eq!(
+            plaintext(&Vault::open_with_recovery(&b2, &new_code).unwrap()),
+            before
+        );
+        assert!(matches!(
+            Vault::open_with_password(&b2, PW),
+            Err(Error::Decrypt)
+        ));
+        assert!(matches!(
+            Vault::open_with_recovery(&b2, &code),
+            Err(Error::Decrypt)
+        ));
+        // Old files: old credentials only (a retained backup is not revoked).
+        for old in [&old_bytes, &b1] {
+            assert!(Vault::open_with_password(old, PW).is_ok());
+            assert!(Vault::open_with_recovery(old, &code).is_ok());
+            assert!(Vault::open_with_password(old, new_pw).is_err());
+            assert!(Vault::open_with_recovery(old, &new_code).is_err());
+        }
+        // Every slot, item ciphertext and the manifest changed; ids and revs did not.
+        let (j1, j2) = (json(&b1), json(&b2));
+        for k in 0..2 {
+            assert_ne!(j1["slots"][k]["id"], j2["slots"][k]["id"]);
+            assert_ne!(j1["slots"][k]["wrapped"], j2["slots"][k]["wrapped"]);
+        }
+        assert_ne!(j1["manifest"], j2["manifest"]);
+        let (i1, i2) = (
+            j1["items"].as_array().unwrap(),
+            j2["items"].as_array().unwrap(),
+        );
+        assert_eq!(i1.len(), 8);
+        for (a, b) in i1.iter().zip(i2) {
+            assert_eq!((&a["id"], &a["rev"]), (&b["id"], &b["rev"]));
+            assert_ne!(a["sealed"], b["sealed"]);
+        }
+        // Splicing an old slot (old data key) into the new file fails to open.
+        let mut spliced = j2.clone();
+        spliced["slots"][0] = j1["slots"][0].clone();
+        assert!(Vault::open_with_password(&bytes_of(&spliced), PW).is_err());
+        assert!(Vault::open_with_password(&bytes_of(&spliced), new_pw).is_err());
+    }
+
+    #[test]
+    fn v2_rotation_needs_authority_a_fresh_setup_and_the_new_code() {
+        let (v, code, _) = protected();
+        let setup = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let key = setup.derive("synthetic rotated passphrase").unwrap();
+        let other = RecoveryCode::generate(&mut OsRandom).unwrap();
+        assert!(v
+            .begin_rotation(Authority::Recovery(&other), &setup, &key, &mut OsRandom)
+            .is_err());
+        assert!(v
+            .begin_rotation(
+                Authority::PasswordKey(&[0u8; 32]),
+                &setup,
+                &key,
+                &mut OsRandom
+            )
+            .is_err());
+        let mut reuse = setup.clone();
+        reuse.salt = v.password_setup().unwrap().salt;
+        assert!(v
+            .begin_rotation(Authority::Recovery(&code), &reuse, &key, &mut OsRandom)
+            .is_err());
+        // Current-password authority (the shared derived key).
+        let (_, cur_key) = shared();
+        let p = v
+            .begin_rotation(Authority::PasswordKey(cur_key), &setup, &key, &mut OsRandom)
+            .unwrap();
+        let shown = RecoveryCode::parse(&p.code().to_text()).unwrap();
+        // A mistyped (or the old) code keeps the rotation pending.
+        let e = v.finish_rotation(&p, &code).err().unwrap();
+        assert!(matches!(e, Error::Validation(_)));
+        assert!(v.finish_rotation(&p, &other).is_err());
+        // A rotation started for another vault, or for the same vault in
+        // another credential state, is refused.
+        let other_setup = ProtectedSetup::generate(&mut OsRandom).unwrap();
+        let (w, _) = Vault::create_protected(&other_setup, &[9u8; 32], &mut OsRandom).unwrap();
+        assert!(w.finish_rotation(&p, &shown).is_err());
+        let mut changed = v.clone();
+        let s2 = PasswordSetup::generate(&mut OsRandom).unwrap();
+        changed
+            .change_password(Authority::Recovery(&code), &s2, &[8u8; 32], &mut OsRandom)
+            .unwrap();
+        assert!(changed.finish_rotation(&p, &shown).is_err());
+        // Same vault id, independently keyed (another DEK and slots): refused,
+        // and its replacement wrappers never land in the other vault.
+        let (twin, _, _) = protected();
+        assert_eq!(twin.vault_id(), v.vault_id());
+        assert!(twin.finish_rotation(&p, &shown).is_err());
+        // Same id AND same slot records but another data key in memory: the
+        // DEK binding alone refuses it.
+        let mut other_key = v.clone();
+        other_key.dek = Key256::generate(&mut OsRandom).unwrap();
+        assert!(other_key.finish_rotation(&p, &shown).is_err());
+        let rv = v.finish_rotation(&p, &shown).unwrap();
+        // Made stale by a completed rotation: the rotated vault refuses it.
+        assert!(rv.finish_rotation(&p, &shown).is_err());
+        assert!(rv.recovery_confirmed());
+        // The vault it came from is untouched: still the old credentials.
+        let (b, _) = v.seal_next_protected(&mut OsRandom).unwrap();
+        assert!(Vault::open_with_recovery(&b, &code).is_ok());
+        assert!(Vault::open_with_recovery(&b, &shown).is_err());
+    }
+
+    #[test]
+    fn v2_rotation_invalidates_an_older_pending_recovery_code() {
+        let (v, code, _) = protected();
+        let pending = v
+            .begin_recovery_change(Authority::Recovery(&code), &mut OsRandom)
+            .unwrap();
+        let pending_code = RecoveryCode::parse(&pending.code().to_text()).unwrap();
+        let (mut rv, _) = rotate(&v, &code, "synthetic rotated passphrase");
+        let r = rv.finish_recovery_change(pending, &pending_code);
+        assert!(
+            r.is_err(),
+            "a code wrapped for the old data key must be refused"
+        );
+    }
+
+    #[test]
+    fn rotation_never_applies_to_demo_vaults() {
+        let p = provider();
+        let (v, _) = sample(&p);
+        let setup = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let code = RecoveryCode::generate(&mut OsRandom).unwrap();
+        assert!(v
+            .begin_rotation(
+                Authority::Recovery(&code),
+                &setup,
+                &[1u8; 32],
+                &mut OsRandom
+            )
+            .is_err());
     }
 
     #[test]

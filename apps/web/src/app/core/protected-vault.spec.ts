@@ -43,6 +43,8 @@ const GOOD_PW = 'synthetic good passphrase';
 const NEW_PW = 'synthetic newer passphrase';
 const CODE = 'GOOD-CODE';
 const OTHER_CODE = 'OTHER-CODE';
+const ROT_CODE = 'ROTATED-CODE';
+const codeTag = (c: string) => (c === CODE ? 1 : c === ROT_CODE ? 2 : 0);
 
 /** v2 envelope stand-in: [1, revision, uniqueness, 2, passwordTag, codeTag]. */
 let counter = 0;
@@ -61,6 +63,8 @@ class FakeSession {
   pending: number | null = null;
   pendingPw: boolean = false;
   pendingCode: string | null = null;
+  /** A prepared rotation: the new password tag (data key "rotates" with it). */
+  rotating: number | null = null;
   committedPw: number;
   committedCode: string;
   rollbacks = 0;
@@ -81,7 +85,7 @@ class FakeSession {
   static openWithPasswordKey(bytes: Uint8Array, key: Uint8Array) {
     if (bytes[3] !== 2) throw new Error('unsupported or unknown format: this is a demo vault without a password');
     if (key[0] !== bytes[4]) throw new Error('decryption failed: wrong key or corrupted data');
-    return new FakeSession(bytes[1], bytes[4], bytes[5] === 1 ? CODE : OTHER_CODE);
+    return new FakeSession(bytes[1], bytes[4], bytes[5] === 1 ? CODE : bytes[5] === 2 ? ROT_CODE : OTHER_CODE);
   }
   static openWithRecovery(bytes: Uint8Array, code: string) {
     if (code !== CODE && code !== OTHER_CODE) throw new Error('validation failed: recovery code is not valid');
@@ -99,6 +103,7 @@ class FakeSession {
   }
   shownRecoveryCode() {
     if (!this.confirmed) return CODE;
+    if (this.rotating !== null) return ROT_CODE;
     if (this.pendingCode) return this.pendingCode;
     throw new Error('validation failed: no recovery code to show');
   }
@@ -137,6 +142,23 @@ class FakeSession {
   cancelRecoveryChange() {
     this.pendingCode = null;
   }
+  beginRotation(cur: Uint8Array, next: Uint8Array) {
+    if (!this.pendingPw) throw new Error('validation failed: start the password change first');
+    this.pendingPw = false;
+    if (cur[0] !== this.pw) throw new Error('decryption failed: wrong key or corrupted data');
+    this.pendingCode = null;
+    this.rotating = next[0];
+  }
+  finishRotation(code: string) {
+    if (this.rotating === null) throw new Error('validation failed: no key rotation in progress');
+    if (code !== ROT_CODE) throw new Error('validation failed: recovery code does not match');
+    this.pw = this.rotating;
+    this.code = ROT_CODE;
+    this.rotating = null;
+  }
+  cancelRotation() {
+    this.rotating = null;
+  }
   rollback() {
     this.rollbacks++;
     this.pw = this.committedPw;
@@ -146,7 +168,7 @@ class FakeSession {
     if (!this.confirmed) throw new Error('validation failed: confirm the recovery code before saving the vault');
     const revision = this.rev + 1;
     this.pending = revision;
-    return { bytes: v2(revision, this.pw, this.code === CODE ? 1 : 0), revision, free() {} };
+    return { bytes: v2(revision, this.pw, codeTag(this.code)), revision, free() {} };
   }
   commit(r: number) {
     if (r !== this.pending) throw new Error('no matching sealed revision');
@@ -235,21 +257,37 @@ class ManualKdf implements KdfRunner {
 class TestStore extends VaultStore {
   gate: Promise<void> | null = null;
   fail = false;
+  /** The write lands, then the call still reports an error (submitted-write uncertainty). */
+  failAfterPut = false;
+  /** Held after the write landed, before the call returns. */
+  afterPut: Promise<void> | null = null;
+  /** Reads fail (the outcome cannot be checked). */
+  readFails = false;
+  durabilities: (IDBTransactionDurability | undefined)[] = [];
   writes = 0;
   reads = 0;
   override async read(): Promise<StoredVault | null> {
     this.reads++;
+    if (this.readFails) throw new Error('UnknownError (synthetic)');
     return super.read();
   }
   gateReached = false;
-  override async compareAndSwap(expected: Uint8Array | null, next: StoredVault, guard?: () => void): Promise<void> {
+  override async compareAndSwap(
+    expected: Uint8Array | null,
+    next: StoredVault,
+    guard?: () => void,
+    durability?: IDBTransactionDurability,
+  ): Promise<void> {
+    this.durabilities.push(durability);
     if (this.gate) {
       this.gateReached = true;
       await this.gate;
     }
     if (this.fail) throw new Error('QuotaExceededError (synthetic)');
     this.writes++;
-    await super.compareAndSwap(expected, next, guard);
+    await super.compareAndSwap(expected, next, guard, durability);
+    if (this.afterPut) await this.afterPut;
+    if (this.failAfterPut) throw new Error('UnknownError (synthetic, after put)');
   }
 }
 
@@ -696,6 +734,165 @@ describe('VaultService password vault', () => {
       expect(await stored(prot)).toEqual(Array.from(other));
     });
   });
+  describe('data-key rotation', () => {
+    beforeEach(() => setup());
+
+    /** Start a rotation GOOD_PW → NEW_PW and release both derivations. */
+    async function begin(current = GOOD_PW, next = NEW_PW): Promise<string> {
+      const p = vault.beginRotation(current, next);
+      await kdf.started(1);
+      kdf.release(0);
+      await kdf.started(2);
+      kdf.release(1);
+      return p;
+    }
+
+    const session = () => sessions[sessions.length - 1];
+
+    it('needs the current password and a NEW password; nothing changes before the code is back', async () => {
+      const bytes = await unlocked();
+      await expect(vault.beginRotation(GOOD_PW, GOOD_PW)).rejects.toMatchObject({ code: 'samePassword' });
+      await expect(vault.beginRotation(GOOD_PW, 'short')).rejects.toThrow(/too short/);
+      expect(kdf.calls).toHaveLength(0);
+      const bad = vault.beginRotation('synthetic wrong passphrase', NEW_PW);
+      await kdf.started(1);
+      kdf.release(0);
+      await kdf.started(2);
+      kdf.release(1);
+      expect(errorKey(await bad.catch((x: unknown) => x))).toBe('errors.wrongPassword');
+      kdf.calls = [];
+      kdf.returned = [];
+      expect(await begin()).toBe(ROT_CODE);
+      // Wrong code: refused, still pending, nothing written.
+      await expect(vault.finishRotation(CODE)).rejects.toThrow(/does not match/);
+      expect(session().rotating).toBe(2);
+      expect(prot.writes).toBe(0);
+      expect(await stored(prot)).toEqual(Array.from(bytes));
+      expect(kdf.returned.every((k) => k.every((b) => b === 0))).toBe(true);
+    });
+
+    it('success: stored with exact-byte CAS and strict durability; new credentials only', async () => {
+      const bytes = await unlocked();
+      prot.durabilities = [];
+      await begin();
+      await vault.finishRotation(ROT_CODE);
+      const now = await stored(prot);
+      expect(now?.[4]).toBe(2); // new password
+      expect(now?.[5]).toBe(2); // new recovery code
+      expect(prot.durabilities).toEqual(['strict']);
+      expect(vault.revision()).toBe(bytes[1] + 1);
+      expect(vault.status()).toBe('unlocked');
+      expect(session().rollbacks).toBe(0);
+    });
+
+    it('lock during a derivation cancels the rotation: nothing pending, nothing written', async () => {
+      const bytes = await unlocked();
+      const p = vault.beginRotation(GOOD_PW, NEW_PW);
+      await kdf.started(1);
+      kdf.release(0);
+      await kdf.started(2);
+      vault.lock();
+      await expect(p).rejects.toBeInstanceOf(StaleWorkError);
+      expect(await stored(prot)).toEqual(Array.from(bytes));
+      expect(kdf.returned[0].every((b) => b === 0)).toBe(true);
+    });
+
+    it('pre-commit failure (write refused before it lands): rolled back, old credentials stored', async () => {
+      const bytes = await unlocked();
+      await begin();
+      prot.fail = true;
+      await expect(vault.finishRotation(ROT_CODE)).rejects.toThrow(/synthetic/);
+      expect(session().rollbacks).toBe(1);
+      expect(session().pw).toBe(1);
+      expect(await stored(prot)).toEqual(Array.from(bytes));
+      expect(vault.status()).toBe('unlocked');
+    });
+
+    it('error AFTER the write landed: read back, the new bytes are there, so it counts as committed', async () => {
+      const bytes = await unlocked();
+      await begin();
+      prot.failAfterPut = true;
+      await vault.finishRotation(ROT_CODE);
+      prot.failAfterPut = false;
+      const now = await stored(prot);
+      expect(now?.[4]).toBe(2);
+      expect(session().rollbacks).toBe(0);
+      expect(vault.revision()).toBe(bytes[1] + 1);
+      expect(vault.status()).toBe('unlocked');
+    });
+
+    it('error after the write and the read-back fails too: uncertain, the vault is locked (nothing guessed)', async () => {
+      await unlocked();
+      await begin();
+      prot.failAfterPut = true;
+      prot.readFails = true;
+      expect(errorKey(await vault.finishRotation(ROT_CODE).catch((x: unknown) => x))).toBe('errors.rotationUncertain');
+      expect(vault.status()).not.toBe('unlocked');
+      expect(vault.isProtected()).toBe(false);
+      expect(session().rollbacks).toBe(0);
+      prot.readFails = false;
+      prot.failAfterPut = false;
+      expect((await stored(prot))?.[4]).toBe(2); // it did land; the next unlock needs NEW_PW
+    });
+
+    it('another tab wrote first: CAS conflict, rolled back, stale; their bytes kept', async () => {
+      await unlocked();
+      await begin();
+      const cur = (await prot.read())!.bytes;
+      const other = v2(8);
+      await prot.compareAndSwap(cur, rec(other));
+      await expect(vault.finishRotation(ROT_CODE)).rejects.toBeInstanceOf(ConflictError);
+      expect(vault.status()).toBe('stale');
+      expect(session().rollbacks).toBe(1);
+      expect(await stored(prot)).toEqual(Array.from(other));
+    });
+
+    it('lock while the write is held before IndexedDB: cancelled, nothing stored', async () => {
+      const bytes = await unlocked();
+      await begin();
+      const gate = deferred();
+      prot.gate = gate.promise;
+      const p = vault.finishRotation(ROT_CODE);
+      await until(() => prot.gateReached, 'write gate');
+      vault.lock();
+      gate.resolve();
+      await expect(p).rejects.toBeInstanceOf(StaleWorkError);
+      expect(await stored(prot)).toEqual(Array.from(bytes));
+    });
+
+    it('lock after the write landed: told the rotation was saved (no session resurrection)', async () => {
+      await unlocked();
+      await begin();
+      const held = deferred();
+      prot.afterPut = held.promise;
+      const p = vault.finishRotation(ROT_CODE);
+      await until(() => prot.writes === 1, 'write');
+      vault.lock();
+      held.resolve();
+      expect(errorKey(await p.catch((x: unknown) => x))).toBe('errors.rotatedWhileLocked');
+      expect(vault.status()).not.toBe('unlocked');
+      expect((await stored(prot))?.[4]).toBe(2);
+      // Unlocking now needs the NEW password; the old one is refused.
+      const bad = vault.unlockWithPassword(GOOD_PW);
+      await until(() => kdf.calls.length > 0 && kdf.returned.length < kdf.calls.length, 'KDF call');
+      kdf.release();
+      expect(errorKey(await bad.catch((x: unknown) => x))).toBe('errors.wrongPassword');
+      const good = vault.unlockWithPassword(NEW_PW);
+      await until(() => kdf.calls.length > 0 && kdf.returned.length < kdf.calls.length, 'KDF call');
+      kdf.release();
+      await good;
+      expect(vault.status()).toBe('unlocked');
+    });
+
+    it('cancelling drops the pending rotation', async () => {
+      const bytes = await unlocked();
+      await begin();
+      vault.cancelRotation();
+      await expect(vault.finishRotation(ROT_CODE)).rejects.toThrow(/no key rotation/);
+      expect(await stored(prot)).toEqual(Array.from(bytes));
+    });
+  });
+
   describe('stale reload keeps the password vault (never opens the demo)', () => {
     beforeEach(() => setup());
 

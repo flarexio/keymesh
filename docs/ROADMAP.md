@@ -1,6 +1,6 @@
 # Keymesh roadmap
 
-**Status as of 2026-11-15.**
+**Status as of 2026-11-16.**
 * **Authorized rollout (M5):** FlareX authorized implementing the backlog below plus an installable app (PWA), in phases A, B and C (task `keymesh-product-rollout`). Each phase gets an independent review before it is deployed to the private endpoint.
 * **Boundaries:** everything stays experimental and synthetic-data only until independent acceptance. Outside this rollout, each item still needs its own task contract.
 * **Priorities** follow FlareX's requests from 2026-11-14 and 2026-11-15 unless noted.
@@ -14,26 +14,26 @@
 | M3 UI polish, locale and theme | Accepted |
 | Generator finish | Accepted |
 | **M4 local unlock** (password and recovery slots, backup/restore, HTTPS mechanics) | **Partial, not accepted.** A private HTTPS endpoint (`keymesh.cloud`, Docker, internal CA) now runs; **gate C** (a real client device trusting it) is still unverified by the human |
-| **M5 product rollout** (PWA + backlog) | **Phase A implemented and tested, not yet reviewed or deployed.** Phases B and C not started. See the checklist below |
+| **M5 product rollout** (PWA + backlog) | **Phase A accepted** (`7079932`, experimental, synthetic only) and its web image deployed to `keymesh.cloud` 2026-11-16 (supervisor read-back pending). **Phase B implemented and tested, not yet reviewed or deployed**; its format/core gate is pending. Phase C not started. See the checklist below |
 
 ## M5 checklist (versioned)
 
-**v2, 2026-11-15** (after Phase A review fixes), on branch `feature/m5-pwa-product-features`. The exact commit is listed in the draft PR.
+**v3, 2026-11-16** (Phase A deployed, Phase B implemented), on branch `feature/m5-pwa-product-features`. The exact commits are listed in the draft PR. "Deployed" for A means the accepted `7079932` web image; B is not deployed and stays off the private endpoint until its independent review.
 * **States:** *implemented* · *tested* (automated, Chromium on the Pi) · *deployed* (private `keymesh.cloud` image) · *blocked*.
 * **Not covered by "tested":** real phones, Safari and Firefox; iOS install; and real camera hardware. Those need human device checks.
 
 | Phase | Feature | Implemented | Tested | Deployed | Notes |
 |---|---|---|---|---|---|
-| A | PWA: manifest, icons (incl. maskable), install button/hint | yes | yes | no | Chromium only. The `beforeinstallprompt` flow and the iOS hint were not verified on real devices |
-| A | Offline reopen and unlock after one online visit | yes | yes | no | Tested with the server stopped. A cold first visit offline is not supported |
-| A | Updates offered, never forced; lock before reload | yes | yes | no | Covers v1→v2, the ephemeral-vault warning and the unrecoverable chunk state. A genuinely failed install degrades offline reopening until a bounded retry succeeds (tested). Damaged cached files: online repair (tested) |
-| A | TOTP from QR: image upload and paste | yes | yes | no | zxing-wasm in a worker, self-hosted. Header bounds checked before decoding |
-| A | TOTP from QR: live camera | yes | Chromium fake camera | no | Real camera hardware is untested |
-| A | Circular TOTP countdown (last 5 s warning) | yes | yes | no | Fixed-clock unit and E2E tests; reduced motion |
-| A | Local login icons (brand, private host, category, letter) | yes | yes | no | 81 reviewed Simple Icons: no per-icon licence (Rust, CC-BY-SA-4.0, removed); explicit domain aliases. No network. Not a security indicator |
-| B | Ed25519 Base58 public key, sign and verify | no | no | no | |
-| B | DEK rotation | no | no | no | Needs a format/core review and vectors before deployment |
-| B | Passphrase wordlist and emergency kit | no | no | no | |
+| A | PWA: manifest, icons (incl. maskable), install button/hint | yes | yes | yes | Chromium only. The `beforeinstallprompt` flow and the iOS hint were not verified on real devices |
+| A | Offline reopen and unlock after one online visit | yes | yes | yes | Tested with the server stopped. A cold first visit offline is not supported |
+| A | Updates offered, never forced; lock before reload | yes | yes | yes | Covers v1→v2, the ephemeral-vault warning and the unrecoverable chunk state. A genuinely failed install degrades offline reopening until a bounded retry succeeds (tested). Damaged cached files: online repair (tested) |
+| A | TOTP from QR: image upload and paste | yes | yes | yes | zxing-wasm in a worker, self-hosted. Header bounds checked before decoding |
+| A | TOTP from QR: live camera | yes | Chromium fake camera | yes | Real camera hardware is untested |
+| A | Circular TOTP countdown (last 5 s warning) | yes | yes | yes | Fixed-clock unit and E2E tests; reduced motion |
+| A | Local login icons (brand, private host, category, letter) | yes | yes | yes | 81 reviewed Simple Icons: no per-icon licence (Rust, CC-BY-SA-4.0, removed); explicit domain aliases. No network. Not a security indicator |
+| B | Ed25519 Base58 public key, sign and verify | yes | yes | no | Raw 32-byte Base58 (no prefix/checksum); pure Ed25519 over the exact shown bytes; `verify_strict`. RFC 8032 + Base58 + negative vectors natively, through WASM, and Node/OpenSSL in E2E |
+| B | DEK rotation (password + recovery slots) | yes | yes | no | No wire-format change. Native, CLI, bridge, browser; rotation vector checked by Node/OpenSSL. Browser outcome reconciliation tested with a fake store; IndexedDB post-commit durability can't be observed. **Format/core gate pending** |
+| B | Passphrase wordlist and emergency kit | yes | yes | no | EFF Long Wordlist pinned by SHA-256; core CSPRNG with rejection sampling. Kit never prints the password; code only on request. Real printers/PDF untested |
 | C | WebAuthn PRF quick unlock and auto-lock | no | no | no | ADR 0003 |
 | C | Custom short PIN | no | no | no | Expected to be **blocked** unless a protected native/authenticator mechanism exists (ADR 0003 §6) |
 | C | Optional favicon route | no | no | no | Opt-in; SSRF suite first (item 6 below) |
@@ -63,7 +63,12 @@
   * **Real devices:** at least one BE = 0 and one backup-eligible path recorded on real devices, with authenticator and transport.
   * **Copy:** never says "biometric" alone; describes BE = 0 as bound to an authenticator (not to this computer) and BE = 1 as backup-eligible (not as synced everywhere); never offers rotation before it exists.
 
-### 2. DEK rotation (re-encrypt the vault) — M5 phase B, before PRF slots
+### 2. DEK rotation (re-encrypt the vault) — implemented (M5 phase B), review pending
+* **Implemented:**
+  * **Core:** `Vault::begin_rotation` / `finish_rotation` (`src/vault.rs`). A pending rotation is bound to the exact slots its authority was checked against.
+  * **Other layers:** `storage::save_protected` (native), `keymesh rotate-key` (CLI), `Session::begin_rotation` / `finish_rotation` (bridge), and `VaultService.beginRotation` / `finishRotation` (browser, with read-back reconciliation and strict durability).
+  * **Tests:** `vault::tests::v2_rotation_*`, `storage::tests::*rotation*`, `tests/cli_protected.rs`, `tests/rotation_vectors.rs` and `scripts/check-vectors.mjs`; `core/protected-vault.spec.ts` (data-key rotation) and `e2e/m5b.spec.ts`.
+  * **Still open:** the "no recovery path" acknowledgement does not arise yet, because rotation always installs both a new password and a new recovery code.
 * **Scope:**
   * A new random DEK, every item re-encrypted, and new password and recovery slots, with the new recovery code typed back.
   * Every other slot (PRF, later device) re-established with a fresh evaluation, or explicitly invalidated and listed for confirmation (ADR 0001 §3).
@@ -113,7 +118,12 @@
   * Reduced-motion snapshot.
   * Accessible label check.
 
-### 5. Ed25519 Base58 public key, signing and verification
+### 5. Ed25519 Base58 public key, signing and verification — implemented (M5 phase B), review pending
+* **Implemented:**
+  * **Core:** `src/ed25519.rs` (`base58`, `parse_public_key`, `parse_signature`, `message_bytes`, `Ed25519KeyPair::sign`).
+  * **Bridge and UI:** `sign_ed25519` / `verify_ed25519` in the bridge; `features/ed25519-tools.ts` in the UI.
+  * **Inputs:** keys and signatures are accepted as hex or raw Base58. Base64 is not offered.
+  * **Chain formats:** none; no chain-specific prefix or checksum was requested.
 * **Scope (local utilities only):**
   * Show the raw 32-byte public key in Base58 (Bitcoin alphabet, no prefix or checksum) beside the existing format, with a copy action.
   * Sign an explicit message (text, or hex bytes shown before signing) with an unlocked item's key.

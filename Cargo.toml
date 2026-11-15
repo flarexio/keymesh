@@ -34,6 +34,8 @@ subtle = "2"
 argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
 hkdf = "=0.12.4"
 unicode-normalization = "=0.1.26"
+# Raw Base58 (Bitcoin alphabet) display of Ed25519 keys and signatures (M5 B).
+bs58 = { version = "=0.5.1", default-features = false, features = ["alloc"] }
 tempfile = { version = "3", optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 # Masked terminal input for the master password and recovery code.

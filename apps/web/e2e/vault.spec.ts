@@ -75,7 +75,7 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await hexRow.getByRole('button', { name: 'Reveal' }).click();
   await expect(hexRow.getByTestId('secret-value')).toHaveText(/^\s*[0-9a-f]{64}\s*$/);
   await page.getByRole('button', { name: 'Generators' }).click();
-  await expect(page.getByRole('button', { name: 'Generate passphrase' })).toBeDisabled();
+  await expect(page.getByTestId('generate-passphrase')).toBeEnabled();
   await page.getByRole('button', { name: 'Generate & save key' }).click();
   await expect(page.locator('#detail-title')).toHaveText('Generated Ed25519 key');
   await expect(page.locator('.detail')).toContainText('ssh-ed25519 ');

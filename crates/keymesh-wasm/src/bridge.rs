@@ -4,10 +4,12 @@
 //! Secrets stay inside this module's memory. Item *views* sent to the UI
 //! contain non-secret fields plus a list of masked secret slots; plaintext of
 //! a slot crosses the boundary only through an explicit [`Session::reveal`].
-//! Ed25519 private seeds are never revealed and there is no signing API.
+//! Ed25519 private seeds are never revealed. Signing happens here, on an
+//! explicit request for one stored key and exact message bytes; only the
+//! signature leaves.
 
 use keymesh::crypto::{EphemeralKeyProvider, Key256, KeyProvider};
-use keymesh::ed25519::Ed25519KeyPair;
+use keymesh::ed25519::{self, Ed25519KeyPair, MessageEncoding};
 use keymesh::generate::{
     generate_password, generate_secret, PasswordOptions, PasswordPolicy, PasswordProfile,
     PolicySummary, SecretEncoding,
@@ -19,13 +21,14 @@ use keymesh::model::{
     ItemKind, LabeledValue, Login, SecretCredential, SecretFormat, SecretOrigin, SecureNote,
     TotpRecord,
 };
+use keymesh::passphrase::{self, PassphraseOptions, PassphraseSummary};
 use keymesh::recovery::RecoveryCode;
 use keymesh::rng::OsRandom;
 use keymesh::secret::SecretString;
 use keymesh::totp::{code_now, parse_base32_secret, parse_otpauth_uri, FixedClock, TotpConfig};
 use keymesh::vault::{
-    password_request as envelope_password_request, read_header, PendingRecovery, ProtectedSetup,
-    Vault,
+    password_request as envelope_password_request, read_header, PendingRecovery, PendingRotation,
+    ProtectedSetup, Vault,
 };
 use keymesh::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -413,6 +416,7 @@ fn view(i: &Item) -> Result<ItemView> {
         ItemData::Ed25519Key(k) => json!({
             "comment": k.comment,
             "public_key_hex": k.key.public_key_hex,
+            "public_key_base58": k.key.public_key_base58()?,
             "openssh": k.key.openssh_public_key(k.comment.as_deref())?}),
         ItemData::SecureNote(_) => {
             secrets.push(slot("body", "Note"));
@@ -591,6 +595,8 @@ pub struct Session {
     pending_password: Option<PasswordSetup>,
     /// v2: a replacement recovery code waiting for confirmation.
     pending_recovery: Option<PendingRecovery>,
+    /// v2: a data-key rotation waiting for its new recovery code.
+    pending_rotation: Option<PendingRotation>,
 }
 
 /// The latest generated-but-unsaved value per generator. Zeroized on drop,
@@ -598,6 +604,7 @@ pub struct Session {
 #[derive(Default)]
 struct Previews {
     password: Option<SecretString>,
+    passphrase: Option<SecretString>,
     secret: Option<(SecretString, SecretEncoding)>,
 }
 
@@ -612,6 +619,7 @@ impl Session {
             new_code: None,
             pending_password: None,
             pending_recovery: None,
+            pending_rotation: None,
         }
     }
 
@@ -642,6 +650,7 @@ impl Session {
         self.new_code = None;
         self.pending_password = None;
         self.pending_recovery = None;
+        self.pending_rotation = None;
     }
 
     // --- v2: password + recovery --------------------------------------------
@@ -683,9 +692,14 @@ impl Session {
     /// replacement), formatted for display.
     pub fn shown_recovery_code(&self) -> Result<Zeroizing<String>> {
         self.v()?;
-        match (&self.new_code, &self.pending_recovery) {
-            (Some(c), _) => Ok(c.to_text()),
-            (None, Some(p)) => Ok(p.code().to_text()),
+        match (
+            &self.new_code,
+            &self.pending_recovery,
+            &self.pending_rotation,
+        ) {
+            (Some(c), _, _) => Ok(c.to_text()),
+            (None, _, Some(r)) => Ok(r.code().to_text()),
+            (None, Some(p), None) => Ok(p.code().to_text()),
             _ => Err(Error::Validation("no recovery code to show".into())),
         }
     }
@@ -769,6 +783,47 @@ impl Session {
 
     pub fn cancel_recovery_change(&mut self) {
         self.pending_recovery = None;
+    }
+
+    /// Start a data-key rotation (ADR 0002 §8). Authority is the CURRENT
+    /// password's key; `new_key` is derived for the parameters from
+    /// [`Session::begin_password_change`]. A new recovery code is shown via
+    /// [`Session::shown_recovery_code`]. Nothing changes until
+    /// [`Session::finish_rotation`]; any pending recovery-code change is
+    /// dropped (it would wrap the old data key).
+    pub fn begin_rotation(&mut self, current_key: &[u8], new_key: &[u8]) -> Result<()> {
+        let setup = self.take_password_setup()?;
+        let (cur, new) = (key32(current_key)?, key32(new_key)?);
+        let p =
+            self.v()?
+                .begin_rotation(Authority::PasswordKey(&cur), &setup, &new, &mut OsRandom)?;
+        self.pending_recovery = None;
+        self.pending_rotation = Some(p);
+        Ok(())
+    }
+
+    /// The new recovery code was typed back: switch the session to the
+    /// rotated vault (new data key and slots). Persist with
+    /// [`Session::seal_protected`] + commit; [`Session::rollback`] returns to
+    /// the stored (old) state. A mistyped code keeps the rotation pending.
+    pub fn finish_rotation(&mut self, code: &str) -> Result<()> {
+        let code = RecoveryCode::parse(code)?;
+        let p = self
+            .pending_rotation
+            .as_ref()
+            .ok_or_else(|| Error::Validation("no key rotation in progress".into()))?;
+        let rotated = self.v()?.finish_rotation(p, &code)?;
+        self.pending_rotation = None;
+        self.vault = Some(rotated);
+        Ok(())
+    }
+
+    pub fn cancel_rotation(&mut self) {
+        self.pending_rotation = None;
+    }
+
+    pub fn rotation_pending(&self) -> bool {
+        self.pending_rotation.is_some()
     }
 
     /// Return to the last committed state (a credential change whose write
@@ -1137,6 +1192,23 @@ impl Session {
         Ok(self.vm()?.insert(item)?.to_string())
     }
 
+    /// Sign exactly the bytes `message` stands for (`encoding`: "utf8" as
+    /// typed, or "hex") with the stored key of Ed25519 item `id`. Requires
+    /// an unlocked vault; the seed never leaves the core.
+    pub fn sign_ed25519(&self, id: &str, message: &str, encoding: &str) -> Result<SignatureOut> {
+        let item = self.v()?.get(&parse_id(id)?)?;
+        let ItemData::Ed25519Key(k) = &item.data else {
+            return Err(Error::Validation("not an Ed25519 key item".into()));
+        };
+        let bytes = ed25519::message_bytes(message, MessageEncoding::parse(encoding)?)?;
+        let sig = k.key.sign(&bytes)?;
+        Ok(SignatureOut {
+            hex: data_encoding::HEXLOWER.encode(&sig),
+            base58: ed25519::base58(&sig),
+            message_bytes: bytes.len(),
+        })
+    }
+
     /// Random secret generated and stored without leaving WASM memory.
     pub fn generate_secret_item(
         &mut self,
@@ -1216,6 +1288,17 @@ impl Session {
         Ok(shown)
     }
 
+    /// Like [`Session::preview_password`], for a passphrase (JSON
+    /// `{words, separator}`).
+    pub fn preview_passphrase(&mut self, options_json: &str) -> Result<Zeroizing<String>> {
+        self.v()?;
+        self.previews.passphrase = None;
+        let p = gen_passphrase(options_json)?;
+        let shown = Zeroizing::new(p.expose().to_owned());
+        self.previews.passphrase = Some(p);
+        Ok(shown)
+    }
+
     /// Like [`Session::preview_password`], for an encoded random secret.
     pub fn preview_secret(&mut self, n_bytes: usize, encoding: &str) -> Result<Zeroizing<String>> {
         self.v()?;
@@ -1227,7 +1310,7 @@ impl Session {
         Ok(shown)
     }
 
-    /// Store the current preview of `kind` ("password" or "secret") as a
+    /// Store the current preview of `kind` ("password", "passphrase" or "secret") as a
     /// generated Secret item. `shown` must equal that preview exactly, so a
     /// replaced, discarded or already saved preview is refused instead of
     /// silently storing something else. The preview is consumed on success
@@ -1242,6 +1325,7 @@ impl Session {
         self.v()?;
         let (secret, format) = match kind {
             "password" => (self.previews.password.as_ref(), SecretFormat::Text),
+            "passphrase" => (self.previews.passphrase.as_ref(), SecretFormat::Text),
             "secret" => match &self.previews.secret {
                 Some((v, enc)) => (Some(v), SecretFormat::Encoded(*enc)),
                 None => (None, SecretFormat::Text),
@@ -1268,6 +1352,7 @@ impl Session {
         let id = self.vm()?.insert(item)?.to_string();
         match kind {
             "password" => self.previews.password = None,
+            "passphrase" => self.previews.passphrase = None,
             _ => self.previews.secret = None,
         }
         Ok(id)
@@ -1390,6 +1475,79 @@ pub fn password_policy_summary(options_json: &str) -> Result<PolicySummary> {
 
 pub fn gen_secret(n_bytes: usize, encoding: &str) -> Result<SecretString> {
     generate_secret(n_bytes, parse_encoding(encoding)?, &mut OsRandom)
+}
+
+// --- Ed25519 sign / verify, passphrases (M5 B) -------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct SignatureOut {
+    pub hex: String,
+    pub base58: String,
+    pub message_bytes: usize,
+}
+
+/// The exact bytes a message stands for, for display before signing or
+/// verifying: their count and hex (the first 512 bytes; `truncated` beyond).
+#[derive(Debug, Serialize, PartialEq)]
+pub struct MessagePreview {
+    pub bytes: usize,
+    pub hex: String,
+    pub truncated: bool,
+}
+
+pub const PREVIEW_BYTES: usize = 512;
+
+pub fn message_preview(message: &str, encoding: &str) -> Result<MessagePreview> {
+    let b = ed25519::message_bytes(message, MessageEncoding::parse(encoding)?)?;
+    let shown = &b[..b.len().min(PREVIEW_BYTES)];
+    Ok(MessagePreview {
+        bytes: b.len(),
+        hex: data_encoding::HEXLOWER.encode(shown),
+        truncated: b.len() > PREVIEW_BYTES,
+    })
+}
+
+/// Outcome of a strict verification. A malformed input is reported as such
+/// and is never "valid".
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Valid,
+    Invalid,
+    BadPublicKey,
+    BadSignature,
+    BadMessage,
+}
+
+/// Stateless strict verification (works without an unlocked vault).
+pub fn verify_ed25519(public_key: &str, message: &str, encoding: &str, signature: &str) -> Verdict {
+    let Ok(pk) = ed25519::parse_public_key(public_key) else {
+        return Verdict::BadPublicKey;
+    };
+    let Ok(sig) = ed25519::parse_signature(signature) else {
+        return Verdict::BadSignature;
+    };
+    let Ok(msg) = MessageEncoding::parse(encoding).and_then(|e| ed25519::message_bytes(message, e))
+    else {
+        return Verdict::BadMessage;
+    };
+    match ed25519::verify(&pk, &msg, &sig) {
+        Ok(()) => Verdict::Valid,
+        Err(_) => Verdict::Invalid,
+    }
+}
+
+fn parse_passphrase_options(json: &str) -> Result<PassphraseOptions> {
+    serde_json::from_str(json).map_err(|_| Error::Policy("invalid passphrase settings".into()))
+}
+
+/// Passphrase from JSON `{words, separator: "space" | "period"}`.
+pub fn gen_passphrase(options_json: &str) -> Result<SecretString> {
+    passphrase::generate_passphrase(&parse_passphrase_options(options_json)?, &mut OsRandom)
+}
+
+pub fn passphrase_summary(options_json: &str) -> Result<PassphraseSummary> {
+    parse_passphrase_options(options_json)?.summary()
 }
 
 #[cfg(test)]
@@ -2033,5 +2191,181 @@ mod tests {
         assert!(derive_password_key(PW, &"x".repeat(1000)).is_err());
         assert!(check_new_password("short").is_err());
         assert!(check_new_password(PW).is_ok());
+    }
+
+    #[test]
+    fn ed25519_sign_verify_through_the_bridge() {
+        let (_k, mut s) = session();
+        let id = s.generate_ed25519("Synthetic signer", "").unwrap();
+        let view = serde_json::to_value(s.get(&id).unwrap()).unwrap();
+        let pk58 = view["data"]["public_key_base58"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let pkhex = view["data"]["public_key_hex"].as_str().unwrap().to_owned();
+        assert_eq!(
+            ed25519::parse_public_key(&pk58).unwrap(),
+            ed25519::parse_public_key(&pkhex).unwrap()
+        );
+        // The view carries no seed.
+        assert!(!serde_json::to_string(&view).unwrap().contains("seed"));
+
+        let out = s.sign_ed25519(&id, "synthetic message", "utf8").unwrap();
+        assert_eq!(out.message_bytes, 17);
+        assert_eq!(out.hex.len(), 128);
+        for (k, sig) in [(&pk58, &out.hex), (&pkhex, &out.base58)] {
+            assert_eq!(
+                verify_ed25519(k, "synthetic message", "utf8", sig),
+                Verdict::Valid
+            );
+        }
+        // Same bytes written as hex verify too; other bytes do not.
+        let hexmsg = data_encoding::HEXLOWER.encode(b"synthetic message");
+        assert_eq!(
+            verify_ed25519(&pk58, &hexmsg, "hex", &out.hex),
+            Verdict::Valid
+        );
+        assert_eq!(
+            verify_ed25519(&pk58, "synthetic message ", "utf8", &out.hex),
+            Verdict::Invalid
+        );
+        assert_eq!(
+            verify_ed25519("nope", "m", "utf8", &out.hex),
+            Verdict::BadPublicKey
+        );
+        assert_eq!(
+            verify_ed25519(&pk58, "m", "utf8", "nope"),
+            Verdict::BadSignature
+        );
+        assert_eq!(
+            verify_ed25519(&pk58, "zz", "hex", &out.hex),
+            Verdict::BadMessage
+        );
+        assert_eq!(
+            verify_ed25519(&pk58, "m", "base64", &out.hex),
+            Verdict::BadMessage
+        );
+
+        // Only Ed25519 items sign; a bad message is refused; locked refuses.
+        let note = s
+            .create_item(input(serde_json::json!({"title": "n", "data": {"kind": "secure_note", "body": "synthetic"}})))
+            .unwrap();
+        assert!(s.sign_ed25519(&note, "m", "utf8").is_err());
+        assert!(s.sign_ed25519(&id, "abc", "hex").is_err());
+        s.lock();
+        assert!(s.sign_ed25519(&id, "m", "utf8").is_err());
+    }
+
+    #[test]
+    fn message_preview_shows_exact_bytes() {
+        let p = message_preview("e\u{301}", "utf8").unwrap();
+        assert_eq!(
+            p,
+            MessagePreview {
+                bytes: 3,
+                hex: "65cc81".into(),
+                truncated: false
+            }
+        );
+        let long = message_preview(&"ab".repeat(600), "hex").unwrap();
+        assert_eq!(
+            (long.bytes, long.hex.len(), long.truncated),
+            (600, 1024, true)
+        );
+        assert!(message_preview("x", "hex").is_err());
+    }
+
+    #[test]
+    fn passphrases_through_the_bridge() {
+        let p = gen_passphrase(r#"{"words":7,"separator":"period"}"#).unwrap();
+        assert_eq!(p.expose().split('.').count(), 7);
+        let sum = passphrase_summary(r#"{"words":5,"separator":"space"}"#).unwrap();
+        assert!(!sum.master_ok);
+        assert!((sum.entropy_bits - 64.62).abs() < 0.01);
+        for bad in [
+            r#"{"words":3,"separator":"space"}"#,
+            r#"{"words":6,"separator":"hyphen"}"#,
+            r#"{"words":6}"#,
+            r#"{"words":6,"separator":"space","x":1}"#,
+            "nope",
+        ] {
+            assert!(gen_passphrase(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn v2_rotation_session_flow_rollback_and_lock() {
+        let (mut s, code) = new_protected();
+        s.create_item(input(
+            serde_json::json!({"title": "n", "data": {"kind": "secure_note", "body": "SYNTH-ROT"}}),
+        ))
+        .unwrap();
+        let b1 = persist_v2(&mut s);
+        let cur = derive(PW, &s.current_password_request().unwrap());
+        const PW_NEW: &str = "synthetic bridge rotated passphrase";
+        // Without fresh parameters: refused.
+        assert!(s.begin_rotation(&cur[..], &[0u8; 32]).is_err());
+        let req = s.begin_password_change().unwrap();
+        let new = derive(PW_NEW, &req);
+        // Wrong current key: refused, the parameters are consumed.
+        assert!(s.begin_rotation(&[7u8; 32], &new[..]).is_err());
+        let req = s.begin_password_change().unwrap();
+        let new = derive(PW_NEW, &req);
+        s.begin_rotation(&cur[..], &new[..]).unwrap();
+        assert!(s.rotation_pending());
+        let shown = s.shown_recovery_code().unwrap().as_str().to_owned();
+        assert_ne!(shown, code);
+        // Mistyped (or old) code: still pending, nothing switched.
+        assert!(s.finish_rotation(&code).is_err());
+        assert!(s.rotation_pending());
+        s.finish_rotation(&shown).unwrap();
+        // A failed write: rollback returns to the stored (old) credentials.
+        s.rollback().unwrap();
+        let (b, r) = s.seal_protected().unwrap();
+        assert!(Session::open_with_recovery(&b, &code).is_ok());
+        s.commit(r).unwrap();
+        // Again, persisted this time.
+        let req = s.begin_password_change().unwrap();
+        let new = derive(PW_NEW, &req);
+        let cur = derive(PW, &s.current_password_request().unwrap());
+        s.begin_rotation(&cur[..], &new[..]).unwrap();
+        let shown = s.shown_recovery_code().unwrap().as_str().to_owned();
+        s.finish_rotation(&shown).unwrap();
+        let b2 = persist_v2(&mut s);
+        let k_new = derive(PW_NEW, &password_request(&b2).unwrap());
+        let w = Session::open_with_password_key(&b2, &k_new[..]).unwrap();
+        assert_eq!(w.list("", "").unwrap().len(), 1);
+        assert!(Session::open_with_recovery(&b2, &shown).is_ok());
+        assert!(Session::open_with_recovery(&b2, &code).is_err());
+        assert!(Session::open_with_recovery(&b1, &code).is_ok());
+        // Lock drops a pending rotation.
+        let req = s.begin_password_change().unwrap();
+        let new2 = derive("synthetic third passphrase here", &req);
+        let cur2 = derive(PW_NEW, &s.current_password_request().unwrap());
+        s.begin_rotation(&cur2[..], &new2[..]).unwrap();
+        s.lock();
+        assert!(!s.rotation_pending());
+        assert!(s.finish_rotation(&shown).is_err());
+    }
+
+    #[test]
+    fn passphrase_preview_is_saved_exactly_once() {
+        let (_k, mut s) = session();
+        let shown = s
+            .preview_passphrase(r#"{"words":6,"separator":"space"}"#)
+            .unwrap();
+        assert!(s.save_preview("passphrase", "not it", "t", "").is_err());
+        let id = s
+            .save_preview("passphrase", &shown, "Synthetic passphrase", "")
+            .unwrap();
+        assert_eq!(s.reveal(&id, "secret").unwrap().as_str(), shown.as_str());
+        assert!(s.save_preview("passphrase", &shown, "again", "").is_err());
+        assert!(s
+            .preview_passphrase(r#"{"words":2,"separator":"space"}"#)
+            .is_err());
+        s.lock();
+        assert!(s
+            .preview_passphrase(r#"{"words":6,"separator":"space"}"#)
+            .is_err());
     }
 }

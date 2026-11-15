@@ -383,3 +383,87 @@ fn passwd_that_cannot_sync_the_directory_changes_nothing() {
         .status
         .success());
 }
+
+#[test]
+fn rotate_key_replaces_both_credentials_and_keeps_old_backups_on_old_ones() {
+    let c = Ctx::new();
+    let v = c.path("vault.keymesh");
+    let code = c.init(&v, PW);
+    c.ok_at(
+        &v,
+        &["add", "note", "--title", "Synthetic note"],
+        &format!("{PW}\nSYNTHETIC-NOTE-BODY\n"),
+    );
+    let bak = c.path("backup.keymesh");
+    c.ok_at(
+        &v,
+        &["backup", "--to", bak.to_str().unwrap()],
+        &format!("{PW}\n"),
+    );
+    let before = std::fs::read(&v).unwrap();
+
+    // Wrong current password, weak or unchanged new password, wrong code
+    // typed back: refused, file untouched.
+    let o = c.run_at(
+        &v,
+        &["rotate-key"],
+        &format!("synthetic wrong passphrase\n{PW2}\n"),
+    );
+    assert!(!o.status.success());
+    let o = c.run_at(&v, &["rotate-key"], &format!("{PW}\nshort\n"));
+    assert!(!o.status.success());
+    let o = c.run_at(&v, &["rotate-key"], &format!("{PW}\n{PW}\n"));
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("different password"));
+    let (o, shown) = c.with_code(&v, &["rotate-key"], &format!("{PW}\n{PW2}\n"), Some(&code));
+    assert!(!o.status.success());
+    assert_eq!(std::fs::read(&v).unwrap(), before);
+    assert_no_secrets(&o.stderr, &[PW, PW2, &code, &shown]);
+
+    let (o, new_code) = c.with_code(&v, &["rotate-key"], &format!("{PW}\n{PW2}\n"), None);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("OLD password and code"),
+        "backup semantics stated"
+    );
+    assert!(out.contains("website and service credentials"));
+    assert_ne!(new_code, code);
+    let after = std::fs::read(&v).unwrap();
+    assert_no_secrets(
+        &after,
+        &[PW2, &new_code, "SYNTHETIC-NOTE-BODY", "Synthetic note"],
+    );
+    // Only the new password opens it; the old one does not.
+    assert!(list(&c, &v, PW2).contains("Synthetic note"));
+    assert!(!c.run_at(&v, &["list"], &format!("{PW}\n")).status.success());
+    // The old recovery code no longer resets it; the new one does.
+    let o = c.run_at(&v, &["passwd", "--recovery"], &format!("{code}\n{PW3}\n"));
+    assert!(!o.status.success());
+    c.ok_at(
+        &v,
+        &["passwd", "--recovery"],
+        &format!("{new_code}\n{PW3}\n"),
+    );
+    assert!(list(&c, &v, PW3).contains("Synthetic note"));
+    // The backup from before still opens with the OLD credentials only.
+    assert!(list(&c, &bak, PW).contains("Synthetic note"));
+    assert!(!c
+        .run_at(&bak, &["list"], &format!("{PW2}\n"))
+        .status
+        .success());
+    assert!(!c
+        .run_at(&bak, &["list"], &format!("{PW3}\n"))
+        .status
+        .success());
+
+    // Demo vaults are not rotated.
+    let demo = c.path("demo.keymesh");
+    let mut d = cmd(&demo);
+    d.env("KEYMESH_DEMO_KEY", "11".repeat(32))
+        .args(["init", "--demo"]);
+    assert!(d.output().unwrap().status.success());
+    let mut d = cmd(&demo);
+    d.env("KEYMESH_DEMO_KEY", "11".repeat(32)).arg("rotate-key");
+    assert!(!d.output().unwrap().status.success());
+}

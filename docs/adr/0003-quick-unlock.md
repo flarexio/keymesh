@@ -203,7 +203,7 @@ A recovery-code path remains for each of them where ADR 0002 already allows it.
 ### 4.5 Device loss, revocation and rotation
 
 * **Removing a PRF slot** needs an unlocked vault. Removal deletes the slot entry, but copies made earlier (backups, another browser profile) still carry it.
-* **Lost or stolen authenticator, or a compromised sync account:** removing the slot is not enough, because any copy made earlier still has it. The complete response is a **DEK rotation**, but **rotation does not exist today**: `Vault::rotate_data_key` refuses v2 vaults (ADR 0002 §8). Until it does:
+* **Lost or stolen authenticator, or a compromised sync account:** removing the slot is not enough, because any copy made earlier still has it. The complete response is a **DEK rotation**. Rotation for password and recovery slots exists since M5 B (ADR 0002 §8, review pending); a PRF slot must be added to its re-enrol-or-revoke extension point before PRF ships. Until then:
   * the UI must **not** offer or mention rotation as an available action;
   * it says plainly that removing the slot protects only future copies of this vault, and that copies already taken stay openable with that authenticator;
   * it advises changing the site credentials stored in the vault.

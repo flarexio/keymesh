@@ -508,7 +508,7 @@ fn email(e: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::rng::OsRandom;
     use crate::secret::SecretBytes;
@@ -524,10 +524,10 @@ mod tests {
         })
     }
 
-    #[test]
-    fn every_kind_validates_and_round_trips() {
+    /// One synthetic value of every item kind (shared with other tests).
+    pub(crate) fn every_kind_data() -> Vec<ItemData> {
         let mut r = OsRandom;
-        let datas = vec![
+        vec![
             login(),
             ItemData::Secret(SecretCredential {
                 secret: SecretString::new("00ff"),
@@ -564,7 +564,13 @@ mod tests {
             ItemData::SecureNote(SecureNote {
                 body: SecretString::new("synthetic note"),
             }),
-        ];
+        ]
+    }
+
+    #[test]
+    fn every_kind_validates_and_round_trips() {
+        let mut r = OsRandom;
+        let datas = every_kind_data();
         for d in datas {
             let mut item = Item::new("Synthetic", d, &mut r).unwrap();
             item.custom_fields.push(CustomField {

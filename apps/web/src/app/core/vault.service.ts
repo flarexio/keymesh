@@ -31,6 +31,7 @@ import { ConflictError, StoredVault, VaultStore } from './vault-store';
 import type { PasswordOptions } from './password-options';
 import { Core, loadCore } from './wasm';
 import type { DemoKeyProvider, VaultSession } from './wasm-pkg/keymesh_wasm';
+import type { MessageEncoding, MessagePreview, PassphraseOptions, PassphraseSummary, SignatureOut, Verdict } from './types';
 import {
   EPHEMERAL_KEY_ID,
   EnvelopeInfo,
@@ -74,6 +75,9 @@ export type VaultErrorCode =
   | 'wrongRecovery'
   | 'demoBackup'
   | 'protectedBackup'
+  | 'samePassword'
+  | 'rotatedWhileLocked'
+  | 'rotationUncertain'
   | 'busy';
 
 export class VaultError extends Error {
@@ -526,6 +530,15 @@ export class VaultService {
     });
   }
 
+  /** The new vault's id (for the emergency kit), or null. */
+  newVaultId(): string | null {
+    try {
+      return this.creating?.vaultId() ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   /** The new vault's recovery code, for display until it is confirmed. */
   newVaultRecoveryCode(): string {
     if (!this.creating) throw new VaultError('noPendingVault', 'No new vault is waiting.');
@@ -806,6 +819,139 @@ export class VaultService {
     }
   }
 
+  // --- data-key rotation (M5 B, ADR 0002 §8) --------------------------------
+
+  /**
+   * Step 1 of a compromise rotation: prove the current password, derive the
+   * new one, and let the core prepare a new data key with new password and
+   * recovery slots. Returns the new recovery code to show. Nothing changes
+   * (memory or storage) until `finishRotation` gets the code back.
+   */
+  beginRotation(current: string, next: string): Promise<string> {
+    return this.credential(async (guard) => {
+      const s = this.protectedSession();
+      this.checkNewPassword(next);
+      if (current.normalize('NFC') === next.normalize('NFC')) {
+        throw new VaultError('samePassword', 'Rotation needs a new password.');
+      }
+      const curKey = await this.derive(current, s.currentPasswordRequest(), guard);
+      try {
+        const newKey = await this.derive(next, s.beginPasswordChange(), guard);
+        try {
+          s.beginRotation(curKey, newKey);
+        } catch (e) {
+          throw this.unlockError(e, 'wrongPassword');
+        } finally {
+          newKey.fill(0);
+        }
+      } finally {
+        curKey.fill(0);
+      }
+      return s.shownRecoveryCode();
+    });
+  }
+
+  /**
+   * Step 2: the core checks the typed code, switches the session to the
+   * rotated vault, and the result is stored with an exact-byte CAS
+   * (requesting strict durability, a browser hint, not a guarantee).
+   * Outcomes:
+   * * before the write (seal error, lock, CAS mismatch): rolled back,
+   *   storage keeps the old data key and credentials;
+   * * the write failed some other way: the store only rejects once its
+   *   transaction is over, so storage is then read back and compared byte
+   *   for byte: new bytes = committed; old bytes = not committed (rolled
+   *   back); other bytes = another writer (conflict, tab goes stale); read
+   *   failed = unknown: the vault is LOCKED and the user unlocks again
+   *   (nothing is rolled back or reinstalled on a guess);
+   * * stored, but the vault was locked meanwhile: `rotatedWhileLocked` (the
+   *   NEW password and code are now required). A lock always wins.
+   * A mistyped code keeps the rotation pending.
+   */
+  finishRotation(code: string): Promise<void> {
+    return this.run(async (guard) => {
+      this.requireSecure();
+      const s = this.protectedSession();
+      s.finishRotation(code);
+      const expected = this.protSnap;
+      let bytes: Uint8Array;
+      let revision: number;
+      try {
+        const sealed = s.sealProtected();
+        bytes = sealed.bytes;
+        revision = sealed.revision;
+        sealed.free();
+      } catch (e) {
+        s.rollback();
+        throw e;
+      }
+      try {
+        await this.protStore.compareAndSwap(expected, this.record(bytes), guard, 'strict');
+      } catch (e) {
+        if (e instanceof ConflictError) {
+          if (!this.isStale(guard)) {
+            s.rollback();
+            this.status.set('stale');
+          }
+          throw e;
+        }
+        if (e instanceof StaleWorkError) {
+          // The guard stopped the write before it was issued: nothing stored.
+          if (!this.isStale(guard)) s.rollback();
+          throw e;
+        }
+        const outcome = await this.storedOutcome(bytes, expected);
+        if (outcome === 'old') {
+          if (!this.isStale(guard)) s.rollback();
+          throw e;
+        }
+        if (outcome === 'other') {
+          if (!this.isStale(guard)) {
+            s.rollback();
+            this.status.set('stale');
+          }
+          throw new ConflictError();
+        }
+        if (outcome === 'unknown') {
+          // Neither credential set can be assumed: drop the session.
+          if (!this.isStale(guard)) this.lock();
+          throw new VaultError('rotationUncertain', 'Could not confirm the rotation.');
+        }
+        // Stored after all: fall through and install.
+      }
+      if (this.isStale(guard)) {
+        this.protSnap = bytes;
+        this.protectedStored.set(this.info(bytes));
+        this.broadcast();
+        throw new VaultError('rotatedWhileLocked', 'The rotation was stored before the vault was locked.');
+      }
+      s.commit(revision);
+      this.protSnap = bytes;
+      this.revision.set(revision);
+      this.protectedStored.set(this.info(bytes));
+      this.version.update((v) => v + 1);
+      this.broadcast();
+    });
+  }
+
+  /** Which envelope storage holds now, compared byte for byte. */
+  private async storedOutcome(next: Uint8Array, previous: Uint8Array | null): Promise<'new' | 'old' | 'other' | 'unknown'> {
+    try {
+      const now = await this.protStore.read();
+      if (now && sameBytes(now.bytes, next)) return 'new';
+      if (now ? sameBytes(now.bytes, previous) : previous === null) return 'old';
+      return 'other';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  cancelRotation(): void {
+    if (this.session && this.status() === 'unlocked' && this.active === 'protected') {
+      this.session.cancelRotation();
+    }
+  }
+
   /** Delete the stored password vault (only the exact one this tab last saw). */
   discardProtected(): Promise<void> {
     this.lock();
@@ -852,6 +998,33 @@ export class VaultService {
     return this.c().generatePasswordWithOptions(JSON.stringify(options));
   }
 
+  // --- Ed25519 sign / verify, passphrases (M5 B) ----------------------------
+
+  /** Sign the exact bytes of `message` with Ed25519 item `id` (unlocked only). */
+  signEd25519(id: string, message: string, encoding: MessageEncoding): SignatureOut {
+    if (this.status() !== 'unlocked') throw new LockedError();
+    return JSON.parse(this.s().signEd25519(id, message, encoding)) as SignatureOut;
+  }
+
+  /** Strict verification in the core; needs no vault. */
+  verifyEd25519(publicKey: string, message: string, encoding: MessageEncoding, signature: string): Verdict {
+    return this.c().verifyEd25519(publicKey, message, encoding, signature) as Verdict;
+  }
+
+  /** Byte count and hex of exactly what would be signed or verified. */
+  messagePreview(message: string, encoding: MessageEncoding): MessagePreview {
+    return JSON.parse(this.c().messagePreview(message, encoding)) as MessagePreview;
+  }
+
+  /** Passphrase from the core (EFF Long Wordlist, OS CSPRNG). */
+  generatePassphrase(options: PassphraseOptions): string {
+    return this.c().generatePassphrase(JSON.stringify(options));
+  }
+
+  passphraseSummary(options: PassphraseOptions): PassphraseSummary {
+    return JSON.parse(this.c().passphraseSummary(JSON.stringify(options))) as PassphraseSummary;
+  }
+
   /** Validate settings in the core without generating anything. */
   checkPasswordOptions(options: PasswordOptions): void {
     this.c().passwordPolicySummary(JSON.stringify(options));
@@ -876,7 +1049,13 @@ export class VaultService {
    * value that is not its current preview (replaced, discarded on lock, or
    * already saved), so nothing else can be stored in its place.
    */
-  savePreview(kind: 'password' | 'secret', shown: string, title: string): Promise<string> {
+  /** Passphrase preview (EFF Long Wordlist), kept by the core like the others. */
+  previewPassphrase(options: PassphraseOptions): string {
+    if (this.status() !== 'unlocked') throw new LockedError();
+    return this.s().previewPassphrase(JSON.stringify(options));
+  }
+
+  savePreview(kind: 'password' | 'passphrase' | 'secret', shown: string, title: string): Promise<string> {
     return this.mutate((s) => s.savePreview(kind, shown, title, ''));
   }
 

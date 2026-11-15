@@ -47,6 +47,7 @@ const CORE_PATTERNS: [RegExp, MessageKey][] = [
   [/^invalid generator policy: policy entropy below/, 'errors.pwWeak'],
   [/^invalid generator policy/, 'errors.generatorPolicy'],
   [/^item not found/, 'errors.notFound'],
+  [/^Ed25519 key error/, 'errors.signFailed'],
 ];
 
 export function errorKey(e: unknown): MessageKey {
