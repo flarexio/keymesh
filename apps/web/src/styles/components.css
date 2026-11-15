@@ -1613,3 +1613,31 @@ km-secret-field .field-error {
 .callout.notice .notice-body p {
   margin: 0;
 }
+
+/* Auto-lock settings card and lock reason (M5 C2). */
+.autolock-card {
+  margin-top: var(--space-4);
+}
+.autolock-reason {
+  max-width: 64rem;
+  margin: var(--space-4) max(var(--space-4), calc((100% - 64rem) / 2)) 0;
+}
+
+/* Opted-in website icon (same-origin, sanitized PNG). */
+.remote-tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.remote-tile img {
+  width: 70%;
+  height: 70%;
+  object-fit: contain;
+}
+
+.credential-notice-host:not(:empty) {
+  display: block;
+  max-width: 64rem;
+  margin: var(--space-4) auto 0;
+  padding-inline: var(--space-4);
+}

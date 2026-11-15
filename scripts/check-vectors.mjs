@@ -137,6 +137,10 @@ function openEnvelope(name, e) {
       : fields('hkdf-sha256', b64u(k.salt));
   const slotAad = (s) => fields('keymesh.vault', '2', 'slot', file.aead, file.vault_id, s.id, s.kind, canon(s.kdf));
   const pw = file.slots.find((s) => s.kind === 'password');
+  const canonKdf = (k) =>
+    k.alg === 'webauthn-prf-hkdf'
+      ? fields('webauthn-prf-hkdf', b64u(k.credential_id), k.rp_id, b64u(k.salt), Buffer.from([k.be ? 1 : 0]), k.label)
+      : canon(k);
   const rc = file.slots.find((s) => s.kind === 'recovery');
   const unwrapPw = (password) =>
     xopen(
@@ -148,12 +152,14 @@ function openEnvelope(name, e) {
   const unwrapRc = (code) =>
     xopen(kek(decodeCode(code), b64u(rc.kdf.salt), 'recovery', file.vault_id, rc.id), b64u(rc.wrapped.nonce), b64u(rc.wrapped.ct), slotAad(rc));
   const dekA = unwrapPw(e.password);
-  const dekB = unwrapRc(e.recovery_code);
-  check(`${name}: both slots unwrap the same 32-byte DEK`, dekA.length === 32 && dekA.equals(dekB));
+  if (!e.skipRecovery) {
+    const dekB = unwrapRc(e.recovery_code);
+    check(`${name}: both slots unwrap the same 32-byte DEK`, dekA.length === 32 && dekA.equals(dekB));
+  }
 
   const digest = createHash('sha256').update(u32(file.slots.length));
   for (const s of file.slots) {
-    digest.update(fields(s.id, s.kind, canon(s.kdf), b64u(s.wrapped.nonce), b64u(s.wrapped.ct)));
+    digest.update(fields(s.id, s.kind, canonKdf(s.kdf), b64u(s.wrapped.nonce), b64u(s.wrapped.ct)));
   }
   const maad = fields('keymesh.vault', '2', 'manifest', file.aead, file.vault_id, u64(file.revision), digest.digest());
   const manifest = JSON.parse(xopen(dekA, b64u(file.manifest.nonce), b64u(file.manifest.ct), maad));
@@ -188,6 +194,34 @@ check('rotation uses a different DEK', !after.dek.equals(before.dek));
 check('old password does not open the rotated slot', after.fails(() => after.unwrapPw(e.password)));
 check('old recovery code does not open the rotated slot', after.fails(() => after.unwrapRc(e.recovery_code)));
 check('new recovery code does not open the old slot', before.fails(() => before.unwrapRc(rot.after.recovery_code)));
+
+// PRF quick-unlock vector (M5 C1): the webauthn-prf slot unwraps the SAME
+// DEK as the password slot, with the KEK and AAD recomputed from the spec:
+//   canonical = fields("webauthn-prf-hkdf", credential_id, rp_id, salt, [be], label)
+//   KEK = HKDF-SHA256(salt = none, ikm = PRF output,
+//         info = fields("keymesh.vault","2","kek","webauthn-prf", vault_id, slot_id, credential_id))
+{
+  const pv = JSON.parse(readFileSync(new URL('../tests/fixtures/v2/prf.json', import.meta.url), 'utf8')).prf;
+  const pfile = JSON.parse(pv.json);
+  const slot = pfile.slots.find((s) => s.kind === 'webauthn-prf');
+  const cred = Buffer.from(pv.credential_id_hex, 'hex');
+  check('prf: slot binds the vector credential, rp id and label', slot && b64u(slot.kdf.credential_id).equals(cred) && slot.kdf.rp_id === pv.rp_id && slot.kdf.label === pv.label && slot.kdf.be === false);
+  const canonPrf = fields('webauthn-prf-hkdf', cred, slot.kdf.rp_id, b64u(slot.kdf.salt), Buffer.from([0]), slot.kdf.label);
+  const prfAad = fields('keymesh.vault', '2', 'slot', pfile.aead, pfile.vault_id, slot.id, slot.kind, canonPrf);
+  const prfKek = Buffer.from(
+    hkdfSync('sha256', Buffer.from(pv.prf_output_hex, 'hex'), Buffer.alloc(0), fields('keymesh.vault', '2', 'kek', 'webauthn-prf', pfile.vault_id, slot.id, cred), 32),
+  );
+  const dekPrf = xopen(prfKek, b64u(slot.wrapped.nonce), b64u(slot.wrapped.ct), prfAad);
+  const opened = openEnvelope('prf envelope', { ...pv, recovery_code: null, vault_id: pfile.vault_id, titles: pv.titles, json: pv.json, password: pv.password, skipRecovery: true });
+  check('prf: the passkey slot unwraps the same DEK as the password slot', dekPrf.length === 32 && dekPrf.equals(opened.dek));
+  const wrongPrf = Buffer.from(pv.prf_output_hex, 'hex');
+  wrongPrf[0] ^= 1;
+  const wk = Buffer.from(hkdfSync('sha256', wrongPrf, Buffer.alloc(0), fields('keymesh.vault', '2', 'kek', 'webauthn-prf', pfile.vault_id, slot.id, cred), 32));
+  check('prf: a different PRF output fails authentication', opened.fails(() => xopen(wk, b64u(slot.wrapped.nonce), b64u(slot.wrapped.ct), prfAad)));
+  const tampered = fields('webauthn-prf-hkdf', cred, slot.kdf.rp_id, b64u(slot.kdf.salt), Buffer.from([1]), slot.kdf.label);
+  const tAad = fields('keymesh.vault', '2', 'slot', pfile.aead, pfile.vault_id, slot.id, slot.kind, tampered);
+  check('prf: the BE flag is authenticated (flipped → fails)', opened.fails(() => xopen(prfKek, b64u(slot.wrapped.nonce), b64u(slot.wrapped.ct), tAad)));
+}
 
 let wrongRejected = false;
 try {

@@ -25,6 +25,7 @@ import { PreferencesService } from './preferences';
 import { en } from './i18n/en';
 import { zhTW } from './i18n/zh-tw';
 import { PREFERENCE_STORAGE } from './preferences';
+import { WEBAUTHN } from './quick-unlock';
 
 function deferred<T = void>() {
   let resolve!: (v: T) => void;
@@ -61,6 +62,46 @@ const pwTag = (pw: string) => (pw === GOOD_PW ? 1 : pw === NEW_PW ? 2 : 9);
 const keyFor = (pw: string) => new Uint8Array([pwTag(pw), 0, 0, 0]);
 
 const sessions: FakeSession[] = [];
+const CRED = new Uint8Array(Array.from({ length: 16 }, (_, i) => i + 1));
+const CRED_B64 = 'AQIDBAUGBwgJCgsMDQ4PEA';
+const PRF_SLOT = { slot_id: 'aaaaaaaaaaaaaaaa', credential_id: CRED_B64, rp_id: 'localhost', salt: 'x', label: 'Synthetic key', be: false };
+
+/** Scripted WebAuthn: create() returns a credential with or without PRF. */
+function fakeWebAuthn(opts: { prf?: boolean; hold?: Promise<void> } = {}) {
+  const calls = { create: 0, get: 0 };
+  const authData = (flags: number) => {
+    const d = new Uint8Array(37);
+    d[32] = flags;
+    return d.buffer;
+  };
+  const cred = (prf: boolean) =>
+    ({
+      rawId: CRED.slice().buffer,
+      response: { getAuthenticatorData: () => authData(0x05), authenticatorData: authData(0x05) },
+      getClientExtensionResults: () => ({ prf: { enabled: prf, results: prf ? { first: new Uint8Array(32).fill(7).buffer } : undefined } }),
+    }) as unknown as PublicKeyCredential;
+  return {
+    calls,
+    port: {
+      async create(o: CredentialCreationOptions) {
+        calls.create++;
+        if (opts.hold) {
+          await new Promise<void>((res, rej) => {
+            o.signal?.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError')));
+            void opts.hold!.then(res);
+          });
+        }
+        return cred(opts.prf ?? true);
+      },
+      async get() {
+        calls.get++;
+        return opts.prf === false ? cred(false) : cred(true);
+      },
+      prfHint: async () => undefined,
+      available: () => true,
+    },
+  };
+}
 
 class FakeSession {
   freed = false;
@@ -71,6 +112,9 @@ class FakeSession {
   pendingCode: string | null = null;
   /** A prepared rotation: the new password tag (data key "rotates" with it). */
   rotating: number | null = null;
+  passkey = false;
+  committedPasskey = false;
+  prfPending = false;
   committedPw: number;
   committedCode: string;
   rollbacks = 0;
@@ -165,22 +209,45 @@ class FakeSession {
   cancelRotation() {
     this.rotating = null;
   }
+  prfSlots() {
+    return this.passkey ? JSON.stringify([PRF_SLOT]) : '[]';
+  }
+  beginPrfEnrolment(cur: Uint8Array) {
+    if (cur[0] !== this.pw) throw new Error('decryption failed: wrong key or corrupted data');
+    this.prfPending = true;
+    return JSON.stringify({ slot_id: 'aaaaaaaaaaaaaaaa', salt: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', vault_id: 'v'.repeat(32) });
+  }
+  finishPrfEnrolment(cur: Uint8Array, _id: Uint8Array, _rp: string, _be: boolean, _label: string, prf: Uint8Array) {
+    if (!this.prfPending) throw new Error('validation failed: start the quick-unlock enrolment first');
+    this.prfPending = false;
+    if (cur[0] !== this.pw || prf.length !== 32) throw new Error('decryption failed');
+    this.passkey = true;
+  }
+  cancelPrfEnrolment() {
+    this.prfPending = false;
+  }
+  beginRotationRevokingQuickUnlock(cur: Uint8Array, next: Uint8Array) {
+    this.beginRotation(cur, next);
+  }
   rollback() {
     this.rollbacks++;
     this.pw = this.committedPw;
     this.code = this.committedCode;
+    this.passkey = this.committedPasskey;
   }
   sealProtected() {
     if (!this.confirmed) throw new Error('validation failed: confirm the recovery code before saving the vault');
     const revision = this.rev + 1;
     this.pending = revision;
-    return { bytes: v2(revision, this.pw, codeTag(this.code)), revision, free() {} };
+    const b = v2(revision, this.pw, codeTag(this.code));
+    return { bytes: this.passkey ? new Uint8Array([...b, 1]) : b, revision, free() {} };
   }
   commit(r: number) {
     if (r !== this.pending) throw new Error('no matching sealed revision');
     this.rev = r;
     this.committedPw = this.pw;
     this.committedCode = this.code;
+    this.committedPasskey = this.passkey;
   }
   lock() {
     this.locked = true;
@@ -209,6 +276,7 @@ const fakeCore = {
     });
   },
   passwordRequest: () => '{"stored":1}',
+  prfRequest: (b: Uint8Array) => (b[6] === 1 ? JSON.stringify([PRF_SLOT]) : '[]'),
   checkNewPassword: (pw: string) => {
     if ([...pw].length < 15) throw new Error('validation failed: password is too short');
   },
@@ -1111,5 +1179,179 @@ describe('rotation outcome notice in the mounted app', () => {
     vault.recordNotice('rotationUncertain', older + 1);
     vault.recordNotice('rotatedWhileLocked', older);
     expect(vault.credentialNotice()?.code).toBe('rotationUncertain');
+  });
+});
+
+/**
+ * Passkey enrolment outcomes in the mounted app (C1 gate response). The
+ * notice must be visible on the LOCKED screen after the Backup view is gone;
+ * "orphan" only when it is proven nothing was written; an unknown outcome
+ * stays pending through failed unlocks and is reconciled by the next
+ * successful one.
+ */
+describe('passkey enrolment outcomes in the mounted app', () => {
+  let prot: TestStore;
+  let kdf: ManualKdf;
+
+  beforeAll(() => {
+    globalThis.matchMedia ??= ((q: string) =>
+      ({ matches: false, media: q, addEventListener() {}, removeEventListener() {}, onchange: null }) as unknown as MediaQueryList) as typeof matchMedia;
+  });
+
+  async function mount(wa: ReturnType<typeof fakeWebAuthn>) {
+    sessions.length = 0;
+    prot = new TestStore(new IDBFactory(), 'keymesh-vault');
+    kdf = new ManualKdf();
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        provideServiceWorker('ngsw-worker.js', { enabled: false }),
+        { provide: VAULT_STORE, useValue: new TestStore(new IDBFactory(), 'keymesh-demo') },
+        { provide: PROTECTED_VAULT_STORE, useValue: prot },
+        { provide: KDF_RUNNER, useValue: kdf },
+        { provide: SECURE_CONTEXT, useValue: true },
+        { provide: CORE_LOADER, useValue: () => Promise.resolve(fakeCore) },
+        { provide: PREFERENCE_STORAGE, useValue: null },
+        { provide: WEBAUTHN, useValue: wa.port },
+      ],
+    });
+    TestBed.inject(PreferencesService).setLocale('en');
+    await prot.create(rec(v2(3)));
+    prot.writes = 0;
+    prot.landed = 0;
+    const fixture = TestBed.createComponent(App);
+    const el = fixture.nativeElement as HTMLElement;
+    const settle = async () => {
+      fixture.detectChanges();
+      await fixture.whenStable();
+      fixture.detectChanges();
+    };
+    const q = (id: string) => el.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+    const vault = TestBed.inject(VaultService);
+    await settle();
+    await until(() => vault.status() !== 'loading' && vault.protectedStored() !== null, 'app started');
+    const unlock = async (pw: string) => {
+      let settled = false;
+      const p = vault
+        .unlockWithPassword(pw)
+        .catch(() => undefined) // handled at once (a failed unlock is expected here)
+        .finally(() => (settled = true));
+      // With storage reads failing the unlock fails before any KDF runs.
+      await until(() => settled || (kdf.calls.length > 0 && kdf.returned.length < kdf.calls.length), 'KDF call or failure');
+      if (!settled) kdf.release();
+      await p;
+      kdf.calls = [];
+      kdf.returned = [];
+      await settle();
+    };
+    await unlock(GOOD_PW);
+    expect(vault.status()).toBe('unlocked');
+    return { fixture, el, q, settle, vault, unlock };
+  }
+
+  async function enrol(vault: VaultService) {
+    const p = vault.enrollQuickUnlock(GOOD_PW, 'Synthetic key');
+    await kdf.started(1);
+    kdf.release(0);
+    return p;
+  }
+
+  const shown = (q: (id: string) => HTMLElement | null) => ({
+    code: q('credential-notice')?.getAttribute('data-code') ?? null,
+    text: q('credential-notice')?.textContent ?? '',
+  });
+
+  it('success: stored, no notice', async () => {
+    const wa = fakeWebAuthn();
+    const { vault, q, settle } = await mount(wa);
+    await enrol(vault);
+    await settle();
+    expect(Array.from((await prot.read())!.bytes)[6]).toBe(1);
+    expect(q('credential-notice')).toBeNull();
+  });
+
+  it('wrong master password: refused before create(), no passkey, no notice', async () => {
+    const wa = fakeWebAuthn();
+    const { vault, q, settle } = await mount(wa);
+    const p = vault.enrollQuickUnlock('synthetic wrong passphrase', 'x');
+    await kdf.started(1);
+    kdf.release(0);
+    expect(errorKey(await p.catch((e: unknown) => e))).toBe('errors.wrongPassword');
+    expect(wa.calls.create).toBe(0);
+    await settle();
+    expect(q('credential-notice')).toBeNull();
+  });
+
+  it('authenticator without PRF: orphan guidance (label, time) survives the lock; password fallback works', async () => {
+    const wa = fakeWebAuthn({ prf: false });
+    const { vault, q, settle, unlock } = await mount(wa);
+    expect(errorKey(await enrol(vault).catch((e: unknown) => e))).toBe('errors.quickUnlockOrphan');
+    expect(prot.writes).toBe(0);
+    vault.lock();
+    await settle();
+    expect(shown(q).code).toBe('quickUnlockOrphan');
+    expect(shown(q).text).toContain(en['notice.quickUnlockOrphan']);
+    expect(q('credential-notice-passkey')?.textContent).toContain('Synthetic key');
+    await unlock(GOOD_PW); // password still works; the orphan note stays until acknowledged
+    expect(vault.status()).toBe('unlocked');
+    expect(shown(q).code).toBe('quickUnlockOrphan');
+  });
+
+  it('lock during create(): the ceremony is aborted; the may-exist passkey gets the guidance; nothing written', async () => {
+    const hold = deferred();
+    const wa = fakeWebAuthn({ hold: hold.promise });
+    const { vault, q, settle } = await mount(wa);
+    const p = enrol(vault);
+    await until(() => wa.calls.create === 1, 'create() started');
+    vault.lock();
+    hold.resolve();
+    await p.catch(() => undefined);
+    await settle();
+    expect(prot.writes).toBe(0);
+    expect(shown(q).code).toBe('quickUnlockOrphan');
+    expect(vault.status()).not.toBe('unlocked');
+  });
+
+  it('write outcome unknown: pending (no delete advice) through a failed unlock; reconciled as ADDED when the write had landed', async () => {
+    const wa = fakeWebAuthn();
+    const { vault, q, settle, unlock } = await mount(wa);
+    prot.failAfterPut = true;
+    prot.readFails = true;
+    expect(errorKey(await enrol(vault).catch((e: unknown) => e))).toBe('errors.quickUnlockUncertain');
+    await settle();
+    expect(vault.status()).not.toBe('unlocked');
+    expect(shown(q).code).toBe('quickUnlockUncertain');
+    expect(shown(q).text).not.toContain(en['notice.quickUnlockOrphan']);
+    // Reads still failing: the unlock fails; the pending notice stays.
+    await unlock(GOOD_PW);
+    expect(vault.status()).not.toBe('unlocked');
+    expect(shown(q).code).toBe('quickUnlockUncertain');
+    // A wrong password: still pending.
+    prot.readFails = false;
+    prot.failAfterPut = false;
+    await unlock('synthetic wrong passphrase');
+    expect(shown(q).code).toBe('quickUnlockUncertain');
+    // Successful unlock: the stored vault HAS the passkey → no orphan.
+    await unlock(GOOD_PW);
+    expect(vault.status()).toBe('unlocked');
+    expect(q('credential-notice')).toBeNull();
+  });
+
+  it('write outcome unknown and the write had NOT landed: reconciled as an orphan only after a successful unlock', async () => {
+    const wa = fakeWebAuthn();
+    const { vault, q, settle, unlock } = await mount(wa);
+    prot.fail = true; // the write never lands...
+    prot.readFails = true; // ...and the outcome can't be read back
+    // A write error that is neither a conflict nor a guard stop goes to the
+    // read-back; with reads failing the outcome is unknown.
+    const r = await enrol(vault).catch((e: unknown) => e);
+    expect(errorKey(r)).toBe('errors.quickUnlockUncertain');
+    await settle();
+    expect(shown(q).code).toBe('quickUnlockUncertain');
+    prot.fail = false;
+    prot.readFails = false;
+    await unlock(GOOD_PW);
+    expect(vault.status()).toBe('unlocked');
+    expect(shown(q).code).toBe('quickUnlockOrphan'); // proven absent now
   });
 });

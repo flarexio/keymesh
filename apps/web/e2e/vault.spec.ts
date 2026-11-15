@@ -28,6 +28,12 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   context,
 }, testInfo) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  // This flow jumps the clock decades forward (RFC 6238 vector) with the
+  // vault open: start at the fixed early time and opt out of the idle
+  // limit through the app's own auto-lock setting (M5 C2). The clock only
+  // moves forward, so the backwards-clock rule stays active.
+  await page.clock.setFixedTime(new Date(59_000));
+  await page.addInitScript(() => localStorage.setItem('keymesh.autolock.v1', '{"idleMinutes":0,"hideSeconds":30}'));
   const errors: string[] = [];
   page.on('pageerror', (e) => errors.push(e.message));
   const requests: string[] = [];
@@ -109,7 +115,9 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   // Storage holds only the encrypted envelope.
   assertNoMarkers(await storedBytes(page), 'IndexedDB');
   const storage = await browserStorageSummary(page);
-  expect(storage).toEqual({ dbs: ['keymesh-demo'], local: 0, session: 0, cookies: '' });
+  // The only Web Storage entry is this test's non-secret auto-lock setting.
+  expect(storage).toEqual({ dbs: ['keymesh-demo'], local: 1, session: 0, cookies: '' });
+  expect(await page.evaluate(() => Object.keys(localStorage))).toEqual(['keymesh.autolock.v1']);
 
   // Screenshot of the running UI with synthetic data.
   await openItem(page, 'Synthetic TOTP');

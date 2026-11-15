@@ -9,10 +9,12 @@ import { Start } from './features/start';
 import { VaultShell } from './features/vault-shell';
 import { InstallApp, UpdateBanner } from './features/app-install';
 import { BrandCatalog } from './shared/brand-catalog';
+import { AutoLock, LockReason } from './core/auto-lock';
+import { CredentialNotice } from './shared/credential-notice';
 
 @Component({
   selector: 'app-root',
-  imports: [Start, VaultShell, DisplayPrefs, ConfirmDialog, Toasts, Icon, UpdateBanner, InstallApp],
+  imports: [Start, VaultShell, DisplayPrefs, ConfirmDialog, Toasts, Icon, UpdateBanner, InstallApp, CredentialNotice],
   template: `
     <a class="skip-link" href="#main">{{ i18n.t('app.skipToContent') }}</a>
     <div class="demo-strip" role="note" data-testid="demo-banner">
@@ -37,6 +39,7 @@ import { BrandCatalog } from './shared/brand-catalog';
       </div>
     </header>
     <main id="main" tabindex="-1" [class.main-vault]="open()">
+      <km-credential-notice class="credential-notice-host" />
       @if (open()) {
         <km-vault-shell />
       } @else {
@@ -69,6 +72,11 @@ import { BrandCatalog } from './shared/brand-catalog';
           </div>
         }
         @default {
+          @if (autoLock.lastReason(); as why) {
+            <div class="callout callout-info autolock-reason" role="status" data-testid="autolock-reason" [attr.data-reason]="why">
+              <km-icon name="lock" /><p>{{ i18n.t(reasonKey[why]) }}</p>
+            </div>
+          }
           <km-start />
         }
       }
@@ -84,7 +92,16 @@ export class App implements OnInit {
   private readonly confirm = inject(ConfirmService);
   private readonly toast = inject(ToastService);
 
+  protected readonly autoLock = inject(AutoLock);
+  protected readonly reasonKey: Record<LockReason, MessageKey> = {
+    idle: 'autolock.reason.idle',
+    hidden: 'autolock.reason.hidden',
+    clock: 'autolock.reason.clock',
+    pagehide: 'autolock.reason.pagehide',
+  };
+
   constructor() {
+    this.autoLock.start();
     inject(BrandCatalog); // start loading login brand icons (lazy chunk)
     // Locking closes any pending confirmation and clears notifications.
     let wasOpen = false;

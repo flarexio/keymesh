@@ -15,7 +15,7 @@ use keymesh::generate::{
     PolicySummary, SecretEncoding,
 };
 use keymesh::kdf::{self, KdfParams};
-use keymesh::keyslot::{Authority, PasswordSetup};
+use keymesh::keyslot::{Authority, PasswordSetup, PRF_LEN};
 use keymesh::model::{
     Contact, CryptoWalletRecord, CustomField, Ed25519KeyRecord, FieldKind, Item, ItemData, ItemId,
     ItemKind, LabeledValue, Login, SecretCredential, SecretFormat, SecretOrigin, SecureNote,
@@ -27,8 +27,8 @@ use keymesh::rng::OsRandom;
 use keymesh::secret::SecretString;
 use keymesh::totp::{code_now, parse_base32_secret, parse_otpauth_uri, FixedClock, TotpConfig};
 use keymesh::vault::{
-    password_request as envelope_password_request, read_header, PendingRecovery, PendingRotation,
-    ProtectedSetup, Vault,
+    password_request as envelope_password_request, prf_request as envelope_prf_request,
+    read_header, PendingPrf, PendingRecovery, PendingRotation, PrfRequest, ProtectedSetup, Vault,
 };
 use keymesh::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -597,6 +597,8 @@ pub struct Session {
     pending_recovery: Option<PendingRecovery>,
     /// v2: a data-key rotation waiting for its new recovery code.
     pending_rotation: Option<PendingRotation>,
+    /// v2: a quick-unlock enrolment in progress (bound to this vault state).
+    pending_prf: Option<PendingPrf>,
 }
 
 /// The latest generated-but-unsaved value per generator. Zeroized on drop,
@@ -620,6 +622,7 @@ impl Session {
             pending_password: None,
             pending_recovery: None,
             pending_rotation: None,
+            pending_prf: None,
         }
     }
 
@@ -651,6 +654,7 @@ impl Session {
         self.pending_password = None;
         self.pending_recovery = None;
         self.pending_rotation = None;
+        self.pending_prf = None;
     }
 
     // --- v2: password + recovery --------------------------------------------
@@ -798,6 +802,7 @@ impl Session {
             self.v()?
                 .begin_rotation(Authority::PasswordKey(&cur), &setup, &new, &mut OsRandom)?;
         self.pending_recovery = None;
+        self.pending_prf = None;
         self.pending_rotation = Some(p);
         Ok(())
     }
@@ -816,6 +821,108 @@ impl Session {
         self.pending_rotation = None;
         self.vault = Some(rotated);
         Ok(())
+    }
+
+    /// Like [`Session::begin_rotation`], revoking quick-unlock passkeys
+    /// (the user confirmed); without it rotation is refused while any exist.
+    pub fn begin_rotation_revoking_quick_unlock(
+        &mut self,
+        current_key: &[u8],
+        new_key: &[u8],
+    ) -> Result<()> {
+        let setup = self.take_password_setup()?;
+        let (cur, new) = (key32(current_key)?, key32(new_key)?);
+        let p = self.v()?.begin_rotation_revoking_quick_unlock(
+            Authority::PasswordKey(&cur),
+            &setup,
+            &new,
+            &mut OsRandom,
+        )?;
+        self.pending_recovery = None;
+        self.pending_rotation = Some(p);
+        Ok(())
+    }
+
+    // --- v2: quick unlock (webauthn-prf) ----------------------------------
+
+    /// Start enrolling a passkey: the CURRENT password's key is verified
+    /// first (no passkey is created for a wrong password), then the core
+    /// issues the slot id and PRF input salt (32 random bytes).
+    pub fn begin_prf_enrolment(&mut self, current_key: &[u8]) -> Result<PrfEnrolment> {
+        let cur = key32(current_key)?;
+        let p = self
+            .v()?
+            .begin_prf(Authority::PasswordKey(&cur), &mut OsRandom)?;
+        let e = PrfEnrolment {
+            slot_id: p.setup().slot_id.clone(),
+            salt: data_encoding::BASE64URL_NOPAD.encode(&p.setup().salt),
+            vault_id: self.v()?.vault_id().to_owned(),
+        };
+        self.pending_prf = Some(p);
+        Ok(e)
+    }
+
+    /// Finish enrolling: authority is the CURRENT password's key. The new
+    /// slot is verified in memory; persist with seal + commit (or rollback).
+    pub fn finish_prf_enrolment(
+        &mut self,
+        current_key: &[u8],
+        credential_id: &[u8],
+        rp_id: &str,
+        be: bool,
+        label: &str,
+        prf_output: &[u8],
+    ) -> Result<()> {
+        let pending = self
+            .pending_prf
+            .take()
+            .ok_or_else(|| Error::Validation("start the quick-unlock enrolment first".into()))?;
+        let cur = key32(current_key)?;
+        let prf = prf32(prf_output)?;
+        self.vm()?.add_prf_slot(
+            Authority::PasswordKey(&cur),
+            &pending,
+            credential_id,
+            rp_id,
+            be,
+            label,
+            &prf,
+            &mut OsRandom,
+        )
+    }
+
+    pub fn cancel_prf_enrolment(&mut self) {
+        self.pending_prf = None;
+    }
+
+    pub fn prf_slots(&self) -> Result<Vec<PrfRequest>> {
+        self.v()?.prf_slots()
+    }
+
+    /// Remove a quick-unlock slot; authority is the CURRENT password's key.
+    pub fn remove_prf_slot(&mut self, current_key: &[u8], slot_id: &str) -> Result<()> {
+        let cur = key32(current_key)?;
+        self.vm()?
+            .remove_prf_slot(Authority::PasswordKey(&cur), slot_id)
+    }
+
+    /// Open with a quick-unlock assertion (see `Vault::open_with_prf`).
+    pub fn open_with_prf(
+        bytes: &[u8],
+        credential_id: &[u8],
+        authenticator_data: &[u8],
+        prf_output: &[u8],
+        rp_id: &str,
+    ) -> Result<Self> {
+        check_size(bytes)?;
+        let prf = prf32(prf_output)?;
+        Ok(Self::with_vault(Vault::open_with_prf(
+            bytes,
+            credential_id,
+            authenticator_data,
+            &prf,
+            rp_id,
+        )?))
     }
 
     pub fn cancel_rotation(&mut self) {
@@ -1422,6 +1529,28 @@ impl Session {
             _ => Err(Error::Integrity("no matching sealed revision".into())),
         }
     }
+}
+
+/// Parameters for a passkey enrolment (public).
+#[derive(Debug, Serialize)]
+pub struct PrfEnrolment {
+    pub slot_id: String,
+    /// PRF input, base64url (32 bytes).
+    pub salt: String,
+    pub vault_id: String,
+}
+
+fn prf32(b: &[u8]) -> Result<Zeroizing<[u8; PRF_LEN]>> {
+    let a: [u8; PRF_LEN] = b
+        .try_into()
+        .map_err(|_| Error::Validation("PRF output must be 32 bytes".into()))?;
+    Ok(Zeroizing::new(a))
+}
+
+/// Quick-unlock slots of a stored envelope (public), for `get()`.
+pub fn prf_request(bytes: &[u8]) -> Result<Vec<PrfRequest>> {
+    check_size(bytes)?;
+    envelope_prf_request(bytes)
 }
 
 pub fn parse_profile(p: &str) -> Result<PasswordProfile> {
@@ -2369,5 +2498,73 @@ mod tests {
         assert!(s
             .preview_passphrase(r#"{"words":6,"separator":"space"}"#)
             .is_err());
+    }
+
+    #[test]
+    fn prf_enrolment_unlock_and_removal_through_the_bridge() {
+        use sha2::{Digest, Sha256};
+        let (mut s, code) = new_protected();
+        let b0 = persist_v2(&mut s);
+        let cur = derive(PW, &s.current_password_request().unwrap());
+        // Enrolment needs the parameters the core issued first.
+        assert!(s
+            .finish_prf_enrolment(&cur[..], &[3; 16], "keymesh.cloud", false, "k", &[1; 32])
+            .is_err());
+        assert!(
+            s.begin_prf_enrolment(&[7; 32]).is_err(),
+            "wrong password: refused before any ceremony"
+        );
+        let e = s.begin_prf_enrolment(&cur[..]).unwrap();
+        assert_eq!(
+            data_encoding::BASE64URL_NOPAD
+                .decode(e.salt.as_bytes())
+                .unwrap()
+                .len(),
+            32
+        );
+        // Wrong current password: refused (and the parameters are consumed).
+        assert!(s
+            .finish_prf_enrolment(&[7; 32], &[3; 16], "keymesh.cloud", false, "k", &[1; 32])
+            .is_err());
+        s.begin_prf_enrolment(&cur[..]).unwrap();
+        assert!(s
+            .finish_prf_enrolment(&cur[..], &[3; 16], "keymesh.cloud", false, "k", &[1; 31])
+            .is_err());
+        s.begin_prf_enrolment(&cur[..]).unwrap();
+        s.finish_prf_enrolment(
+            &cur[..],
+            &[3; 16],
+            "keymesh.cloud",
+            false,
+            "Synthetic key",
+            &[1; 32],
+        )
+        .unwrap();
+        let b1 = persist_v2(&mut s);
+        let req = prf_request(&b1).unwrap();
+        assert_eq!(req.len(), 1);
+        assert!(prf_request(&b0).unwrap().is_empty());
+        let mut ad = Sha256::digest(b"keymesh.cloud").to_vec();
+        ad.extend_from_slice(&[0x05, 0, 0, 0, 1]);
+        let u = Session::open_with_prf(&b1, &[3; 16], &ad, &[1; 32], "keymesh.cloud").unwrap();
+        assert_eq!(u.prf_slots().unwrap().len(), 1);
+        assert!(Session::open_with_prf(&b1, &[3; 16], &ad, &[2; 32], "keymesh.cloud").is_err());
+        // Rotation with a passkey: refused unless revoking.
+        let req = s.begin_password_change().unwrap();
+        let new = derive("synthetic bridge prf rotation pw", &req);
+        assert!(s.begin_rotation(&cur[..], &new[..]).is_err());
+        let req = s.begin_password_change().unwrap();
+        let new = derive("synthetic bridge prf rotation pw", &req);
+        s.begin_rotation_revoking_quick_unlock(&cur[..], &new[..])
+            .unwrap();
+        s.cancel_rotation();
+        // Removal.
+        let id = s.prf_slots().unwrap()[0].slot_id.clone();
+        s.remove_prf_slot(&cur[..], &id).unwrap();
+        let b2 = persist_v2(&mut s);
+        assert!(Session::open_with_prf(&b2, &[3; 16], &ad, &[1; 32], "keymesh.cloud").is_err());
+        assert!(Session::open_with_recovery(&b2, &code).is_ok());
+        s.lock();
+        assert!(s.begin_prf_enrolment(&cur[..]).is_err());
     }
 }

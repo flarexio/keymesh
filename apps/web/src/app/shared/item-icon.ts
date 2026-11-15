@@ -1,5 +1,6 @@
-import { Component, computed, inject, input } from '@angular/core';
-import { LoginCategory, loginIcon } from '../core/login-icon';
+import { Component, computed, effect, inject, input, signal } from '@angular/core';
+import { FaviconPref } from '../core/favicon-pref';
+import { LoginCategory, hostOf, isPrivateHost, loginIcon } from '../core/login-icon';
 import type { ItemKind } from '../core/types';
 import { BrandCatalog } from './brand-catalog';
 import { Icon, IconName, KIND_ICONS } from './icon';
@@ -31,6 +32,11 @@ export function onBrand(hex: string): '#ffffff' | '#000000' {
   selector: 'km-item-icon',
   imports: [Icon],
   template: `
+    @if (remoteHost(); as h) {
+      <span class="kind-tile remote-tile" [class.kind-tile-lg]="large()" data-icon="remote" aria-hidden="true">
+        <img [src]="'/api/favicon?host=' + h" alt="" width="32" height="32" referrerpolicy="no-referrer" (error)="failed.set(h)" />
+      </span>
+    } @else {
     @switch (look().kind) {
       @case ('brand') {
         <span class="kind-tile brand-tile" [class.kind-tile-lg]="large()" data-icon="brand" [attr.data-brand]="look().id"
@@ -47,6 +53,7 @@ export function onBrand(hex: string): '#ffffff' | '#000000' {
           aria-hidden="true"><km-icon [name]="iconName()" /></span>
       }
     }
+    }
   `,
 })
 export class ItemIcon {
@@ -54,7 +61,28 @@ export class ItemIcon {
   readonly title = input('');
   readonly url = input<string | null>(null);
   readonly large = input(false);
+  /** Allow an opted-in website icon (only the item detail view sets this). */
+  readonly remote = input(false);
   private readonly catalog = inject(BrandCatalog);
+  private readonly favicon = inject(FaviconPref);
+  /** Host whose icon failed: fall back to the local icon. */
+  protected readonly failed = signal<string | null>(null);
+
+  /** A public login host to ask our server about, or null (local icon). */
+  protected readonly remoteHost = computed(() => {
+    if (!this.remote() || !this.favicon.enabled() || this.kind() !== 'login') return null;
+    if (this.look().kind === 'brand') return null; // a reviewed local icon already
+    const h = hostOf(this.url());
+    if (!h || isPrivateHost(h) || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(h)) return null;
+    return this.failed() === h ? null : h.toLowerCase();
+  });
+
+  constructor() {
+    effect(() => {
+      this.url(); // a new item gets a new try
+      this.failed.set(null);
+    });
+  }
 
   /** Typed: an unknown name is a compile error, not an empty tile. */
   protected readonly iconName = computed<IconName>(() => {

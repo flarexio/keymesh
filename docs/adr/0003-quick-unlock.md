@@ -1,6 +1,9 @@
 # ADR 0003: Quick unlock, auto-lock and master-password custody
 
-* **Status:** **Proposed. Nothing in this ADR is implemented.** It needs independent review and a scoped task before any code. It does not authorize real-secret entry, Keymesh login, external network calls or trust changes.
+* **Status:** **Implemented as experimental in M5 phase C (2026-11-16); independent code review pending.**
+  * Covered: the `webauthn-prf` slot (§4.1, exact format in §4.1.1) and deadline-based auto-lock (§4.2).
+  * Not covered: real-device capability results (§5 is still open; only Chromium's virtual authenticator was used), real-secret entry, Keymesh login, trust changes.
+  * Earlier this ADR was proposal-only; the parent gate decision of 2026-11-16 approved the C1 format for implementation and synthetic tests.
   * Any capability study or prototype built from it stays **synthetic-data only and experimental** until a compromise-response (DEK rotation) policy is approved (§4.5, D5).
   * The product decisions in §8 (synced passkeys, browser PIN, lifecycle defaults, HTTPS trust, interim rotation gate) are open. This document proposes; it records no approval.
 * **Date:** 2026-11-14
@@ -82,17 +85,39 @@ A user who wants a PIN can often use one through option C: many platform authent
 
 ### 4.1 `webauthn-prf` slot (Stage 2 of ADR 0001)
 
-**Slot**
-```
-kind   = "webauthn-prf"
-params = { credential_id, rp_id, salt (32 random bytes), be (bool at enrolment), transports?, label }
-KEK    = HKDF-SHA256(ikm = prf_output(salt), salt = none,
-                     info = "keymesh webauthn-prf v1" ‖ vault_id ‖ slot_id ‖ credential_id)
-```
+**Slot.** The exact implemented format is in §4.1.1 below. It replaced the earlier sketch here, so there is one canonical recipe.
 * The slot wraps the existing DEK with XChaCha20-Poly1305.
 * The AAD binds the slot exactly like ADR 0002, through `slot.id`, `kind` and canonical `params`.
 * The manifest digest covers the slot list.
 * The salt is per slot and random, so two vaults on one passkey get unrelated KEKs. It is not secret: the authenticator holds the secret.
+
+#### 4.1.1 Implemented format (authoritative; vectors in `tests/fixtures/v2/prf.json`)
+```
+kind = "webauthn-prf"
+kdf  = { "alg": "webauthn-prf-hkdf", "credential_id": b64url (16..=1023 bytes), "rp_id": lowercase host (1..=253),
+         "salt": b64url (32 bytes; the PRF input), "be": bool, "label": ≤ 64 UTF-8 bytes, no control chars }
+canonical(kdf) = fields("webauthn-prf-hkdf", credential_id, rp_id, salt, [be ? 0x01 : 0x00], label)
+slot_aad       = fields("keymesh.vault","2","slot", aead, vault_id, slot_id, "webauthn-prf", canonical(kdf))   (as ADR 0002 §5)
+KEK            = HKDF-SHA256(salt = none, ikm = PRF output (exactly 32 bytes),
+                             info = fields("keymesh.vault","2","kek","webauthn-prf", vault_id, slot_id, credential_id))
+wrapped        = XChaCha20-Poly1305(KEK, nonce[24], DEK, slot_aad)
+```
+* **Slot rules:** exactly one password slot, exactly one recovery slot, and 0..=4 `webauthn-prf` slots (≤ 8 slots in total). Slot ids and credential ids are unique.
+* **Bounds:** bounds, unknown kinds, unknown algorithms and unknown fields are refused before any derivation.
+* **Older readers:** the A/B builds and the older CLI **refuse the whole file** once a passkey slot exists. That is fail-closed by design and is shown by a test with the `4e65efb` CLI.
+* **Authenticated fields:** BE and the label are authenticated by `slot_aad` and, after unlock, by the manifest's slots digest.
+* **Unlock checks (core, `Vault::open_with_prf`):** fail closed unless all of these hold:
+  * the credential id names exactly one slot;
+  * that slot's stored `rp_id` equals this page's RP id;
+  * `authenticatorData` is at least 37 bytes;
+  * its `rpIdHash` equals SHA-256(rp_id);
+  * the UP (0x01) and UV (0x04) flags are set;
+  * the PRF output is 32 bytes.
+* **Trust boundary (stated plainly):**
+  * The browser's credentials API is trusted for the PRF output and the authenticator data. The core checks the flags and rpIdHash it is **given**; it does **not** verify the assertion signature or any attestation. There is no server, and the PRF output itself is the key material.
+  * So UP/UV/BE are what the client reports. They do not prove hardware protection, attempt limits, or where a key is stored.
+* **Enrolment binding:** an enrolment in progress (`PendingPrf`) is bound to the vault id, the exact slot digest and the DEK its authority (the master password) was checked against. It is refused on any other vault or state, including another vault with the same id, a vault after a password change, a different DEK in memory, or a rotated vault.
+* **Rotation:** it refuses while passkey slots exist unless the user confirms revocation (`begin_rotation_revoking_quick_unlock`). The rotated vault has no passkey slots, and passkeys must be enrolled again afterwards.
 
 **Enrolment**
 1. The vault is unlocked, and the user re-enters the master password. Enrolment is a sensitive operation (§4.4).
@@ -132,6 +157,26 @@ Whether backup-eligible passkeys are allowed at all is a product decision (§8, 
 
 **What it does not do.** It does not authenticate the user to any server; Keymesh has no login. It does not prove a person is present beyond what the authenticator's UV asserts. It does not replace the recovery code.
 
+### 4.1.2 Orphans and uncertain outcomes (as implemented)
+* **Wrong master password:** checked by the core **before** `create()`, so no ceremony runs. This does not prevent orphans in general.
+* **Proven not written → "orphan":** any failure **after `create()` started** whose outcome is known not to have been written gets the orphan guidance. This covers:
+  * no PRF, or UV missing;
+  * `get()` failing or being cancelled;
+  * a lock or abort during `create()`, when a credential **may** exist;
+  * the core refusing to wrap;
+  * a seal error, a CAS conflict, or a guard stop before `put`;
+  * a read-back after a failed write showing the old bytes.
+
+  The guidance is a non-secret notice with the label and creation time and how to delete the passkey in device/provider settings. It is held at app level, so it survives the lock and is shown on the locked screen until acknowledged.
+* **Unknown (write submitted, read-back failed):** the vault is locked and a *pending* notice says "don't delete it yet". It keeps the public credential id and survives failed unlocks. Only a later **successful** unlock (any credential) reconciles it against the stored slots:
+  * present: enrolment took effect, nothing to delete;
+  * absent: only now does it become an orphan notice.
+
+  No deletion advice is given before that.
+* **Committed after a lock:** "saved before the vault locked". No session is reinstalled.
+* **User cancels `create()`** (`NotAllowedError`): no credential exists per the spec, so there is no orphan notice.
+* **`signalUnknownCredential()`:** not called (manual guidance only).
+
 ### 4.2 Auto-lock and lifecycle
 
 **What ends a session.**
@@ -164,7 +209,7 @@ Whether backup-eligible passkeys are allowed at all is a product decision (§8, 
 
 **What it does not promise.** JavaScript strings, DOM text, browser caches and copies the engine made inside WASM linear memory cannot be proven erased. Locking removes the app's references and zeroizes what Rust owns. It does not guarantee that every in-memory copy is gone [WC §6.2 notes the same for key material]. The UI must not claim otherwise.
 
-**Future acceptance cases for the lifecycle** (proposed; nothing here is implemented now). The tests drive an injected clock and dispatch lifecycle events directly, so they do not depend on real timers firing:
+**Lifecycle acceptance cases** (implemented in M5 C2: `core/auto-lock.ts`; deterministic tests in `core/auto-lock.spec.ts`, browser checks in `e2e/autolock.spec.ts`; case 5 by the existing epoch/write-stage tests). The tests drive an injected clock and dispatch lifecycle events directly, so they do not depend on real timers firing:
 1. **Elapsed deadline, timer never fired:** hide, advance both clocks past the grace period without running timers, return to visible. The vault is locked before any item renders, and no decrypted value reaches the DOM.
 2. **Suspended resume:** the same through `freeze`/`resume` (Chromium's DevTools `Page.setWebLifecycleState` can freeze a real page) and through `pageshow` with `persisted = true`.
 3. **Protected operation after expiry:** reveal, copy, edit, save and export each lock and refuse when called past a deadline, even if no lifecycle event arrived.
@@ -259,7 +304,7 @@ Neither replaces the recovery code, and the vault must stay fully recoverable wi
 | # | Decision | Proposal |
 |---|---|---|
 | D1 | Allow backup-eligible (BE = 1) passkeys for PRF slots? | Allow, with the §4.1 disclosure; a setting may restrict to BE = 0 |
-| D2 | Offer option E (browser PIN) at all? | **Not in the first implementation.** A device PIN used as WebAuthn user verification covers the wish for a short code; its guessing limits depend on the authenticator (§3). Revisit for the native app |
+| D2 | Offer option E (browser PIN) at all? | **Blocked (M5 C):** no protected native/authenticator mechanism exists in the web app. The device PIN used as WebAuthn user verification is the supported route, but it is not a Keymesh PIN, and its guessing limits come from the authenticator. **Not in the first implementation.** A device PIN used as WebAuthn user verification covers the wish for a short code; its guessing limits depend on the authenticator (§3). Revisit for the native app |
 | D3 | Lifecycle defaults and semantics | 5 min idle, 30 s hidden (desktop), immediate on hide for mobile; `pagehide` locks; deadline checks on resume, `pageshow` and before protected operations (§4.2) |
 | D4 | Trusted HTTPS approach (gate C) | See `docs/DELIVERY.md` §4; needed before any non-loopback quick unlock |
 | D5 | Interim compromise-response gate | Keep quick unlock experimental and synthetic-only until DEK rotation lands, **or** approve a bounded interim release that states it has no revocation. No proposal is assumed approved |

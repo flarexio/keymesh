@@ -161,7 +161,8 @@ test.describe('camera start: a cancelled run never installs anything after play(
         expect(await workers(p)).toEqual({ created: 0, terminated: 0, live: 0 });
         expect(await liveTracks(p)).toBe(0);
         if (stop === 'hide') await show(p);
-        if (stop === 'lock') {
+        // pagehide locks the vault too (auto-lock, M5 C2; bfcache rule).
+        if (stop === 'lock' || stop === 'pagehide') {
           await p.getByTestId('unlock').click(); // locked in this session: Unlock
           await expect(p.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'synthetic-fixture');
           await newItem(p, 'totp');

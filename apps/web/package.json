@@ -10,7 +10,7 @@
     "test": "ng test --watch=false",
     "e2e": "playwright test",
     "tls-check": "node scripts/tls-check.mjs",
-    "test:serve": "node --test scripts/serve.test.mjs"
+    "test:serve": "node --test scripts/serve.test.mjs scripts/favicon.test.mjs"
   },
   "private": true,
   "packageManager": "npm@11.19.0",

@@ -143,3 +143,10 @@ tmux new-session -d -s keymesh-vpn-https \
 * The manifest is served as `application/manifest+json`. Security headers and CSP are unchanged.
 
 **Deployment:** rebuilding the `keymesh-web` image (`deploy/README.md`) publishes a new version. Installed copies pick it up on their next online visit.
+
+## 7. Quick unlock, auto-lock and website icons (M5 phase C; experimental, review pending)
+
+* **Passkeys need a domain origin.** WebAuthn RP ids are domain names, so quick unlock works on `https://keymesh.cloud` (or `http://localhost` for development), never on an IP address or plain-HTTP preview. A passkey is bound to the RP id it was made on: one made on `localhost` does not unlock the vault on `keymesh.cloud`.
+* **What was tested:** only Chromium's DevTools virtual authenticator (CTAP 2.1, internal, UV, PRF). No TouchID, FaceID, Windows Hello, Android, iOS or security-key result is recorded (ADR 0003 §5 is still open). Real devices need a human with the device.
+* **Auto-lock** runs in every origin, including demo vaults on the previews.
+* **Website icons:** the server route `/api/favicon` is compiled into the image but **off** unless the server runs with `KEYMESH_FAVICON=1`. The Docker deployment does not set it, and live outbound use is not approved. When it is off, the route answers 404 and the app keeps its local icons.

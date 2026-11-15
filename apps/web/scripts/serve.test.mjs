@@ -14,6 +14,7 @@ const OUTSIDE = 'SYNTHETIC-OUTSIDE-ROOT-MARKER';
 const base = mkdtempSync(join(tmpdir(), 'keymesh-serve-'));
 const root = join(base, 'browser');
 let server;
+let serverOutput = '';
 
 function get(path) {
   return new Promise((resolve, reject) => {
@@ -48,9 +49,11 @@ before(async () => {
   symlinkSync(base, join(root, 'link-dir'));
   const script = fileURLToPath(new URL('./serve.mjs', import.meta.url));
   server = spawn(process.execPath, [script, String(PORT)], {
-    env: { ...process.env, HOST: '127.0.0.1', STATIC_ROOT: root, TLS_CERT: '', TLS_KEY: '' },
+    env: { ...process.env, HOST: '127.0.0.1', STATIC_ROOT: root, TLS_CERT: '', TLS_KEY: '', KEYMESH_FAVICON: '' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  server.stdout.on('data', (d) => (serverOutput += d));
+  server.stderr.on('data', (d) => (serverOutput += d));
   await new Promise((resolve, reject) => {
     server.stdout.once('data', resolve);
     server.once('exit', (c) => reject(new Error(`server exited ${c}`)));
@@ -164,4 +167,13 @@ test('an outward index.html symlink is never served, not even as the SPA fallbac
     srv.kill();
     rmSync(base2, { recursive: true, force: true });
   }
+});
+
+test('favicon route: off by default (404, never the SPA shell), other /api paths 404, no host names logged', async () => {
+  for (const p of ['/api/favicon?host=icons.example.com', '/api/favicon', '/api/other', '/api/']) {
+    const r = await get(p);
+    assert.equal(r.status, 404, p);
+    assert.ok(!r.body.includes('synthetic index'), p);
+  }
+  assert.ok(!serverOutput.includes('icons.example.com'));
 });

@@ -14,11 +14,11 @@
 | M3 UI polish, locale and theme | Accepted |
 | Generator finish | Accepted |
 | **M4 local unlock** (password and recovery slots, backup/restore, HTTPS mechanics) | **Partial, not accepted.** A private HTTPS endpoint (`keymesh.cloud`, Docker, internal CA) now runs; **gate C** (a real client device trusting it) is still unverified by the human |
-| **M5 product rollout** (PWA + backlog) | **Phase A accepted** (`7079932`, experimental, synthetic only) and its web image deployed to `keymesh.cloud` 2026-11-16 (independently read back). **Phase B implemented and tested; its design gate is approved. The independent code review (`1092cc5`) requested fixes, which are in progress, and it is not deployed.** Phase C not started. See the checklist below |
+| **M5 product rollout** (PWA + backlog) | **Phase A accepted** (`7079932`) and **Phase B accepted** (`4e65efb`). Both are experimental, synthetic only, and privately deployed to `keymesh.cloud`, A and then B on 2026-11-16. **Phase C is implemented and tested in Chromium, but not reviewed and not deployed.** The C1 format and the C3 architecture passed their design gates; outbound icon fetching is still not approved. See the checklist below |
 
 ## M5 checklist (versioned)
 
-**v3.1, 2026-11-16** (Phase A deployed, Phase B implemented plus review fixes), on branch `feature/m5-pwa-product-features`. The exact commits are listed in the draft PR. "Deployed" for A means the accepted `7079932` web image; B is not deployed and stays off the private endpoint until its independent review.
+**v4, 2026-11-16** (A and B deployed, C implemented), on branch `feature/m5-pwa-product-features`. The exact commits are listed in the draft PR. "Deployed" for A means the accepted `7079932` web image; B is not deployed and stays off the private endpoint until its independent review.
 * **States:** *implemented* · *tested* (automated, Chromium on the Pi) · *deployed* (private `keymesh.cloud` image) · *blocked*.
 * **Not covered by "tested":** real phones, Safari and Firefox; iOS install; and real camera hardware. Those need human device checks.
 
@@ -31,12 +31,13 @@
 | A | TOTP from QR: live camera | yes | Chromium fake camera | yes | Real camera hardware is untested |
 | A | Circular TOTP countdown (last 5 s warning) | yes | yes | yes | Fixed-clock unit and E2E tests; reduced motion |
 | A | Local login icons (brand, private host, category, letter) | yes | yes | yes | 81 reviewed Simple Icons: no per-icon licence (Rust, CC-BY-SA-4.0, removed); explicit domain aliases. No network. Not a security indicator |
-| B | Ed25519 Base58 public key, sign and verify | yes | yes | no | Raw 32-byte Base58 (no prefix/checksum); pure Ed25519 over the exact shown bytes; `verify_strict`. RFC 8032 + Base58 + negative vectors natively, through WASM, and Node/OpenSSL in E2E |
-| B | DEK rotation (password + recovery slots) | yes | yes | no | No wire-format change. Native, CLI, bridge, browser; rotation vector checked by Node/OpenSSL. Browser outcome reconciliation tested with a fake store and, in the production build, with held IndexedDB completion. If the outcome is only known after a lock, a non-secret notice stays on the locked screen (review fix). IndexedDB post-commit durability can't be observed. Design gate approved; code review fixes pending re-review |
-| B | Passphrase wordlist and emergency kit | yes | yes | no | EFF Long Wordlist pinned by SHA-256; core CSPRNG with rejection sampling. Kit never prints the password; code only on request. Real printers/PDF untested |
-| C | WebAuthn PRF quick unlock and auto-lock | no | no | no | ADR 0003 |
-| C | Custom short PIN | no | no | no | Expected to be **blocked** unless a protected native/authenticator mechanism exists (ADR 0003 §6) |
-| C | Optional favicon route | no | no | no | Opt-in; SSRF suite first (item 6 below) |
+| B | Ed25519 Base58 public key, sign and verify | yes | yes | yes | Raw 32-byte Base58 (no prefix/checksum); pure Ed25519 over the exact shown bytes; `verify_strict`. RFC 8032 + Base58 + negative vectors natively, through WASM, and Node/OpenSSL in E2E |
+| B | DEK rotation (password + recovery slots) | yes | yes | yes | No wire-format change. Native, CLI, bridge, browser; rotation vector checked by Node/OpenSSL. Browser outcome reconciliation tested with a fake store and, in the production build, with held IndexedDB completion. If the outcome is only known after a lock, a non-secret notice stays on the locked screen (review fix). IndexedDB post-commit durability can't be observed. Design gate approved; code review fixes pending re-review |
+| B | Passphrase wordlist and emergency kit | yes | yes | yes | EFF Long Wordlist pinned by SHA-256; core CSPRNG with rejection sampling. Kit never prints the password; code only on request. Real printers/PDF untested |
+| C | WebAuthn PRF quick unlock | yes | virtual authenticator only | no | ADR 0003 §4.1.1. Real-device capability (§5) is not recorded: no TouchID, FaceID, Windows Hello, Android or iOS proof |
+| C | Auto-lock (idle, hidden, pagehide, clock) | yes | yes | no | Deadline checks; visibility simulated in tests (no real OS app switch or freeze) |
+| C | Custom short PIN | no | n/a | no | **Blocked**: no protected mechanism in the web app (ADR 0003 D2). The device PIN as WebAuthn UV is the supported route; it is not a Keymesh PIN |
+| C | Optional favicon route | yes (off) | mock-network suite | no | `KEYMESH_FAVICON` unset in Docker. Outbound use is not approved; the gate-response fixes (address allowlist, overall deadline, PNG structure) are in place |
 
 ### Gates shared by several items
 * **G-HTTPS (gate C).** A client-trusted HTTPS origin for LAN/VPN use, because the plain-HTTP previews are not secure contexts. It is required for non-loopback password vaults, WebAuthn, the camera and the Clipboard API. The decision is the human's; no CA or certificate is created without approval.

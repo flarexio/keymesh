@@ -31,6 +31,7 @@ import { ConflictError, StoredVault, VaultStore } from './vault-store';
 import type { PasswordOptions } from './password-options';
 import { Core, loadCore } from './wasm';
 import type { DemoKeyProvider, VaultSession } from './wasm-pkg/keymesh_wasm';
+import { FLAG_BE, FLAG_UV, PrfSlotInfo, WEBAUTHN, b64u, flagsOf, prfEnabled, prfFirst, randomBytes } from './quick-unlock';
 import type { MessageEncoding, MessagePreview, PassphraseOptions, PassphraseSummary, SignatureOut, Verdict } from './types';
 import {
   EPHEMERAL_KEY_ID,
@@ -78,6 +79,12 @@ export type VaultErrorCode =
   | 'samePassword'
   | 'rotatedWhileLocked'
   | 'rotationUncertain'
+  | 'quickUnlockUnsupported'
+  | 'quickUnlockNone'
+  | 'quickUnlockFailed'
+  | 'quickUnlockOrphan'
+  | 'quickUnlockUncertain'
+  | 'quickUnlockRevokeRequired'
   | 'busy';
 
 export class VaultError extends Error {
@@ -145,11 +152,20 @@ function sameBytes(a: Uint8Array | null, b: Uint8Array | null): boolean {
 
 type Guard = () => void;
 
-export type CredentialNoticeCode = 'rotatedWhileLocked' | 'rotationUncertain';
+export type CredentialNoticeCode =
+  | 'rotatedWhileLocked'
+  | 'rotationUncertain'
+  | 'quickUnlockSavedWhileLocked'
+  | 'quickUnlockOrphan'
+  | 'quickUnlockUncertain';
 export interface CredentialNotice {
   code: CredentialNoticeCode;
   /** Sequence number of the operation that produced it. */
   seq: number;
+  /** Non-secret passkey metadata for the instructions (label, creation time). */
+  passkey?: { label: string; at: number };
+  /** Public credential id (base64url) still to reconcile at the next unlock. */
+  credentialId?: string;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -158,6 +174,7 @@ export class VaultService {
   private readonly demoStore = inject(VAULT_STORE);
   private readonly protStore = inject(PROTECTED_VAULT_STORE);
   private readonly kdf = inject(KDF_RUNNER);
+  private readonly webauthn = inject(WEBAUTHN);
   /** Secure context: password vaults are allowed. */
   readonly secure = inject(SECURE_CONTEXT);
   private readonly loadCore = inject(CORE_LOADER);
@@ -230,13 +247,37 @@ export class VaultService {
   }
 
   /** Record `code` for the operation numbered `seq`, unless a newer one already left a notice. */
-  recordNotice(code: CredentialNoticeCode, seq: number): void {
+  recordNotice(code: CredentialNoticeCode, seq: number, extra: Partial<CredentialNotice> = {}): void {
     const cur = this.credentialNotice();
     if (cur && cur.seq > seq) return;
-    this.credentialNotice.set({ code, seq });
+    this.credentialNotice.set({ ...extra, code, seq });
   }
 
   acknowledgeNotice(): void {
+    this.credentialNotice.set(null);
+  }
+
+  /**
+   * A password vault opened (with whichever credential worked). Rotation
+   * notices are answered by that. A pending passkey enrolment is reconciled
+   * against the STORED slots: present → it took effect (no orphan, nothing
+   * to delete); absent → only now is it reported as an orphan to delete in
+   * the device/provider settings. An orphan notice stays until acknowledged.
+   */
+  private reconcileNotice(bytes: Uint8Array): void {
+    const n = this.credentialNotice();
+    if (!n) return;
+    if (n.code === 'quickUnlockOrphan') return;
+    if (n.code === 'quickUnlockUncertain' && n.credentialId) {
+      let present = false;
+      try {
+        present = (JSON.parse(this.c().prfRequest(bytes)) as PrfSlotInfo[]).some((x) => x.credential_id === n.credentialId);
+      } catch {
+        return; // can't tell yet: keep the pending notice
+      }
+      this.credentialNotice.set(present ? null : { code: 'quickUnlockOrphan', seq: n.seq, passkey: n.passkey });
+      return;
+    }
     this.credentialNotice.set(null);
   }
 
@@ -257,6 +298,7 @@ export class VaultService {
           guard();
           this.protSnap = prot?.bytes ?? null;
           this.protectedStored.set(prot ? this.info(prot.bytes) : null);
+          this.refreshStoredQuickUnlock(prot?.bytes ?? null);
         }
         const rec = await this.demoStore.read();
         guard();
@@ -283,7 +325,17 @@ export class VaultService {
 
   private s(): VaultSession {
     if (!this.session || this.status() === 'locked') throw new LockedError();
+    // Auto-lock: a passed deadline locks BEFORE any secret is used.
+    if (!this.freshCheck()) throw new LockedError();
     return this.session;
+  }
+
+  /** Auto-lock hooks (core/auto-lock.ts): checked before every session use. */
+  private freshCheck: () => boolean = () => true;
+  private sessionStarted: () => void = () => undefined;
+  setFreshnessCheck(fresh: () => boolean, started: () => void = () => undefined): void {
+    this.freshCheck = fresh;
+    this.sessionStarted = started;
   }
 
   /** Demo vault state after a read (start screen). */
@@ -323,6 +375,7 @@ export class VaultService {
 
   private setStoredInfo(bytes: Uint8Array): void {
     (this.active === 'protected' ? this.protectedStored : this.stored).set(this.info(bytes));
+    if (this.active === 'protected') this.refreshStoredQuickUnlock(bytes);
   }
 
   /**
@@ -331,6 +384,7 @@ export class VaultService {
    */
   private install(s: VaultSession, key: DemoKeyProvider | null, bytes: Uint8Array): void {
     this.epoch++;
+    this.sessionStarted(); // fresh deadlines BEFORE the session becomes usable
     this.session?.free();
     this.session = s;
     // A password session leaves the demo key alone (an ephemeral demo vault
@@ -340,8 +394,7 @@ export class VaultService {
       this.key = key;
     }
     this.active = key ? 'demo' : 'protected';
-    // A password vault opened: whichever credential worked answers the notice.
-    if (!key) this.credentialNotice.set(null);
+    if (!key) this.reconcileNotice(bytes);
     this.protectedReloaded.set(false);
     this.snapshot = bytes;
     this.setStoredInfo(bytes);
@@ -440,6 +493,8 @@ export class VaultService {
   lock(): void {
     this.epoch++;
     this.kdf.cancel();
+    this.webauthnAbort?.abort();
+    this.webauthnAbort = null;
     this.session?.lock();
     this.session?.free();
     this.session = null;
@@ -782,6 +837,7 @@ export class VaultService {
     this.protSnap = bytes;
     this.revision.set(revision);
     this.protectedStored.set(this.info(bytes));
+    this.refreshStoredQuickUnlock(bytes);
     this.broadcast();
   }
 
@@ -862,7 +918,7 @@ export class VaultService {
    * recovery slots. Returns the new recovery code to show. Nothing changes
    * (memory or storage) until `finishRotation` gets the code back.
    */
-  beginRotation(current: string, next: string): Promise<string> {
+  beginRotation(current: string, next: string, revokeQuickUnlock = false): Promise<string> {
     return this.credential(async (guard) => {
       const s = this.protectedSession();
       this.checkNewPassword(next);
@@ -873,7 +929,10 @@ export class VaultService {
       try {
         const newKey = await this.derive(next, s.beginPasswordChange(), guard);
         try {
-          s.beginRotation(curKey, newKey);
+          if (revokeQuickUnlock) s.beginRotationRevokingQuickUnlock(curKey, newKey);
+          else if (JSON.parse(s.prfSlots()).length > 0) {
+            throw new VaultError('quickUnlockRevokeRequired', 'Rotation revokes quick-unlock passkeys; confirm first.');
+          } else s.beginRotation(curKey, newKey);
         } catch (e) {
           throw this.unlockError(e, 'wrongPassword');
         } finally {
@@ -960,6 +1019,9 @@ export class VaultService {
       if (this.isStale(guard)) {
         this.protSnap = bytes;
         this.protectedStored.set(this.info(bytes));
+      this.refreshStoredQuickUnlock(bytes);
+        this.refreshStoredQuickUnlock(bytes);
+    this.refreshStoredQuickUnlock(bytes);
         this.broadcast();
         this.recordNotice('rotatedWhileLocked', seq);
         throw new VaultError('rotatedWhileLocked', 'The rotation was stored before the vault was locked.');
@@ -968,6 +1030,8 @@ export class VaultService {
       this.protSnap = bytes;
       this.revision.set(revision);
       this.protectedStored.set(this.info(bytes));
+      this.refreshStoredQuickUnlock(bytes);
+    this.refreshStoredQuickUnlock(bytes);
       this.version.update((v) => v + 1);
       this.broadcast();
     });
@@ -991,6 +1055,284 @@ export class VaultService {
     }
   }
 
+  // --- quick unlock: WebAuthn PRF passkeys (M5 C1, ADR 0003 §4.1) ----------
+
+  /** Quick-unlock passkeys of the STORED password vault (public data). */
+  readonly storedQuickUnlock = signal<PrfSlotInfo[]>([]);
+  /** In-flight WebAuthn ceremony; aborted on lock. */
+  private webauthnAbort: AbortController | null = null;
+
+  quickUnlockSupported(): boolean {
+    return this.secure && this.webauthn.available();
+  }
+
+  private refreshStoredQuickUnlock(bytes: Uint8Array | null): void {
+    try {
+      this.storedQuickUnlock.set(bytes && this.core ? (JSON.parse(this.c().prfRequest(bytes)) as PrfSlotInfo[]) : []);
+    } catch {
+      this.storedQuickUnlock.set([]);
+    }
+  }
+
+  /** Passkeys enrolled in the open password vault. */
+  quickUnlockSlots(): PrfSlotInfo[] {
+    if (this.active !== 'protected' || this.status() !== 'unlocked') return [];
+    return JSON.parse(this.s().prfSlots()) as PrfSlotInfo[];
+  }
+
+  private rpId(): string {
+    return location.hostname;
+  }
+
+  private async ceremony<T>(guard: Guard, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const ac = new AbortController();
+    this.webauthnAbort = ac;
+    try {
+      const r = await run(ac.signal);
+      if (this.isStale(guard)) throw new StaleWorkError();
+      return r;
+    } catch (e) {
+      if (this.isStale(guard)) throw new StaleWorkError();
+      throw e;
+    } finally {
+      if (this.webauthnAbort === ac) this.webauthnAbort = null;
+    }
+  }
+
+  /** Unlock the stored password vault with an enrolled passkey. */
+  unlockWithQuickUnlock(): Promise<void> {
+    return this.credential(async (guard) => {
+      if (!this.webauthn.available()) throw new VaultError('quickUnlockUnsupported', 'Passkeys are not available here.');
+      const rec = await this.protStore.read();
+      guard();
+      if (!rec) throw new VaultError('noStoredVault', 'No stored vault.');
+      const slots = JSON.parse(this.c().prfRequest(rec.bytes)) as PrfSlotInfo[];
+      const rp = this.rpId();
+      const mine = slots.filter((x) => x.rp_id === rp);
+      if (mine.length === 0) throw new VaultError('quickUnlockNone', 'No passkey is set up for this vault here.');
+      const evalByCredential: Record<string, { first: Uint8Array<ArrayBuffer> }> = {};
+      for (const x of mine) evalByCredential[x.credential_id] = { first: b64u.decode(x.salt) };
+      const cred = (await this.ceremony(guard, (signal) =>
+        this.webauthn.get({
+          signal,
+          publicKey: {
+            challenge: randomBytes(32), // no server: not verified, only required by the API
+            rpId: rp,
+            allowCredentials: mine.map((x) => ({ type: 'public-key' as const, id: b64u.decode(x.credential_id) })),
+            userVerification: 'required',
+            timeout: 120_000,
+            extensions: { prf: { evalByCredential } } as AuthenticationExtensionsClientInputs,
+          },
+        }),
+      )) as PublicKeyCredential | null;
+      if (!cred) throw new VaultError('quickUnlockFailed', 'The passkey did not unlock this vault.');
+      const prf = prfFirst(cred);
+      const authData = new Uint8Array((cred.response as AuthenticatorAssertionResponse).authenticatorData);
+      if (!prf) throw new VaultError('quickUnlockFailed', 'The passkey did not unlock this vault.');
+      let s: VaultSession;
+      try {
+        s = this.c().VaultSession.openWithPrf(rec.bytes, new Uint8Array(cred.rawId), authData, prf, rp);
+      } catch {
+        throw new VaultError('quickUnlockFailed', 'The passkey did not unlock this vault.');
+      } finally {
+        prf.fill(0);
+      }
+      this.active = 'protected';
+      this.protSnap = rec.bytes;
+      this.install(s, null, rec.bytes);
+    });
+  }
+
+  /**
+   * Enrol a passkey for quick unlock (sensitive: needs the master password).
+   * Order: KDF for the password → core issues {slot_id, salt} → create()
+   * with PRF → (get() if no PRF result at creation) → core adds and verifies
+   * the slot → exact-byte CAS. A failure after create() means the
+   * authenticator holds a credential Keymesh cannot delete: reported as
+   * `quickUnlockOrphan` (before the write) so the user can remove it.
+   */
+  enrollQuickUnlock(current: string, label: string): Promise<void> {
+    const seq = ++this.opSeq;
+    return this.credential(async (guard) => {
+      const s = this.protectedSession();
+      if (!this.webauthn.available()) throw new VaultError('quickUnlockUnsupported', 'Passkeys are not available here.');
+      if ((await this.webauthn.prfHint()) === false) {
+        throw new VaultError('quickUnlockUnsupported', 'This browser cannot use passkeys to unlock vaults.');
+      }
+      guard();
+      const curKey = await this.derive(current, s.currentPasswordRequest(), guard);
+      // From create() on, the authenticator may hold a credential Keymesh
+      // cannot delete. Its non-secret metadata goes into a notice that
+      // survives the lock (the locked screen shows it).
+      const meta = { label: label || 'Keymesh', at: Date.now() };
+      let created: PublicKeyCredential | null = null;
+      const orphan = (): never => {
+        this.recordNotice('quickUnlockOrphan', seq, { passkey: meta });
+        throw new VaultError('quickUnlockOrphan', 'The passkey was created but not added to this vault.');
+      };
+      try {
+        let e: { slot_id: string; salt: string; vault_id: string };
+        try {
+          e = JSON.parse(s.beginPrfEnrolment(curKey)) as typeof e; // checks the password first
+        } catch (err) {
+          throw this.unlockError(err, 'wrongPassword'); // no passkey created
+        }
+        const salt = b64u.decode(e.salt);
+        const rp = this.rpId();
+        let prf: Uint8Array | null = null;
+        let createStarted = false;
+        try {
+          createStarted = true;
+          created = (await this.ceremony(guard, (signal) =>
+            this.webauthn.create({
+              signal,
+              publicKey: {
+                challenge: randomBytes(32),
+                rp: { id: rp, name: 'Keymesh' },
+                user: { id: randomBytes(16), name: `Keymesh vault ${e.vault_id.slice(0, 8)}`, displayName: meta.label },
+                pubKeyCredParams: [
+                  { type: 'public-key', alg: -7 },
+                  { type: 'public-key', alg: -8 },
+                  { type: 'public-key', alg: -257 },
+                ],
+                authenticatorSelection: { userVerification: 'required', residentKey: 'preferred' },
+                timeout: 120_000,
+                extensions: { prf: { eval: { first: salt } } } as AuthenticationExtensionsClientInputs,
+              },
+            }),
+          )) as PublicKeyCredential | null;
+          if (!created) throw new VaultError('quickUnlockUnsupported', 'No passkey was created.');
+          if (!prfEnabled(created)) orphan();
+          let flags = flagsOf((created.response as AuthenticatorAttestationResponse).getAuthenticatorData());
+          prf = prfFirst(created);
+          if (!prf) {
+            // Some authenticators evaluate PRF only on assertion.
+            const id = new Uint8Array(created.rawId);
+            const a = (await this.ceremony(guard, (signal) =>
+              this.webauthn.get({
+                signal,
+                publicKey: {
+                  challenge: randomBytes(32),
+                  rpId: rp,
+                  allowCredentials: [{ type: 'public-key', id }],
+                  userVerification: 'required',
+                  extensions: { prf: { evalByCredential: { [b64u.encode(id)]: { first: salt } } } } as AuthenticationExtensionsClientInputs,
+                },
+              }),
+            )) as PublicKeyCredential | null;
+            prf = a ? prfFirst(a) : null;
+            if (a) flags = flagsOf((a.response as AuthenticatorAssertionResponse).authenticatorData);
+          }
+          if (!prf || !(flags & FLAG_UV)) orphan();
+          s.finishPrfEnrolment(curKey, new Uint8Array(created.rawId), rp, (flags & FLAG_BE) !== 0, meta.label, prf!);
+        } catch (err) {
+          s.cancelPrfEnrolment();
+          // A credential exists if create() returned one; it MAY exist if a
+          // lock aborted the ceremony after it started. A user cancelling
+          // (NotAllowedError) means no credential was made.
+          const alreadyReported = err instanceof VaultError && err.code === 'quickUnlockOrphan';
+          if (!alreadyReported && (created || (createStarted && err instanceof StaleWorkError))) orphan();
+          if (err instanceof DOMException && err.name === 'NotAllowedError') {
+            throw new VaultError('quickUnlockFailed', 'The passkey request was cancelled.');
+          }
+          throw err;
+        } finally {
+          prf?.fill(0);
+        }
+      } finally {
+        curKey.fill(0);
+      }
+      await this.persistEnrolment(s, guard, seq, meta, b64u.encode(new Uint8Array(created!.rawId)));
+    });
+  }
+
+  /**
+   * Store an enrolment with an exact-byte CAS and settled-outcome
+   * reconciliation (as for rotation): only an outcome PROVEN not written is
+   * an orphan; an unknown one stays pending (no delete advice) until a
+   * later successful unlock compares the stored slots.
+   */
+  private async persistEnrolment(
+    s: VaultSession,
+    guard: Guard,
+    seq: number,
+    meta: { label: string; at: number },
+    credentialId: string,
+  ): Promise<void> {
+    const orphan = (): never => {
+      this.recordNotice('quickUnlockOrphan', seq, { passkey: meta });
+      throw new VaultError('quickUnlockOrphan', 'The passkey was created but not added to this vault.');
+    };
+    const expected = this.protSnap;
+    let bytes: Uint8Array;
+    let revision: number;
+    try {
+      const sealed = s.sealProtected();
+      bytes = sealed.bytes;
+      revision = sealed.revision;
+      sealed.free();
+    } catch {
+      s.rollback();
+      return orphan();
+    }
+    try {
+      await this.protStore.compareAndSwap(expected, this.record(bytes), guard);
+    } catch (err) {
+      if (err instanceof ConflictError) {
+        if (!this.isStale(guard)) {
+          s.rollback();
+          this.status.set('stale');
+        }
+        return orphan(); // CAS refused: not written
+      }
+      if (err instanceof StaleWorkError) {
+        if (!this.isStale(guard)) s.rollback();
+        return orphan(); // stopped before put: not written
+      }
+      const outcome = await this.storedOutcome(bytes, expected);
+      if (outcome === 'old') {
+        if (!this.isStale(guard)) s.rollback();
+        return orphan();
+      }
+      if (outcome !== 'new') {
+        this.recordNotice('quickUnlockUncertain', seq, { passkey: meta, credentialId });
+        if (!this.isStale(guard)) this.lock();
+        throw new VaultError('quickUnlockUncertain', 'Could not confirm whether the passkey was added.');
+      }
+    }
+    if (this.isStale(guard)) {
+      this.protSnap = bytes;
+      this.protectedStored.set(this.info(bytes));
+      this.refreshStoredQuickUnlock(bytes);
+      this.broadcast();
+      this.recordNotice('quickUnlockSavedWhileLocked', seq, { passkey: meta });
+      throw new StaleWorkError(true);
+    }
+    s.commit(revision);
+    this.protSnap = bytes;
+    this.revision.set(revision);
+    this.protectedStored.set(this.info(bytes));
+    this.refreshStoredQuickUnlock(bytes);
+    this.version.update((v) => v + 1);
+    this.broadcast();
+  }
+
+  /** Remove a passkey from this vault (needs the master password). */
+  removeQuickUnlock(current: string, slotId: string): Promise<void> {
+    return this.credential(async (guard) => {
+      const s = this.protectedSession();
+      const key = await this.derive(current, s.currentPasswordRequest(), guard);
+      try {
+        s.removePrfSlot(key, slotId);
+      } catch (e) {
+        throw this.unlockError(e, 'wrongPassword');
+      } finally {
+        key.fill(0);
+      }
+      await this.persistCredentialChange(s, guard);
+    });
+  }
+
   /** Delete the stored password vault (only the exact one this tab last saw). */
   discardProtected(): Promise<void> {
     this.lock();
@@ -1001,6 +1343,7 @@ export class VaultService {
       guard();
       this.protSnap = null;
       this.protectedStored.set(null);
+      this.storedQuickUnlock.set([]);
     });
   }
 
@@ -1271,6 +1614,7 @@ export class VaultService {
       guard();
       this.protSnap = rec?.bytes ?? null;
       this.protectedStored.set(rec ? this.info(rec.bytes) : null);
+      this.refreshStoredQuickUnlock(rec?.bytes ?? null);
     });
   }
 }

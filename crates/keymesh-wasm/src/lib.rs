@@ -260,6 +260,76 @@ impl VaultSession {
         self.inner.rotation_pending()
     }
 
+    #[wasm_bindgen(js_name = beginRotationRevokingQuickUnlock)]
+    pub fn begin_rotation_revoking_quick_unlock(
+        &mut self,
+        current_key: &[u8],
+        new_key: &[u8],
+    ) -> Result<(), JsError> {
+        self.inner
+            .begin_rotation_revoking_quick_unlock(current_key, new_key)
+            .map_err(err)
+    }
+
+    /// Quick unlock: JSON `{slot_id, salt (b64url 32), vault_id}`.
+    #[wasm_bindgen(js_name = beginPrfEnrolment)]
+    pub fn begin_prf_enrolment(&mut self, current_key: &[u8]) -> Result<String, JsError> {
+        json(&self.inner.begin_prf_enrolment(current_key).map_err(err)?)
+    }
+
+    #[wasm_bindgen(js_name = finishPrfEnrolment)]
+    pub fn finish_prf_enrolment(
+        &mut self,
+        current_key: &[u8],
+        credential_id: &[u8],
+        rp_id: &str,
+        be: bool,
+        label: &str,
+        prf_output: &[u8],
+    ) -> Result<(), JsError> {
+        self.inner
+            .finish_prf_enrolment(current_key, credential_id, rp_id, be, label, prf_output)
+            .map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = cancelPrfEnrolment)]
+    pub fn cancel_prf_enrolment(&mut self) {
+        self.inner.cancel_prf_enrolment();
+    }
+
+    /// JSON `[{slot_id, credential_id, rp_id, salt, label, be}]`.
+    #[wasm_bindgen(js_name = prfSlots)]
+    pub fn prf_slots(&self) -> Result<String, JsError> {
+        json(&self.inner.prf_slots().map_err(err)?)
+    }
+
+    #[wasm_bindgen(js_name = removePrfSlot)]
+    pub fn remove_prf_slot(&mut self, current_key: &[u8], slot_id: &str) -> Result<(), JsError> {
+        self.inner
+            .remove_prf_slot(current_key, slot_id)
+            .map_err(err)
+    }
+
+    #[wasm_bindgen(js_name = openWithPrf)]
+    pub fn open_with_prf(
+        bytes: &[u8],
+        credential_id: &[u8],
+        authenticator_data: &[u8],
+        prf_output: &[u8],
+        rp_id: &str,
+    ) -> Result<VaultSession, JsError> {
+        Ok(VaultSession {
+            inner: bridge::Session::open_with_prf(
+                bytes,
+                credential_id,
+                authenticator_data,
+                prf_output,
+                rp_id,
+            )
+            .map_err(err)?,
+        })
+    }
+
     #[wasm_bindgen(js_name = cancelRecoveryChange)]
     pub fn cancel_recovery_change(&mut self) {
         self.inner.cancel_recovery_change();
@@ -578,6 +648,12 @@ pub fn generate_passphrase(options: &str) -> Result<String, JsError> {
 #[wasm_bindgen(js_name = passphraseSummary)]
 pub fn passphrase_summary(options: &str) -> Result<String, JsError> {
     json(&bridge::passphrase_summary(options).map_err(err)?)
+}
+
+/// Quick-unlock slots of a stored envelope (public): JSON array.
+#[wasm_bindgen(js_name = prfRequest)]
+pub fn prf_request(bytes: &[u8]) -> Result<String, JsError> {
+    json(&bridge::prf_request(bytes).map_err(err)?)
 }
 
 #[wasm_bindgen(js_name = maxEnvelopeBytes)]

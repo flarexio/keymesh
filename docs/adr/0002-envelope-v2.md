@@ -197,7 +197,9 @@ Changing a password or recovery code is a **rewrap, not a rotation**:
 * Data that was already read stays read.
 * The UI and CLI say this. A recovery-code reset leaves the recovery code unchanged.
 
-**Compromise rotation (M5 B, implemented; independent review pending).**
+**Quick-unlock slots (M5 C1).** A third slot kind, `webauthn-prf`, exists since M5 C; its exact format is in ADR 0003 §4.1.1. Older readers refuse files that contain one.
+
+**Compromise rotation (M5 B; accepted and deployed 2026-11-16).**
 * **Format:** no change. The result is an ordinary v2 file under this ADR's format.
 * **Authority:** the current password or the recovery code. The core then generates:
   * a fresh DEK, which must differ from the old one;

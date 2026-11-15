@@ -46,7 +46,7 @@ interface PlainField {
     @if (view(); as v) {
       <article class="detail" aria-labelledby="detail-title">
         <header class="detail-head">
-          <km-item-icon [kind]="v.kind" [title]="v.title" [url]="firstUrl(v)" [large]="true" />
+          <km-item-icon [kind]="v.kind" [title]="v.title" [url]="firstUrl(v)" [large]="true" [remote]="true" />
           <div class="detail-heading">
             <p class="eyebrow">{{ i18n.t(kindKey(v)) }}</p>
             <h2 id="detail-title">{{ v.title }}</h2>

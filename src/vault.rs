@@ -33,7 +33,9 @@
 use crate::crypto::{self, Key256, KeyProvider, Sealed, AEAD_ALG};
 use crate::error::{Error, Result};
 use crate::kdf::fields;
-use crate::keyslot::{Authority, PasswordSetup, Slot, SlotKind, SlotRecord, SlotSet};
+use crate::keyslot::{
+    Authority, PasswordSetup, PrfSetup, Slot, SlotKind, SlotRecord, SlotSet, PRF_LEN,
+};
 use crate::model::{Item, ItemData, ItemId, ItemKind};
 use crate::recovery::RecoveryCode;
 use crate::rng::{random_array, RandomSource};
@@ -305,6 +307,65 @@ pub fn password_request(bytes: &[u8]) -> Result<PasswordRequest> {
     }
 }
 
+/// What a browser needs to ask for a quick-unlock assertion: per stored
+/// `webauthn-prf` slot, its credential id and PRF input. Public data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrfRequest {
+    pub slot_id: String,
+    #[serde(serialize_with = "ser_b64")]
+    pub credential_id: Vec<u8>,
+    pub rp_id: String,
+    #[serde(serialize_with = "ser_b64")]
+    pub salt: Vec<u8>,
+    pub label: String,
+    pub be: bool,
+}
+
+fn ser_b64<S: serde::Serializer>(v: &[u8], s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(&data_encoding::BASE64URL_NOPAD.encode(v))
+}
+
+impl PrfRequest {
+    fn of(slot: &Slot) -> Option<Self> {
+        let p = slot.prf_params()?;
+        Some(Self {
+            slot_id: slot.id().to_owned(),
+            credential_id: p.credential_id.to_vec(),
+            rp_id: p.rp_id.to_owned(),
+            salt: p.salt.to_vec(),
+            label: p.label.to_owned(),
+            be: p.be,
+        })
+    }
+}
+
+pub fn prf_request(bytes: &[u8]) -> Result<Vec<PrfRequest>> {
+    match parse_any(bytes)? {
+        ParsedFile::V2(_, slots) => Ok(slots.prf_slots().filter_map(PrfRequest::of).collect()),
+        ParsedFile::V1(_) => Err(Error::Format(
+            "this is a demo vault without a password".into(),
+        )),
+    }
+}
+
+/// WebAuthn authenticator data flags: user present, user verified.
+const FLAG_UP: u8 = 0x01;
+const FLAG_UV: u8 = 0x04;
+
+/// rpIdHash and UP/UV flags of an assertion's authenticator data.
+fn check_assertion(authenticator_data: &[u8], rp_id: &str) -> Result<()> {
+    if authenticator_data.len() < 37 {
+        return Err(Error::Decrypt);
+    }
+    let rp_hash: [u8; 32] = Sha256::digest(rp_id.as_bytes()).into();
+    let ok_hash = bool::from(authenticator_data[..32].ct_eq(&rp_hash));
+    let flags = authenticator_data[32];
+    if !ok_hash || flags & FLAG_UP == 0 || flags & FLAG_UV == 0 {
+        return Err(Error::Decrypt);
+    }
+    Ok(())
+}
+
 /// How a vault's data key is protected.
 #[derive(Clone)]
 enum Keys {
@@ -329,6 +390,21 @@ pub struct PendingRecovery {
 impl PendingRecovery {
     pub fn code(&self) -> &RecoveryCode {
         &self.code
+    }
+}
+
+/// A quick-unlock enrolment in progress: core-issued parameters, bound to
+/// the vault state its authority was checked against.
+pub struct PendingPrf {
+    setup: PrfSetup,
+    vault_id: String,
+    source_slots: [u8; 32],
+    source_dek: Key256,
+}
+
+impl PendingPrf {
+    pub fn setup(&self) -> &PrfSetup {
+        &self.setup
     }
 }
 
@@ -584,6 +660,108 @@ impl Vault {
         Ok(())
     }
 
+    /// Check `authority` over this vault without changing anything (so a
+    /// wrong password is refused BEFORE an external ceremony, e.g. creating
+    /// a passkey that could not then be added).
+    pub fn verify_authority(&self, authority: Authority<'_>) -> Result<()> {
+        authority.verify(&self.vault_id, self.slots()?, &self.dek)
+    }
+
+    /// Start a quick-unlock enrolment: `authority` is checked first (so a
+    /// wrong password never reaches a passkey ceremony), then fresh public
+    /// parameters are issued, bound to THIS vault's id, exact slot set and
+    /// DEK. The enrolment can only finish on that same state.
+    pub fn begin_prf(
+        &self,
+        authority: Authority<'_>,
+        rng: &mut dyn RandomSource,
+    ) -> Result<PendingPrf> {
+        let slots = self.slots()?;
+        authority.verify(&self.vault_id, slots, &self.dek)?;
+        Ok(PendingPrf {
+            setup: PrfSetup::generate(rng)?,
+            vault_id: self.vault_id.clone(),
+            source_slots: slots.digest(),
+            source_dek: self.dek.clone(),
+        })
+    }
+
+    /// Quick-unlock slots of this vault (public data).
+    pub fn prf_slots(&self) -> Result<Vec<PrfRequest>> {
+        Ok(self
+            .slots()?
+            .prf_slots()
+            .filter_map(PrfRequest::of)
+            .collect())
+    }
+
+    /// Enrol a quick-unlock passkey: a new `webauthn-prf` slot wrapping this
+    /// vault's DEK under the authenticator's PRF output. Needs `authority`
+    /// (the master password: a sensitive operation, ADR 0003 §4.4). The new
+    /// slot is unwrapped again in memory and must yield this DEK (constant
+    /// time) before it is added. Nothing else changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_prf_slot(
+        &mut self,
+        authority: Authority<'_>,
+        pending: &PendingPrf,
+        credential_id: &[u8],
+        rp_id: &str,
+        be: bool,
+        label: &str,
+        prf_output: &[u8; PRF_LEN],
+        rng: &mut dyn RandomSource,
+    ) -> Result<()> {
+        let slots = self.slots()?;
+        authority.verify(&self.vault_id, slots, &self.dek)?;
+        if pending.vault_id != self.vault_id
+            || slots.digest() != pending.source_slots
+            || !bool::from(pending.source_dek.as_bytes().ct_eq(self.dek.as_bytes()))
+        {
+            return Err(Error::validation(
+                "this enrolment was started for another vault or credential state",
+            ));
+        }
+        let setup = &pending.setup;
+        if slots.records().iter().any(|r| r.id == setup.slot_id) {
+            return Err(Error::validation("a new key slot needs a fresh id"));
+        }
+        let slot = Slot::new_prf(
+            &self.vault_id,
+            setup,
+            credential_id,
+            rp_id,
+            be,
+            label,
+            prf_output,
+            &self.dek,
+            rng,
+        )?;
+        let back = slot.unwrap(&self.vault_id, &prf_output[..])?;
+        if !bool::from(back.as_bytes().ct_eq(self.dek.as_bytes())) {
+            return Err(Error::Integrity(
+                "quick-unlock slot does not open this vault".into(),
+            ));
+        }
+        let next = slots.with_prf(slot)?;
+        if let Keys::Slots { slots, .. } = &mut self.keys {
+            *slots = next;
+        }
+        Ok(())
+    }
+
+    /// Remove one quick-unlock slot. Needs `authority`. Copies of the vault
+    /// made earlier still contain the slot (not revoked).
+    pub fn remove_prf_slot(&mut self, authority: Authority<'_>, slot_id: &str) -> Result<()> {
+        let slots = self.slots()?;
+        authority.verify(&self.vault_id, slots, &self.dek)?;
+        let next = slots.without_prf(slot_id)?;
+        if let Keys::Slots { slots, .. } = &mut self.keys {
+            *slots = next;
+        }
+        Ok(())
+    }
+
     /// Start a compromise rotation of a v2 vault: a fresh data key, and fresh
     /// password and recovery slots for it (ADR 0002 §8). Needs `authority`
     /// over this vault; `setup` must be fresh (new slot id and salt) and
@@ -601,8 +779,38 @@ impl Vault {
         new_password_key: &[u8; 32],
         rng: &mut dyn RandomSource,
     ) -> Result<PendingRotation> {
+        self.begin_rotation_with(authority, setup, new_password_key, false, rng)
+    }
+
+    /// [`Vault::begin_rotation`] for a vault with quick-unlock (PRF) slots:
+    /// they wrap the old DEK and their authenticators are not present, so
+    /// rotation REVOKES them (the rotated vault has none; enrol again
+    /// afterwards). The caller passes this only after the user confirmed.
+    pub fn begin_rotation_revoking_quick_unlock(
+        &self,
+        authority: Authority<'_>,
+        setup: &PasswordSetup,
+        new_password_key: &[u8; 32],
+        rng: &mut dyn RandomSource,
+    ) -> Result<PendingRotation> {
+        self.begin_rotation_with(authority, setup, new_password_key, true, rng)
+    }
+
+    fn begin_rotation_with(
+        &self,
+        authority: Authority<'_>,
+        setup: &PasswordSetup,
+        new_password_key: &[u8; 32],
+        revoke_quick_unlock: bool,
+        rng: &mut dyn RandomSource,
+    ) -> Result<PendingRotation> {
         let slots = self.slots()?;
         authority.verify(&self.vault_id, slots, &self.dek)?;
+        if slots.prf_slots().next().is_some() && !revoke_quick_unlock {
+            return Err(Error::validation(
+                "rotation would revoke quick-unlock passkeys; confirm first",
+            ));
+        }
         let old = slots.get(SlotKind::Password).password_setup()?;
         if old.slot_id == setup.slot_id || bool::from(old.salt.ct_eq(&setup.salt)) {
             return Err(Error::validation("a new password needs a fresh salt"));
@@ -730,6 +938,45 @@ impl Vault {
     }
 
     fn open_v2(bytes: &[u8], kind: SlotKind, ikm: &[u8]) -> Result<Self> {
+        Self::open_v2_with(bytes, |slots| Ok(slots.get(kind)), ikm)
+    }
+
+    /// Open a v2 file with a quick-unlock (WebAuthn PRF) assertion.
+    ///
+    /// Fail closed, before any decryption, unless: the credential id names
+    /// exactly one stored `webauthn-prf` slot; `authenticator_data` is at
+    /// least 37 bytes, its rpIdHash equals SHA-256 of BOTH the slot's stored
+    /// rp id and `rp_id` (this origin), and its flags show user presence
+    /// (0x01) and user verification (0x04); the PRF output is 32 bytes. The
+    /// assertion signature is not verified (no server; the PRF output itself
+    /// is the secret), which is a stated limit.
+    pub fn open_with_prf(
+        bytes: &[u8],
+        credential_id: &[u8],
+        authenticator_data: &[u8],
+        prf_output: &[u8; crate::keyslot::PRF_LEN],
+        rp_id: &str,
+    ) -> Result<Self> {
+        check_assertion(authenticator_data, rp_id)?;
+        Self::open_v2_with(
+            bytes,
+            |slots| {
+                let slot = slots.prf_slot(credential_id).ok_or(Error::Decrypt)?;
+                let stored = slot.prf_params().ok_or(Error::Decrypt)?;
+                if stored.rp_id != rp_id {
+                    return Err(Error::Decrypt);
+                }
+                Ok(slot)
+            },
+            &prf_output[..],
+        )
+    }
+
+    fn open_v2_with(
+        bytes: &[u8],
+        pick: impl FnOnce(&SlotSet) -> Result<&Slot>,
+        ikm: &[u8],
+    ) -> Result<Self> {
         let (f, slots) = match parse_any(bytes)? {
             ParsedFile::V2(f, slots) => (f, slots),
             ParsedFile::V1(_) => {
@@ -738,7 +985,7 @@ impl Vault {
                 ))
             }
         };
-        let dek = slots.get(kind).unwrap(&f.vault_id, ikm)?;
+        let dek = pick(&slots)?.unwrap(&f.vault_id, ikm)?;
         let maad = header_aad_v2(&f.vault_id, f.revision, &slots);
         let items = open_items(
             &dek,
@@ -1755,6 +2002,339 @@ mod tests {
             r.is_err(),
             "a code wrapped for the old data key must be refused"
         );
+    }
+
+    // --- webauthn-prf quick unlock (M5 C1) ---------------------------------
+
+    const RP: &str = "keymesh.cloud";
+
+    fn auth_data(rp: &str, flags: u8) -> Vec<u8> {
+        let mut d: Vec<u8> = Sha256::digest(rp.as_bytes()).to_vec();
+        d.push(flags);
+        d.extend_from_slice(&[0, 0, 0, 7]);
+        d
+    }
+
+    fn enrol(v: &mut Vault, code: &RecoveryCode, cred: &[u8], prf: &[u8; 32]) -> String {
+        let setup = v
+            .begin_prf(Authority::Recovery(code), &mut OsRandom)
+            .unwrap();
+        v.add_prf_slot(
+            Authority::Recovery(code),
+            &setup,
+            cred,
+            RP,
+            false,
+            "Synthetic key",
+            prf,
+            &mut OsRandom,
+        )
+        .unwrap();
+        setup.setup().slot_id.clone()
+    }
+
+    fn sealed(v: &mut Vault) -> Vec<u8> {
+        let (b, r) = v.seal_next_protected(&mut OsRandom).unwrap();
+        v.mark_written(r, &b).unwrap();
+        b
+    }
+
+    #[test]
+    fn prf_slot_unlocks_only_with_the_right_assertion() {
+        let (mut v, code, _) = protected();
+        let cred = [0x11u8; 32];
+        let prf = [0x5au8; 32];
+        enrol(&mut v, &code, &cred, &prf);
+        let b = sealed(&mut v);
+        let ok = Vault::open_with_prf(&b, &cred, &auth_data(RP, 0x05), &prf, RP).unwrap();
+        assert_eq!(ok.len(), v.len());
+        // Password and recovery still open it.
+        assert!(Vault::open_with_password(&b, PW).is_ok());
+        assert!(Vault::open_with_recovery(&b, &code).is_ok());
+        let fails = |cred: &[u8], ad: &[u8], prf: &[u8; 32], rp: &str| {
+            matches!(
+                Vault::open_with_prf(&b, cred, ad, prf, rp),
+                Err(Error::Decrypt)
+            )
+        };
+        assert!(
+            fails(&cred, &auth_data(RP, 0x05), &[0x5b; 32], RP),
+            "wrong PRF output"
+        );
+        assert!(fails(&cred, &auth_data(RP, 0x01), &prf, RP), "UV missing");
+        assert!(fails(&cred, &auth_data(RP, 0x04), &prf, RP), "UP missing");
+        assert!(
+            fails(&cred, &auth_data("evil.example", 0x05), &prf, RP),
+            "rpIdHash of another site"
+        );
+        assert!(
+            fails(
+                &cred,
+                &auth_data("evil.example", 0x05),
+                &prf,
+                "evil.example"
+            ),
+            "slot is for another rp id"
+        );
+        assert!(
+            fails(&[0x12; 32], &auth_data(RP, 0x05), &prf, RP),
+            "unknown credential"
+        );
+        assert!(
+            fails(&cred, &auth_data(RP, 0x05)[..36], &prf, RP),
+            "short authenticator data"
+        );
+        // Public request data lists the slot.
+        let req = prf_request(&b).unwrap();
+        assert_eq!(req.len(), 1);
+        assert_eq!(
+            (
+                req[0].credential_id.as_slice(),
+                req[0].rp_id.as_str(),
+                req[0].salt.len()
+            ),
+            (&cred[..], RP, 32)
+        );
+    }
+
+    #[test]
+    fn prf_slot_fields_are_authenticated() {
+        let (mut v, code, _) = protected();
+        let cred = [0x21u8; 20];
+        let prf = [0x33u8; 32];
+        enrol(&mut v, &code, &cred, &prf);
+        let b = sealed(&mut v);
+        let ad = auth_data(RP, 0x05);
+        let i = json(&b)["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|s| s["kind"] == "webauthn-prf")
+            .unwrap();
+        for (field, val) in [
+            ("label", serde_json::json!("Renamed")),
+            ("be", serde_json::json!(true)),
+            (
+                "salt",
+                serde_json::json!(data_encoding::BASE64URL_NOPAD.encode(&[9u8; 32])),
+            ),
+        ] {
+            let mut j = json(&b);
+            j["slots"][i]["kdf"][field] = val;
+            let t = bytes_of(&j);
+            assert!(
+                Vault::open_with_prf(&t, &cred, &ad, &prf, RP).is_err(),
+                "{field} via PRF"
+            );
+            assert!(
+                Vault::open_with_password(&t, PW).is_err(),
+                "{field} via password (manifest)"
+            );
+        }
+        // Bounds and unknown fields are refused before any derivation.
+        for (field, val) in [
+            (
+                "credential_id",
+                serde_json::json!(data_encoding::BASE64URL_NOPAD.encode(&[1u8; 8])),
+            ),
+            ("rp_id", serde_json::json!("KEYMESH.cloud")),
+            ("rp_id", serde_json::json!("")),
+            ("label", serde_json::json!("x".repeat(65))),
+            ("label", serde_json::json!("bad\nlabel")),
+            ("extra", serde_json::json!(1)),
+        ] {
+            let mut j = json(&b);
+            j["slots"][i]["kdf"][field] = val;
+            assert!(
+                matches!(
+                    Vault::open_with_password(&bytes_of(&j), PW),
+                    Err(Error::Format(_))
+                ),
+                "{field}"
+            );
+        }
+        let mut j = json(&b);
+        j["slots"][i]["kdf"]["alg"] = serde_json::json!("hkdf-sha256");
+        assert!(matches!(
+            Vault::open_with_password(&bytes_of(&j), PW),
+            Err(Error::Format(_))
+        ));
+        let mut j = json(&b);
+        j["slots"][i]["kind"] = serde_json::json!("webauthn-prf-v2");
+        assert!(matches!(
+            Vault::open_with_password(&bytes_of(&j), PW),
+            Err(Error::Format(_))
+        ));
+    }
+
+    #[test]
+    fn prf_enrolment_needs_authority_and_bounds_and_removal_works() {
+        let (mut v, code, _) = protected();
+        let other = RecoveryCode::generate(&mut OsRandom).unwrap();
+        // Wrong authority: refused before any parameters (no ceremony).
+        assert!(v
+            .begin_prf(Authority::Recovery(&other), &mut OsRandom)
+            .is_err());
+        let setup = v
+            .begin_prf(Authority::Recovery(&code), &mut OsRandom)
+            .unwrap();
+        assert!(v
+            .add_prf_slot(
+                Authority::Recovery(&other),
+                &setup,
+                &[1; 16],
+                RP,
+                false,
+                "",
+                &[1; 32],
+                &mut OsRandom
+            )
+            .is_err());
+        for (cred, rp, label) in [
+            (&[1u8; 15][..], RP, ""),
+            (&[1u8; 16][..], "Bad.Host", ""),
+            (&[1u8; 16][..], RP, "a\u{7}b"),
+        ] {
+            assert!(v
+                .add_prf_slot(
+                    Authority::Recovery(&code),
+                    &setup,
+                    cred,
+                    rp,
+                    false,
+                    label,
+                    &[1; 32],
+                    &mut OsRandom
+                )
+                .is_err());
+        }
+        let ids: Vec<String> = (0..4u8)
+            .map(|k| enrol(&mut v, &code, &[k + 1; 16], &[k; 32]))
+            .collect();
+        // Duplicate credential and a fifth slot are refused.
+        let s5 = v
+            .begin_prf(Authority::Recovery(&code), &mut OsRandom)
+            .unwrap();
+        assert!(v
+            .add_prf_slot(
+                Authority::Recovery(&code),
+                &s5,
+                &[1; 16],
+                RP,
+                false,
+                "",
+                &[9; 32],
+                &mut OsRandom
+            )
+            .is_err());
+        assert!(v
+            .add_prf_slot(
+                Authority::Recovery(&code),
+                &s5,
+                &[9; 16],
+                RP,
+                false,
+                "",
+                &[9; 32],
+                &mut OsRandom
+            )
+            .is_err());
+        assert_eq!(v.prf_slots().unwrap().len(), 4);
+        // Removal needs authority; password/recovery slots can't be removed.
+        assert!(v
+            .remove_prf_slot(Authority::Recovery(&other), &ids[0])
+            .is_err());
+        let pw_id = v.password_setup().unwrap().slot_id;
+        assert!(v
+            .remove_prf_slot(Authority::Recovery(&code), &pw_id)
+            .is_err());
+        v.remove_prf_slot(Authority::Recovery(&code), &ids[0])
+            .unwrap();
+        let b = sealed(&mut v);
+        assert!(Vault::open_with_prf(&b, &[1; 16], &auth_data(RP, 0x05), &[0; 32], RP).is_err());
+        assert!(Vault::open_with_prf(&b, &[2; 16], &auth_data(RP, 0x05), &[1; 32], RP).is_ok());
+    }
+
+    #[test]
+    fn prf_enrolment_is_bound_to_its_vault_and_credential_state() {
+        let (mut v, code, _) = protected();
+        let p = v
+            .begin_prf(Authority::Recovery(&code), &mut OsRandom)
+            .unwrap();
+        // Same vault id, independently keyed (the shared test setup): refused.
+        let (mut twin, twin_code, _) = protected();
+        assert_eq!(twin.vault_id(), v.vault_id());
+        let add = |w: &mut Vault, c: &RecoveryCode, p: &PendingPrf| {
+            w.add_prf_slot(
+                Authority::Recovery(c),
+                p,
+                &[5; 16],
+                RP,
+                false,
+                "x",
+                &[5; 32],
+                &mut OsRandom,
+            )
+        };
+        assert!(add(&mut twin, &twin_code, &p).is_err());
+        assert_eq!(
+            twin.prf_slots().unwrap().len(),
+            0,
+            "no wrapper copied into another vault"
+        );
+        // Same vault, made stale by a password change after begin: refused.
+        let mut changed = v.clone();
+        let s2 = PasswordSetup::generate(&mut OsRandom).unwrap();
+        changed
+            .change_password(Authority::Recovery(&code), &s2, &[8; 32], &mut OsRandom)
+            .unwrap();
+        assert!(add(&mut changed, &code, &p).is_err());
+        // Same slots, another DEK in memory: refused by the DEK binding alone.
+        let mut other_key = v.clone();
+        other_key.dek = Key256::generate(&mut OsRandom).unwrap();
+        assert!(add(&mut other_key, &code, &p).is_err());
+        // After a rotation: refused.
+        let setup = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let key = setup.derive("synthetic rotated passphrase").unwrap();
+        let pr = v
+            .begin_rotation(Authority::Recovery(&code), &setup, &key, &mut OsRandom)
+            .unwrap();
+        let nc = RecoveryCode::parse(&pr.code().to_text()).unwrap();
+        let mut rotated = v.finish_rotation(&pr, &nc).unwrap();
+        assert!(add(&mut rotated, &nc, &p).is_err());
+        // The original state accepts it.
+        add(&mut v, &code, &p).unwrap();
+    }
+
+    #[test]
+    fn rotation_never_silently_keeps_prf_slots() {
+        let (mut v, code, _) = protected();
+        let cred = [0x44u8; 16];
+        let prf = [0x77u8; 32];
+        enrol(&mut v, &code, &cred, &prf);
+        let before = sealed(&mut v);
+        let setup = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let key = setup.derive("synthetic rotated passphrase").unwrap();
+        // Without confirmation: refused.
+        assert!(v
+            .begin_rotation(Authority::Recovery(&code), &setup, &key, &mut OsRandom)
+            .is_err());
+        let p = v
+            .begin_rotation_revoking_quick_unlock(
+                Authority::Recovery(&code),
+                &setup,
+                &key,
+                &mut OsRandom,
+            )
+            .unwrap();
+        let new_code = RecoveryCode::parse(&p.code().to_text()).unwrap();
+        let mut r = v.finish_rotation(&p, &new_code).unwrap();
+        assert_eq!(r.prf_slots().unwrap().len(), 0);
+        let after = sealed(&mut r);
+        assert!(prf_request(&after).unwrap().is_empty());
+        assert!(Vault::open_with_prf(&after, &cred, &auth_data(RP, 0x05), &prf, RP).is_err());
+        // The old copy still has (and opens with) the slot: not revocable.
+        assert!(Vault::open_with_prf(&before, &cred, &auth_data(RP, 0x05), &prf, RP).is_ok());
     }
 
     #[test]
