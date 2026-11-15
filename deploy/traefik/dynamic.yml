@@ -1,0 +1,35 @@
+# Routes: keymesh.cloud only (strict SNI), HTTPS to the loopback web server, HTTP redirects to HTTPS.
+http:
+  routers:
+    keymesh:
+      rule: Host(`keymesh.cloud`)
+      entryPoints: [websecure]
+      service: keymesh
+      middlewares: [hsts]
+      tls:
+        certResolver: stepca
+        domains:
+          - main: keymesh.cloud
+    keymesh-http:
+      rule: Host(`keymesh.cloud`)
+      entryPoints: [web]
+      service: keymesh
+      middlewares: [to-https]
+  middlewares:
+    to-https:
+      redirectScheme:
+        scheme: https
+        permanent: false
+    hsts:
+      headers:
+        stsSeconds: 31536000
+  services:
+    keymesh:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:4320
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12
+      sniStrict: true

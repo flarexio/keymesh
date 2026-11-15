@@ -6,6 +6,11 @@ Status (M4): HTTPS serving and secure-context gating are implemented and tested 
 
 Until then, the private-network previews stay plain HTTP and demo-only. Every flow, including password vaults, stays experimental and synthetic-only until independent acceptance.
 
+**Update (2026-11-15): private HTTPS deployment (option 1, using an existing CA).** The human chose `keymesh.cloud` and the existing FlareX step-ca at `ca.cloud`, which is resolved through the VPN DNS 10.8.0.1.
+* **What runs:** `deploy/` runs the web server and a Traefik TLS proxy in Docker on `10.8.0.22:443`. Traefik got its certificate from that CA by ACME HTTP-01. See `deploy/README.md`.
+* **Already verified:** gate B is verified against the real certificate (chain, hostname, headers, redirect, SNI refusal).
+* **Still open:** gate C. Each client must use the VPN DNS and trust the FlareX Root CA, and that must be checked on a real enrolled device.
+
 ## 1. Three separate gates
 
 | Gate | What it shows | State |

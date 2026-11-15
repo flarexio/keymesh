@@ -1,0 +1,4 @@
+# Allowlist: only the server script and the built bundle.
+*
+!scripts/serve.mjs
+!dist/web/browser/**
