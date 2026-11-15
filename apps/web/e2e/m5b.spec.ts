@@ -57,6 +57,14 @@ const EFF = new Set(
     .map((l) => l.split('\t')[1]),
 );
 
+/** Click Reveal and read the value only once it is actually shown (not the mask). */
+async function revealed(scope: import('@playwright/test').Locator): Promise<string> {
+  await scope.getByRole('button', { name: en['secret.reveal'] }).click();
+  const v = scope.getByTestId('generated-value');
+  await expect(v).not.toContainText('•');
+  return (await v.textContent())!.trim();
+}
+
 async function demoVault(page: Page) {
   await page.goto('/');
   await page.locator('input[name=mode][value=synthetic-fixture]').check();
@@ -163,8 +171,7 @@ test('passphrase generator: EFF words, strength shown, Save stores exactly the p
   await card.getByTestId('passphrase-words').selectOption('8');
   await card.getByTestId('passphrase-separator').selectOption('period');
   await card.getByTestId('generate-passphrase').click();
-  await card.getByRole('button', { name: en['secret.reveal'] }).click();
-  const shown = (await card.getByTestId('generated-value').textContent())!.trim();
+  const shown = await revealed(card);
   await card.scrollIntoViewIfNeeded();
   await page.screenshot({ path: shot(testInfo, 'm5b-passphrase-desktop.png'), mask: [card.getByTestId('generated-value')] });
   const words = shown.split('.');
@@ -185,8 +192,7 @@ async function createWithSuggestion(page: Page): Promise<{ pw: string; code: str
   await expect(page.getByTestId('protected-section')).toBeVisible();
   const suggest = page.getByTestId('protected-section').getByTestId('passphrase-suggest');
   await suggest.getByTestId('suggest-passphrase').click();
-  await suggest.getByRole('button', { name: en['secret.reveal'] }).click();
-  const pw = (await suggest.getByTestId('generated-value').textContent())!.trim();
+  const pw = await revealed(suggest);
   expect(pw.split(' ')).toHaveLength(7);
   expect(pw.split(' ').every((w) => EFF.has(w))).toBe(true);
   await expect(suggest.getByTestId('suggest-use')).toBeDisabled();
@@ -280,8 +286,7 @@ test('data-key rotation: new credentials only; the old backup keeps its old ones
   await expect(page.getByTestId('backup-error')).toContainText(en['errors.samePassword']);
   const suggest = r.getByTestId('passphrase-suggest');
   await suggest.getByTestId('suggest-passphrase').click();
-  await suggest.getByRole('button', { name: en['secret.reveal'] }).click();
-  const newPw = (await suggest.getByTestId('generated-value').textContent())!.trim();
+  const newPw = await revealed(suggest);
   await suggest.getByTestId('suggest-stored').check();
   await suggest.getByTestId('suggest-use').click();
   await r.scrollIntoViewIfNeeded();
