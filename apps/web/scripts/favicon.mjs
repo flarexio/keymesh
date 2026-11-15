@@ -11,8 +11,12 @@
 // * Only PNG. It is fully decoded (CRC, bounded inflate, filters) and
 //   re-encoded into a fresh RGBA PNG; nothing from the origin is passed
 //   through. Anything else → null (the app keeps its local icon).
-// * No host names are logged. Results are cached in memory; requests are
-//   rate limited per process.
+// * No host names are logged. No result cache (no cross-client oracle); the
+//   response is `no-store`. Requests are rate limited per process.
+// * Limits that are NOT hard: dns.lookup cannot be cancelled (a late answer
+//   is ignored, but the native resolver job may still be outstanding), and
+//   the bounded PNG decode is synchronous (not preempted; a late result is
+//   discarded). A hard CPU bound would need a terminable worker.
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { request as httpsRequest } from 'node:https';
 import { BlockList, isIP } from 'node:net';
@@ -25,8 +29,6 @@ export const LIMITS = Object.freeze({
   maxSide: 256,
   redirects: 2,
   ratePerMinute: 30,
-  cacheEntries: 256,
-  cacheMs: 24 * 3600 * 1000,
   maxInFlight: 4,
   maxChunks: 64,
 });
@@ -220,18 +222,30 @@ export const realNet = {
     // ignores a late answer.
     return dnsLookup(host, { all: true, verbatim: true });
   },
-  get(host, address, family, path, signal, maxBytes) {
+  /**
+   * GET over HTTPS to the vetted `address` only. `host` stays the TLS server
+   * name (SNI) and the name the certificate must match (normal Node checks;
+   * nothing disabled). The pinned `lookup` honours both callback shapes: a
+   * single address, or `{all: true}` (an array), which Node uses for
+   * happy-eyeballs family autoselection (the default since Node 20).
+   * `test` (port, ca) exists only for the local regression server.
+   */
+  get(host, address, family, path, signal, maxBytes, test = {}) {
     return new Promise((resolve, reject) => {
       const req = httpsRequest(
         {
           host,
           servername: host,
-          port: 443,
+          port: test.port ?? 443,
+          ...(test.ca ? { ca: test.ca } : {}),
           path,
           method: 'GET',
           signal,
           headers: { 'user-agent': 'keymesh-favicon', accept: 'image/png' },
-          lookup: (_h, _o, cb) => cb(null, address, family), // pinned: no second resolution
+          lookup: (_h, opts, cb) => {
+            if (opts && typeof opts === 'object' && opts.all) cb(null, [{ address, family }]);
+            else cb(null, address, family);
+          },
           agent: false,
         },
         (res) => {
@@ -260,6 +274,9 @@ export const realNet = {
  */
 export async function fetchFavicon(input, net = realNet, limits = LIMITS) {
   const ac = new AbortController();
+  const started = performance.now();
+  /** Monotonic: the deadline holds even when a synchronous decode delayed the timer. */
+  const late = () => ac.signal.aborted || performance.now() - started > limits.totalMs;
   let timer;
   // One deadline for EVERYTHING (DNS, every hop, the body, the decode).
   const deadline = new Promise((resolve) => {
@@ -276,14 +293,14 @@ export async function fetchFavicon(input, net = realNet, limits = LIMITS) {
       const key = `${host}${path}`;
       if (tried.has(key)) return null; // loop
       tried.add(key);
-      if (ac.signal.aborted) return null;
+      if (late()) return null;
       const addrs = await net.resolve(host, ac.signal);
-      if (ac.signal.aborted) return null; // late DNS answer: never connect
+      if (late()) return null; // late DNS answer: never connect
       if (!Array.isArray(addrs) || addrs.length === 0 || addrs.length > 32) return null;
       if (!addrs.every((a) => a && isPublicAddress(a.address, a.family))) return null;
       const pick = addrs[0];
       const res = await net.get(host, pick.address, pick.family, path, ac.signal, limits.maxBytes);
-      if (ac.signal.aborted) return null;
+      if (late()) return null;
       if (res.status >= 300 && res.status < 400 && res.location) {
         let next;
         try {
@@ -298,6 +315,9 @@ export async function fetchFavicon(input, net = realNet, limits = LIMITS) {
       }
       if (res.status !== 200 || res.body.length > limits.maxBytes) return null;
       const png = sanitizePng(res.body, limits.maxSide);
+      // The decode runs synchronously (bounded by maxBytes/maxSide); it can't
+      // be preempted here, but a result that is late is never returned.
+      if (late()) return null;
       if (png) return png;
       if (path === '/favicon.ico' && hop === 0) {
         path = '/apple-touch-icon.png';
@@ -308,38 +328,37 @@ export async function fetchFavicon(input, net = realNet, limits = LIMITS) {
     return null;
   })().catch(() => null);
   try {
-    return await Promise.race([work, deadline]);
+    const out = await Promise.race([work, deadline]);
+    return out && !late() ? out : null;
   } finally {
     clearTimeout(timer);
     ac.abort(); // anything still running stops now
   }
 }
 
-/** Route state: an in-memory cache and a per-process rate limit. */
+/**
+ * Route state: a per-process rate limit and concurrency bound only. There
+ * is deliberately NO shared result cache: a cache keyed by host would let
+ * any caller learn (e.g. under an exhausted rate budget) which hosts others
+ * looked up. Every answer is computed fresh and sent with `no-store`.
+ */
 export function createFaviconRoute({ enabled, net = realNet, limits = LIMITS, now = () => Date.now() } = {}) {
-  const cache = new Map();
   let window = { start: 0, count: 0 };
   let inFlight = 0;
   return async function route(url) {
     if (!enabled) return { status: 404 };
     const host = normalizeHost(url.searchParams.get('host') ?? '');
     if (!host || [...url.searchParams.keys()].some((k) => k !== 'host')) return { status: 400 };
-    const hit = cache.get(host);
-    if (hit && now() - hit.at < limits.cacheMs) return hit.png ? { status: 200, body: hit.png } : { status: 404 };
     const t = now();
     if (t - window.start >= 60_000) window = { start: t, count: 0 };
     if (++window.count > limits.ratePerMinute) return { status: 429 };
     if (inFlight >= limits.maxInFlight) return { status: 429 };
     inFlight++;
-    let png;
     try {
-      png = await fetchFavicon(host, net, limits);
+      const png = await fetchFavicon(host, net, limits);
+      return png ? { status: 200, body: png } : { status: 404 };
     } finally {
       inFlight--;
     }
-    cache.delete(host);
-    cache.set(host, { at: now(), png });
-    while (cache.size > limits.cacheEntries) cache.delete(cache.keys().next().value);
-    return png ? { status: 200, body: png } : { status: 404 };
   };
 }

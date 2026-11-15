@@ -150,3 +150,6 @@ tmux new-session -d -s keymesh-vpn-https \
 * **What was tested:** only Chromium's DevTools virtual authenticator (CTAP 2.1, internal, UV, PRF). No TouchID, FaceID, Windows Hello, Android, iOS or security-key result is recorded (ADR 0003 §5 is still open). Real devices need a human with the device.
 * **Auto-lock** runs in every origin, including demo vaults on the previews.
 * **Website icons:** the server route `/api/favicon` is compiled into the image but **off** unless the server runs with `KEYMESH_FAVICON=1`. The Docker deployment does not set it, and live outbound use is not approved. When it is off, the route answers 404 and the app keeps its local icons.
+  * **When on:** the server keeps no host cache, so it gives no cross-client lookup oracle, and answers with `no-store`.
+  * **Limits that are not hard:** `dns.lookup` can't be cancelled, so a late answer is ignored but the resolver job may still be running. The bounded PNG decode is synchronous: it is not preempted, but a late result is discarded. A hard CPU bound would need a terminable worker.
+* **Auto-lock deadlines are checked on every step**, not only by a timer: after a capability query, a KDF, a passkey ceremony or a storage read, and right before a write. A page whose timers were paused still locks before it uses secrets or writes.

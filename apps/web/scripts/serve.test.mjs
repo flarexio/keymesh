@@ -177,3 +177,15 @@ test('favicon route: off by default (404, never the SPA shell), other /api paths
   }
   assert.ok(!serverOutput.includes('icons.example.com'));
 });
+
+test('favicon responses are never stored by the browser (no-store), even errors', async () => {
+  const r = await new Promise((resolve, reject) => {
+    const q = request({ host: '127.0.0.1', port: PORT, path: '/api/favicon?host=icons.example.com', method: 'GET' }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.headers['cache-control']));
+    });
+    q.on('error', reject);
+    q.end();
+  });
+  assert.equal(r, 'no-store');
+});

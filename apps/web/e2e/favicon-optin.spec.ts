@@ -32,6 +32,7 @@ async function setup(page: Page) {
   await expect(page.getByTestId('lock')).toBeVisible();
   await loginItem(page, 'Synthetic shop', 'https://shop.synthetic-favicon.org/account?id=SECRETMARK');
   await loginItem(page, 'Synthetic NAS', 'https://nas.local/admin');
+  await loginItem(page, 'Synthetic internal', 'https://wiki.corp.cloud/');
   return asked;
 }
 
@@ -54,6 +55,8 @@ test('opted in: only the viewed item, only its public host, nothing else; privat
   await expect(page.locator('.detail-head [data-icon="remote"] img')).toBeVisible();
   await openItem(page, 'Synthetic NAS');
   await expect(page.locator('.detail-head [data-icon="private"]')).toBeVisible();
+  await openItem(page, 'Synthetic internal'); // a name the server refuses is never even asked
+  await expect(page.locator('.detail-head [data-icon="remote"]')).toHaveCount(0);
   expect(asked.length).toBe(1);
   const u = new URL(asked[0]);
   expect(u.pathname).toBe('/api/favicon');

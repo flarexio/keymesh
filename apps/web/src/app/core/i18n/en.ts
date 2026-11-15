@@ -559,9 +559,9 @@ export const en = {
 
   // M5 C3: optional website icons
   'favicon.title': 'Website icons (optional)',
-  'favicon.lead': 'Off by default. When on, opening a login item can ask this app’s own server for that website’s icon. Only the website’s host name is sent (no title, account, path or password), only for the item you are viewing, never for private or internal hosts.',
+  'favicon.lead': 'Off by default. When on, opening a login item can ask this app’s own server for that website’s icon. Only the website’s host name is sent (no title, account, path or password), only for the item you are viewing. Names that look private or internal (for example .local, .internal, .cloud) are not sent; a public-looking name can still point to a private address, and the server then refuses it.',
   'favicon.optin': 'Show website icons fetched by this server',
-  'favicon.limits': 'The server then contacts that website. If the server has this feature turned off, the local icon stays. Icons are not a security indicator.',
+  'favicon.limits': 'The server then contacts that website. It keeps no list of looked-up hosts and tells the browser not to store the answer. If the server has this feature turned off, the local icon stays. Icons are not a security indicator.',
   'notice.titlePasskey': 'About the passkey you were adding',
   'notice.passkeyMeta': 'Passkey: “{label}”, created {time}.',
   'notice.quickUnlockOrphan': 'This passkey was created on your device or in your password manager, but it was NOT added to this vault. It can’t unlock anything here. You can delete it in your device’s or browser’s passkey settings (look for “Keymesh vault …”).',

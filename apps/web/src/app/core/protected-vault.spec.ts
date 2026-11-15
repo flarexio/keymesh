@@ -26,6 +26,7 @@ import { en } from './i18n/en';
 import { zhTW } from './i18n/zh-tw';
 import { PREFERENCE_STORAGE } from './preferences';
 import { WEBAUTHN } from './quick-unlock';
+import { AutoLock, LOCK_CLOCK, COARSE_POINTER, AUTOLOCK_STORAGE } from './auto-lock';
 
 function deferred<T = void>() {
   let resolve!: (v: T) => void;
@@ -64,7 +65,7 @@ const keyFor = (pw: string) => new Uint8Array([pwTag(pw), 0, 0, 0]);
 const sessions: FakeSession[] = [];
 const CRED = new Uint8Array(Array.from({ length: 16 }, (_, i) => i + 1));
 const CRED_B64 = 'AQIDBAUGBwgJCgsMDQ4PEA';
-const PRF_SLOT = { slot_id: 'aaaaaaaaaaaaaaaa', credential_id: CRED_B64, rp_id: 'localhost', salt: 'x', label: 'Synthetic key', be: false };
+const PRF_SLOT = { slot_id: 'aaaaaaaaaaaaaaaa', credential_id: CRED_B64, rp_id: 'localhost', salt: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', label: 'Synthetic key', be: false };
 
 /** Scripted WebAuthn: create() returns a credential with or without PRF. */
 function fakeWebAuthn(opts: { prf?: boolean; hold?: Promise<void> } = {}) {
@@ -136,6 +137,12 @@ class FakeSession {
     if (bytes[3] !== 2) throw new Error('unsupported or unknown format: this is a demo vault without a password');
     if (key[0] !== bytes[4]) throw new Error('decryption failed: wrong key or corrupted data');
     return new FakeSession(bytes[1], bytes[4], bytes[5] === 1 ? CODE : bytes[5] === 2 ? ROT_CODE : OTHER_CODE);
+  }
+  static openWithPrf(bytes: Uint8Array, id: Uint8Array) {
+    if (bytes[6] !== 1 || id.length !== 16) throw new Error('decryption failed: wrong key or corrupted data');
+    const s = new FakeSession(bytes[1], bytes[4], bytes[5] === 1 ? CODE : bytes[5] === 2 ? ROT_CODE : OTHER_CODE);
+    s.passkey = s.committedPasskey = true;
+    return s;
   }
   static openWithRecovery(bytes: Uint8Array, code: string) {
     if (code !== CODE && code !== OTHER_CODE) throw new Error('validation failed: recovery code is not valid');
@@ -225,6 +232,10 @@ class FakeSession {
   }
   cancelPrfEnrolment() {
     this.prfPending = false;
+  }
+  removePrfSlot(cur: Uint8Array) {
+    if (cur[0] !== this.pw) throw new Error('decryption failed: wrong key or corrupted data');
+    this.passkey = false;
   }
   beginRotationRevokingQuickUnlock(cur: Uint8Array, next: Uint8Array) {
     this.beginRotation(cur, next);
@@ -1198,6 +1209,15 @@ describe('passkey enrolment outcomes in the mounted app', () => {
       ({ matches: false, media: q, addEventListener() {}, removeEventListener() {}, onchange: null }) as unknown as MediaQueryList) as typeof matchMedia;
   });
 
+  let mono = 1_000;
+  let wall = 1_800_000_000_000;
+  const clock = { mono: () => mono, wall: () => wall };
+  /** Past the 5-minute idle deadline, with no input and no timer. */
+  const expire = () => {
+    mono += 301_000;
+    wall += 301_000;
+  };
+
   async function mount(wa: ReturnType<typeof fakeWebAuthn>) {
     sessions.length = 0;
     prot = new TestStore(new IDBFactory(), 'keymesh-vault');
@@ -1213,6 +1233,9 @@ describe('passkey enrolment outcomes in the mounted app', () => {
         { provide: CORE_LOADER, useValue: () => Promise.resolve(fakeCore) },
         { provide: PREFERENCE_STORAGE, useValue: null },
         { provide: WEBAUTHN, useValue: wa.port },
+        { provide: LOCK_CLOCK, useValue: clock },
+        { provide: COARSE_POINTER, useValue: false },
+        { provide: AUTOLOCK_STORAGE, useValue: null },
       ],
     });
     TestBed.inject(PreferencesService).setLocale('en');
@@ -1353,5 +1376,162 @@ describe('passkey enrolment outcomes in the mounted app', () => {
     await unlock(GOOD_PW);
     expect(vault.status()).toBe('unlocked');
     expect(shown(q).code).toBe('quickUnlockOrphan'); // proven absent now
+  });
+});
+
+/**
+ * Review fix (m5c P2): elapsed idle deadlines are checked on every async
+ * continuation of a credential operation (real AutoLock, injected clock, no
+ * timers run). Each case: the deadline passes while the operation waits;
+ * when it resumes, the vault locks and nothing new is written.
+ */
+describe('deadlines on async continuations (mounted app, real auto-lock)', () => {
+  // Reuses the passkey describe's helpers through a fresh mount.
+  let prot: TestStore;
+  let kdf: ManualKdf;
+  let mono = 1_000;
+  let wall = 1_800_000_000_000;
+  const clock = { mono: () => mono, wall: () => wall };
+  const expire = (ms = 301_000) => {
+    mono += ms;
+    wall += ms;
+  };
+
+  beforeAll(() => {
+    globalThis.matchMedia ??= ((q: string) =>
+      ({ matches: false, media: q, addEventListener() {}, removeEventListener() {}, onchange: null }) as unknown as MediaQueryList) as typeof matchMedia;
+  });
+
+  async function mount(wa: ReturnType<typeof fakeWebAuthn>, withPasskey = false) {
+    sessions.length = 0;
+    prot = new TestStore(new IDBFactory(), 'keymesh-vault');
+    kdf = new ManualKdf();
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        provideServiceWorker('ngsw-worker.js', { enabled: false }),
+        { provide: VAULT_STORE, useValue: new TestStore(new IDBFactory(), 'keymesh-demo') },
+        { provide: PROTECTED_VAULT_STORE, useValue: prot },
+        { provide: KDF_RUNNER, useValue: kdf },
+        { provide: SECURE_CONTEXT, useValue: true },
+        { provide: CORE_LOADER, useValue: () => Promise.resolve(fakeCore) },
+        { provide: PREFERENCE_STORAGE, useValue: null },
+        { provide: WEBAUTHN, useValue: wa.port },
+        { provide: LOCK_CLOCK, useValue: clock },
+        { provide: COARSE_POINTER, useValue: false },
+        { provide: AUTOLOCK_STORAGE, useValue: null },
+      ],
+    });
+    const b = v2(3);
+    await prot.create(rec(withPasskey ? new Uint8Array([...b, 1]) : b));
+    prot.writes = 0;
+    prot.landed = 0;
+    const fixture = TestBed.createComponent(App);
+    const vault = TestBed.inject(VaultService);
+    fixture.detectChanges();
+    await until(() => vault.status() !== 'loading' && vault.protectedStored() !== null, 'app started');
+    const p = vault.unlockWithPassword(GOOD_PW);
+    await kdf.started(1);
+    kdf.release(0);
+    await p;
+    kdf.calls = [];
+    kdf.returned = [];
+    expect(vault.status()).toBe('unlocked');
+    const before = Array.from((await prot.read())!.bytes);
+    return { vault, before };
+  }
+
+  const lockedByIdle = async (vault: VaultService, before: number[]) => {
+    expect(vault.status()).not.toBe('unlocked');
+    expect(TestBed.inject(AutoLock).lastReason()).toBe('idle');
+    expect(prot.landed).toBe(0);
+    expect(Array.from((await prot.read())!.bytes)).toEqual(before);
+  };
+
+  it('enrolment: deadline passes during the KDF → no ceremony, no write, locked', async () => {
+    const wa = fakeWebAuthn();
+    const { vault, before } = await mount(wa);
+    const p = vault.enrollQuickUnlock(GOOD_PW, 'k');
+    await kdf.started(1);
+    expire();
+    kdf.release(0);
+    await expect(p).rejects.toBeInstanceOf(StaleWorkError);
+    expect(wa.calls.create).toBe(0);
+    await lockedByIdle(vault, before);
+    expect(kdf.returned[0].every((b) => b === 0)).toBe(true); // derived key zeroed
+  });
+
+  it('enrolment: deadline passes during create() → the late credential is dropped (orphan guidance), no write, locked', async () => {
+    const hold = deferred();
+    const wa = fakeWebAuthn({ hold: hold.promise });
+    const { vault, before } = await mount(wa);
+    const p = vault.enrollQuickUnlock(GOOD_PW, 'k');
+    await kdf.started(1);
+    kdf.release(0);
+    await until(() => wa.calls.create === 1, 'create() started');
+    expire();
+    hold.resolve();
+    await p.catch(() => undefined);
+    await lockedByIdle(vault, before);
+    expect(vault.credentialNotice()?.code).toBe('quickUnlockOrphan');
+  });
+
+  it('enrolment: deadline passes right before the write → the store guard stops put', async () => {
+    const wa = fakeWebAuthn();
+    const { vault, before } = await mount(wa);
+    const gate = deferred();
+    prot.gate = gate.promise;
+    const p = vault.enrollQuickUnlock(GOOD_PW, 'k');
+    await kdf.started(1);
+    kdf.release(0);
+    await until(() => prot.gateReached, 'write about to be issued');
+    expire();
+    gate.resolve();
+    await p.catch(() => undefined);
+    await lockedByIdle(vault, before);
+  });
+
+  it('removal: deadline passes during the KDF → nothing removed, locked', async () => {
+    const wa = fakeWebAuthn();
+    const { vault, before } = await mount(wa, true);
+    const p = vault.removeQuickUnlock(GOOD_PW, 'aaaaaaaaaaaaaaaa');
+    await kdf.started(1);
+    expire();
+    kdf.release(0);
+    await expect(p).rejects.toBeInstanceOf(StaleWorkError);
+    await lockedByIdle(vault, before);
+  });
+
+  it('password change: deadline passes during the second KDF → nothing written, locked', async () => {
+    const wa = fakeWebAuthn();
+    const { vault, before } = await mount(wa);
+    const p = vault.changePassword(GOOD_PW, NEW_PW);
+    await kdf.started(1);
+    kdf.release(0);
+    await kdf.started(2);
+    expire();
+    kdf.release(1);
+    await expect(p).rejects.toBeInstanceOf(StaleWorkError);
+    await lockedByIdle(vault, before);
+  });
+
+  it('a protected read after expiry locks first (no lifecycle event needed)', async () => {
+    const wa = fakeWebAuthn();
+    const { vault } = await mount(wa);
+    expire();
+    expect(() => vault.quickUnlockSlots()).toThrow();
+    expect(vault.status()).not.toBe('unlocked');
+  });
+
+  it('locked start: quick unlock has no idle deadline (hours later it still opens)', async () => {
+    const wa = fakeWebAuthn();
+    const { vault } = await mount(wa, true);
+    vault.lock();
+    expire(3 * 3600_000);
+    await vault.unlockWithQuickUnlock();
+    expect(vault.status()).toBe('unlocked');
+    expect(wa.calls.get).toBe(1);
+    // And the new session starts with fresh deadlines.
+    expect(() => vault.quickUnlockSlots()).not.toThrow();
   });
 });

@@ -3,7 +3,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { crc32, deflateSync } from 'node:zlib';
-import { createFaviconRoute, fetchFavicon, isPublicAddress, normalizeHost, sanitizePng, LIMITS } from './favicon.mjs';
+import { createFaviconRoute, fetchFavicon, isPublicAddress, normalizeHost, sanitizePng, LIMITS, realNet } from './favicon.mjs';
+import { createServer } from 'node:https';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { getDefaultAutoSelectFamily } from 'node:net';
 
 const SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 function chunk(type, data) {
@@ -186,20 +192,20 @@ test('resources: oversize, slow responses and errors give null within the time l
   assert.equal(await fetchFavicon('nx.example.com', mockNet({}, {})), null);
 });
 
-test('route: disabled → 404 without any lookup; bad input 400; cache; rate limit', async () => {
+test('route: disabled → 404 without any lookup; bad input 400; no shared cache; rate limit', async () => {
   const net = mockNet({ 'c.example.com': PUB }, { 'c.example.com/favicon.ico': { body: png() } });
   const off = createFaviconRoute({ enabled: false, net });
   assert.equal((await off(new URL('http://x/api/favicon?host=c.example.com'))).status, 404);
   assert.equal(net.calls.resolve.length, 0);
   let t = 0;
-  const route = createFaviconRoute({ enabled: true, net, now: () => t, limits: { ...LIMITS, ratePerMinute: 2 } });
+  const route = createFaviconRoute({ enabled: true, net, now: () => t, limits: { ...LIMITS, ratePerMinute: 3 } });
   assert.equal((await route(new URL('http://x/api/favicon?host=127.0.0.1'))).status, 400);
   assert.equal((await route(new URL('http://x/api/favicon?host=c.example.com&title=secret'))).status, 400);
   assert.equal((await route(new URL('http://x/api/favicon'))).status, 400);
   const r1 = await route(new URL('http://x/api/favicon?host=c.example.com'));
   assert.equal(r1.status, 200);
   await route(new URL('http://x/api/favicon?host=c.example.com'));
-  assert.equal(net.calls.get.length, 1); // cached
+  assert.equal(net.calls.get.length, 2); // fetched again: no shared result cache
   assert.equal((await route(new URL('http://x/api/favicon?host=d.example.com'))).status, 404);
   assert.equal((await route(new URL('http://x/api/favicon?host=e.example.com'))).status, 429);
   t += 60_000;
@@ -323,4 +329,101 @@ test('the route is never cached by the installed app (service worker) and adds n
   const assets = JSON.stringify(cfg.assetGroups);
   assert.ok(!assets.includes('/api'), 'no /api in asset groups');
   assert.ok(!(cfg.navigationUrls ?? []).some((u) => u.includes('api')), 'not a navigation URL');
+});
+
+// ---- Independent review fixes (m5c F1/F2/F3) ------------------------------
+
+/** Throwaway CA + leaf for `name` (openssl), in a temp dir removed afterwards. */
+function tlsFixture(name) {
+  const d = mkdtempSync(join(tmpdir(), 'keymesh-favicon-tls-'));
+  const run = (...a) => execFileSync('openssl', a, { cwd: d, stdio: 'ignore' });
+  run('req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-keyout', 'ca.key', '-out', 'ca.crt', '-days', '1', '-subj', '/CN=Keymesh test CA');
+  writeFileSync(join(d, 'ext'), `subjectAltName=DNS:${name}\n`);
+  run('req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-keyout', 'leaf.key', '-out', 'leaf.csr', '-subj', `/CN=${name}`);
+  run('x509', '-req', '-in', 'leaf.csr', '-CA', 'ca.crt', '-CAkey', 'ca.key', '-CAcreateserial', '-out', 'leaf.crt', '-days', '1', '-extfile', 'ext');
+  const f = { ca: readFileSync(join(d, 'ca.crt')), key: readFileSync(join(d, 'leaf.key')), cert: readFileSync(join(d, 'leaf.crt')) };
+  rmSync(d, { recursive: true, force: true });
+  return f;
+}
+
+async function localTls(name, handler) {
+  const f = tlsFixture(name);
+  const seen = { sni: [] };
+  const srv = createServer({ key: f.key, cert: f.cert }, handler);
+  srv.on('secureConnection', (s) => seen.sni.push(s.servername));
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  return { srv, port: srv.address().port, ca: f.ca, seen };
+}
+
+test('F1: the PRODUCTION connector works with Node family autoselection: pinned address, SNI and certificate checks', async () => {
+  assert.equal(getDefaultAutoSelectFamily(), true); // the default this must work with
+  const t = await localTls('synthetic.example.com', (req, res) => {
+    res.writeHead(200, { 'content-type': 'image/png' });
+    res.end(png());
+  });
+  try {
+    const ac = new AbortController();
+    // Real realNet.get: host name for SNI/certificate, connection to the pinned address only.
+    const r = await realNet.get('synthetic.example.com', '127.0.0.1', 4, '/favicon.ico', ac.signal, LIMITS.maxBytes, { port: t.port, ca: t.ca });
+    assert.equal(r.status, 200);
+    assert.ok(sanitizePng(r.body));
+    assert.deepEqual(t.seen.sni, ['synthetic.example.com']);
+    // Certificate checking is NOT disabled: a different name fails...
+    await assert.rejects(
+      realNet.get('other.example.com', '127.0.0.1', 4, '/favicon.ico', ac.signal, LIMITS.maxBytes, { port: t.port, ca: t.ca }),
+      (e) => e.code === 'ERR_TLS_CERT_ALTNAME_INVALID',
+    );
+    // ...and so does an untrusted CA.
+    await assert.rejects(
+      realNet.get('synthetic.example.com', '127.0.0.1', 4, '/favicon.ico', ac.signal, LIMITS.maxBytes, { port: t.port }),
+      (e) => /UNABLE_TO_VERIFY|SELF_SIGNED|unable to (get|verify)/i.test(`${e.code} ${e.message}`),
+    );
+  } finally {
+    t.srv.close();
+  }
+});
+
+function bigPng() {
+  const w = 256, h = 256;
+  const rows = Buffer.alloc((w * 4 + 1) * h);
+  for (let y = 0; y < h; y++) rows[y * (w * 4 + 1)] = 4; // Paeth everywhere (slowest filter)
+  const hdr = Buffer.alloc(13);
+  hdr.writeUInt32BE(w, 0);
+  hdr.writeUInt32BE(h, 4);
+  hdr.set([8, 6, 0, 0, 0], 8);
+  return Buffer.concat([SIG, chunk('IHDR', hdr), chunk('IDAT', deflateSync(rows)), chunk('IEND', Buffer.alloc(0))]);
+}
+
+test('F2: a valid image that becomes available just before the DEFAULT deadline is not returned late', async () => {
+  const body = bigPng();
+  assert.ok(sanitizePng(body)); // the image itself is fine
+  const net = {
+    async resolve() {
+      await new Promise((r) => setTimeout(r, LIMITS.totalMs - 5));
+      return [{ address: '93.184.216.34', family: 4 }];
+    },
+    async get() {
+      return { status: 200, location: null, body };
+    },
+  };
+  const t0 = performance.now();
+  const out = await fetchFavicon('late-decode.example.com', net); // default limits (3000 ms)
+  const elapsed = performance.now() - t0;
+  assert.equal(out, null, `late success returned after ${elapsed.toFixed(0)} ms`);
+  assert.ok(elapsed < LIMITS.totalMs + 2000, `bounded: ${elapsed.toFixed(0)} ms`);
+});
+
+test('F3: no host-use oracle: with the rate budget exhausted every host gets 429, warm or not', async () => {
+  const net = mockNet({ 'victim.example.com': PUB, 'unseen.example.com': PUB }, {
+    'victim.example.com/favicon.ico': { body: png() },
+    'unseen.example.com/favicon.ico': { body: png() },
+  });
+  let t = 0;
+  const route = createFaviconRoute({ enabled: true, net, now: () => t, limits: { ...LIMITS, ratePerMinute: 1 } });
+  assert.equal((await route(new URL('http://x/api/favicon?host=victim.example.com'))).status, 200); // someone else's lookup
+  const warm = await route(new URL('http://x/api/favicon?host=victim.example.com'));
+  const cold = await route(new URL('http://x/api/favicon?host=unseen.example.com'));
+  assert.equal(warm.status, 429);
+  assert.equal(cold.status, 429);
+  assert.equal(net.calls.get.length, 1);
 });

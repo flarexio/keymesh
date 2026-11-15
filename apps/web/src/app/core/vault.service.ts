@@ -414,6 +414,13 @@ export class VaultService {
     const epoch = this.epoch;
     const guard: Guard = () => {
       if (epoch !== this.epoch) throw new StaleWorkError();
+      // Elapsed deadlines are checked on EVERY continuation (after a KDF, a
+      // capability query, a passkey ceremony, a storage read) and in the
+      // store right before `put` — not only by the best-effort timer, which
+      // may not run on a hidden or frozen page. An expired deadline locks
+      // (new epoch) and the operation stops; a write already issued is
+      // reconciled as before. A locked vault has no idle deadline.
+      if (!this.freshCheck()) throw new StaleWorkError();
     };
     const p = this.queue.then(() => {
       guard();

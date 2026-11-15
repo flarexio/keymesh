@@ -18,7 +18,7 @@
 
 ## M5 checklist (versioned)
 
-**v4, 2026-11-16** (A and B deployed, C implemented), on branch `feature/m5-pwa-product-features`. The exact commits are listed in the draft PR. "Deployed" for A means the accepted `7079932` web image; B is not deployed and stays off the private endpoint until its independent review.
+**v4.1, 2026-11-16** (A and B deployed; C implemented with independent-review fixes), on branch `feature/m5-pwa-product-features`. The exact commits are listed in the draft PR. "Deployed" for A means the accepted `7079932` web image; B is not deployed and stays off the private endpoint until its independent review.
 * **States:** *implemented* · *tested* (automated, Chromium on the Pi) · *deployed* (private `keymesh.cloud` image) · *blocked*.
 * **Not covered by "tested":** real phones, Safari and Firefox; iOS install; and real camera hardware. Those need human device checks.
 
@@ -34,10 +34,10 @@
 | B | Ed25519 Base58 public key, sign and verify | yes | yes | yes | Raw 32-byte Base58 (no prefix/checksum); pure Ed25519 over the exact shown bytes; `verify_strict`. RFC 8032 + Base58 + negative vectors natively, through WASM, and Node/OpenSSL in E2E |
 | B | DEK rotation (password + recovery slots) | yes | yes | yes | No wire-format change. Native, CLI, bridge, browser; rotation vector checked by Node/OpenSSL. Browser outcome reconciliation tested with a fake store and, in the production build, with held IndexedDB completion. If the outcome is only known after a lock, a non-secret notice stays on the locked screen (review fix). IndexedDB post-commit durability can't be observed. Design gate approved; code review fixes pending re-review |
 | B | Passphrase wordlist and emergency kit | yes | yes | yes | EFF Long Wordlist pinned by SHA-256; core CSPRNG with rejection sampling. Kit never prints the password; code only on request. Real printers/PDF untested |
-| C | WebAuthn PRF quick unlock | yes | virtual authenticator only | no | ADR 0003 §4.1.1. Real-device capability (§5) is not recorded: no TouchID, FaceID, Windows Hello, Android or iOS proof |
+| C | WebAuthn PRF quick unlock | yes | virtual authenticator only | no | ADR 0003 §4.1.1. Idle deadlines are checked on every async continuation (capability query, KDF, ceremony, before the write). Real-device capability (§5) is not recorded: no TouchID, FaceID, Windows Hello, Android or iOS proof |
 | C | Auto-lock (idle, hidden, pagehide, clock) | yes | yes | no | Deadline checks; visibility simulated in tests (no real OS app switch or freeze) |
 | C | Custom short PIN | no | n/a | no | **Blocked**: no protected mechanism in the web app (ADR 0003 D2). The device PIN as WebAuthn UV is the supported route; it is not a Keymesh PIN |
-| C | Optional favicon route | yes (off) | mock-network suite | no | `KEYMESH_FAVICON` unset in Docker. Outbound use is not approved; the gate-response fixes (address allowlist, overall deadline, PNG structure) are in place |
+| C | Optional favicon route | yes (off) | mock network plus a local TLS production-connector test | no | `KEYMESH_FAVICON` unset in Docker; outbound use is not approved.<br>• **Fixed:** address allowlist; one deadline (monotonic, including DNS); no shared cache, `no-store`; connector works with Node family autoselection.<br>• **Not hard limits:** native DNS jobs can't be cancelled; the PNG decode is synchronous and not preempted |
 
 ### Gates shared by several items
 * **G-HTTPS (gate C).** A client-trusted HTTPS origin for LAN/VPN use, because the plain-HTTP previews are not secure contexts. It is required for non-loopback password vaults, WebAuthn, the camera and the Clipboard API. The decision is the human's; no CA or certificate is created without approval.
@@ -64,7 +64,7 @@
   * **Real devices:** at least one BE = 0 and one backup-eligible path recorded on real devices, with authenticator and transport.
   * **Copy:** never says "biometric" alone; describes BE = 0 as bound to an authenticator (not to this computer) and BE = 1 as backup-eligible (not as synced everywhere); never offers rotation before it exists.
 
-### 2. DEK rotation (re-encrypt the vault) — implemented (M5 phase B), review pending
+### 2. DEK rotation (re-encrypt the vault) — implemented (M5 phase B), accepted and deployed
 * **Implemented:**
   * **Core:** `Vault::begin_rotation` / `finish_rotation` (`src/vault.rs`). A pending rotation is bound to the exact slots its authority was checked against.
   * **Other layers:** `storage::save_protected` (native), `keymesh rotate-key` (CLI), `Session::begin_rotation` / `finish_rotation` (bridge), and `VaultService.beginRotation` / `finishRotation` (browser, with read-back reconciliation and strict durability).
@@ -119,7 +119,7 @@
   * Reduced-motion snapshot.
   * Accessible label check.
 
-### 5. Ed25519 Base58 public key, signing and verification — implemented (M5 phase B), review pending
+### 5. Ed25519 Base58 public key, signing and verification — implemented (M5 phase B), accepted and deployed
 * **Implemented:**
   * **Core:** `src/ed25519.rs` (`base58`, `parse_public_key`, `parse_signature`, `message_bytes`, `Ed25519KeyPair::sign`).
   * **Bridge and UI:** `sign_ed25519` / `verify_ed25519` in the bridge; `features/ed25519-tools.ts` in the UI.

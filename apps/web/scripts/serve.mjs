@@ -68,7 +68,7 @@ async function faviconRequest(req, res, url) {
     res.writeHead(r.status, { ...security, 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end(r.status === 429 ? 'busy' : r.status === 400 ? 'bad request' : 'not found');
   }
-  res.writeHead(200, { ...security, 'Content-Type': 'image/png', 'Cache-Control': 'private, max-age=86400' });
+  res.writeHead(200, { ...security, 'Content-Type': 'image/png' }); // security sets Cache-Control: no-store
   res.end(r.body);
 }
 

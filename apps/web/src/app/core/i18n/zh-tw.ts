@@ -562,9 +562,9 @@ export const zhTW: Record<MessageKey, string> = {
 
   // M5 C3: optional website icons
   'favicon.title': '網站圖示（選用）',
-  'favicon.lead': '預設關閉。開啟後，檢視登入項目時可向此 App 自己的伺服器索取該網站的圖示。只會傳送網站主機名稱（不含標題、帳號、路徑或密碼），只針對你正在檢視的項目，且絕不針對私有或內部主機。',
+  'favicon.lead': '預設關閉。開啟後，檢視登入項目時可向此 App 自己的伺服器索取該網站的圖示。只會傳送網站主機名稱（不含標題、帳號、路徑或密碼），且只針對你正在檢視的項目。看起來是私有或內部的名稱（例如 .local、.internal、.cloud）不會送出；看起來公開的名稱仍可能指向私有位址，此時伺服器會拒絕。',
   'favicon.optin': '顯示由此伺服器取得的網站圖示',
-  'favicon.limits': '伺服器會因此連線到該網站。若伺服器關閉此功能，會繼續顯示本機圖示。圖示不代表安全性。',
+  'favicon.limits': '伺服器會因此連線到該網站。伺服器不保留查詢過的主機清單，並要求瀏覽器不要儲存回應。若伺服器關閉此功能，會繼續顯示本機圖示。圖示不代表安全性。',
   'notice.titlePasskey': '關於剛才新增的通行金鑰',
   'notice.passkeyMeta': '通行金鑰：「{label}」，建立於 {time}。',
   'notice.quickUnlockOrphan': '此通行金鑰已在你的裝置或密碼管理器中建立，但「沒有」加入此保險庫，無法在這裡解鎖任何東西。你可以到裝置或瀏覽器的通行金鑰設定中刪除它（名稱為「Keymesh vault …」）。',

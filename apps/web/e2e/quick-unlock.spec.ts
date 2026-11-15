@@ -221,3 +221,50 @@ test('中文 mobile dark: an orphan passkey is explained on the LOCKED screen wi
   await page.screenshot({ path: shot(testInfo, 'm5c-orphan-notice-zh-TW-mobile-dark.png'), fullPage: true });
   await ctx.close();
 });
+
+/**
+ * Review fix (m5c P2): the idle deadline must be checked on async
+ * continuations, not only by the best-effort timer. Model: auto-lock's 5 s
+ * timer never runs (as on a frozen/background page), getClientCapabilities()
+ * is held, and the wall clock passes the 5-minute idle deadline meanwhile.
+ * Releasing the capability must LOCK the vault: no passkey ceremony and no
+ * enrolment write. Virtual authenticator; not a real frozen-page proof.
+ */
+async function expiredDuringEnrolment(page: Page, baseURL: string | undefined, holdAt: 'capability') {
+  await page.clock.install({ time: new Date('2026-11-16T10:00:00Z') });
+  await page.addInitScript((at) => {
+    const w = window as unknown as Record<string, unknown>;
+    const interval = window.setInterval.bind(window);
+    window.setInterval = ((h: TimerHandler, ms?: number, ...a: unknown[]) => (ms === 5000 ? 0 : interval(h, ms, ...a))) as typeof setInterval;
+    let release!: (v: Record<string, boolean>) => void;
+    const pending = new Promise<Record<string, boolean>>((r) => (release = r));
+    w['__entered'] = false;
+    w['__release'] = () => release({ 'extension:prf': true });
+    (PublicKeyCredential as unknown as { getClientCapabilities: () => Promise<Record<string, boolean>> }).getClientCapabilities = () => {
+      w['__entered'] = true;
+      return at === 'capability' ? pending : Promise.resolve({ 'extension:prf': true }); // KDF/ceremony cases: core/protected-vault.spec.ts
+    };
+  }, holdAt);
+  const { cdp, id } = await authenticator(page);
+  const origin = localhost(baseURL);
+  await createVault(page, origin);
+  await page.getByTestId('nav-backup').click();
+  const q = page.getByTestId('quick-unlock-section');
+  await q.getByTestId('qu-current').fill(PW);
+  await q.getByTestId('qu-label').fill('Synthetic deadline probe');
+  const before = Buffer.from(await storedBytes(page, 'keymesh-vault'));
+  await q.getByTestId('qu-add').click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as Record<string, unknown>)['__entered'])).toBe(true);
+  const now = await page.evaluate(() => Date.now());
+  await page.clock.setSystemTime(new Date(now + 301_000)); // past the 5-minute idle deadline, no input
+  await page.evaluate(() => (window as unknown as Record<string, () => void>)['__release']());
+  await expect(page.getByTestId('lock')).toHaveCount(0, { timeout: 30_000 }); // locked
+  await expect(page.getByTestId('autolock-reason')).toHaveAttribute('data-reason', 'idle');
+  expect(Buffer.from(await storedBytes(page, 'keymesh-vault')).equals(before)).toBe(true); // nothing written
+  expect((await cdp.send('WebAuthn.getCredentials', { authenticatorId: id })).credentials).toHaveLength(0); // no ceremony
+}
+
+test('idle deadline passes while getClientCapabilities() is pending: locks, no ceremony, no write', async ({ page, baseURL }) => {
+  test.setTimeout(150_000);
+  await expiredDuringEnrolment(page, baseURL, 'capability');
+});

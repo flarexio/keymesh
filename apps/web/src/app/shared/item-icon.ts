@@ -15,6 +15,9 @@ const CATEGORY_ICONS: Record<LoginCategory, IconName> = {
   gov: 'bank',
 };
 
+/** Host suffixes the favicon route refuses (keep in sync with scripts/favicon.mjs). */
+const SERVER_REFUSED = ['.local', '.internal', '.lan', '.home.arpa', '.cloud', '.localhost', '.test', '.example', '.invalid', '.onion'];
+
 /** Black or white, whichever reads better on the brand colour (WCAG relative luminance). */
 export function onBrand(hex: string): '#ffffff' | '#000000' {
   const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
@@ -74,6 +77,8 @@ export class ItemIcon {
     if (this.look().kind === 'brand') return null; // a reviewed local icon already
     const h = hostOf(this.url());
     if (!h || isPrivateHost(h) || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(h)) return null;
+    // Same names the server refuses (scripts/favicon.mjs): never even asked.
+    if (SERVER_REFUSED.some((sfx) => h.toLowerCase().endsWith(sfx))) return null;
     return this.failed() === h ? null : h.toLowerCase();
   });
 
