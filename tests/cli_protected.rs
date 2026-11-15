@@ -40,12 +40,14 @@ impl Ctx {
 
     fn run_at(&self, vault: &Path, args: &[&str], stdin: &str) -> Output {
         let mut child = cmd(vault).args(args).spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(stdin.as_bytes())
-            .unwrap();
+        // A command that refuses early (e.g. a demo vault given to a
+        // password command) may exit before reading stdin; the closed pipe
+        // is then expected. Callers assert on the exit status and output.
+        match child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("writing stdin: {e}"),
+        }
         child.wait_with_output().unwrap()
     }
 
