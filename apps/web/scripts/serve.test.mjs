@@ -34,6 +34,10 @@ before(async () => {
   writeFileSync(join(root, 'index.html'), '<!doctype html><title>synthetic index</title>');
   writeFileSync(join(root, 'main-TEST.js'), 'console.log("synthetic")');
   writeFileSync(join(root, 'wasm', 'core.wasm'), 'synthetic-wasm');
+  mkdirSync(join(root, 'icons'));
+  writeFileSync(join(root, 'icons', 'icon.png'), 'synthetic-png');
+  writeFileSync(join(root, 'manifest.webmanifest'), '{"name":"synthetic"}');
+  writeFileSync(join(root, 'ngsw.json'), '{"configVersion":1}');
   // Siblings that share the root's name prefix, and a file outside it.
   writeFileSync(join(base, 'browser-sibling.txt'), OUTSIDE);
   mkdirSync(join(base, 'browserx'));
@@ -70,6 +74,25 @@ test('normal assets and SPA fallback still work', async () => {
   const route = await get('/some/app/route');
   assert.equal(route.status, 200);
   assert.ok(route.body.includes('synthetic index'));
+});
+
+test('PWA files get their own MIME types, and missing files are never the SPA shell', async () => {
+  const manifest = await get('/manifest.webmanifest');
+  assert.equal(manifest.status, 200);
+  assert.equal(manifest.type, 'application/manifest+json');
+  const png = await get('/icons/icon.png');
+  assert.equal(png.status, 200);
+  assert.equal(png.type, 'image/png');
+  const ngsw = await get('/ngsw.json');
+  assert.equal(ngsw.status, 200);
+  assert.match(ngsw.type, /^application\/json/);
+  // A missing file name (it has an extension) is a 404, so a service worker
+  // or script can never receive index.html in place of ngsw.json or a chunk.
+  for (const path of ['/missing.js', '/ngsw-missing.json', '/wasm/missing.wasm', '/icons/missing.png', '/a/b.webmanifest']) {
+    const r = await get(path);
+    assert.equal(r.status, 404, path);
+    assert.ok(!r.body.includes('synthetic index'), path);
+  }
 });
 
 for (const path of [

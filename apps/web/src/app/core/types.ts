@@ -25,6 +25,8 @@ export interface Summary {
   kind: ItemKind;
   title: string;
   subtitle: string | null;
+  /** Login items only: first URL (picks a local icon). */
+  url: string | null;
   tags: string[];
 }
 

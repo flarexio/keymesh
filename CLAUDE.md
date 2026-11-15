@@ -10,6 +10,13 @@ Rust local-first encrypted vault core (`src/`, also the `keymesh` CLI) with a br
 
 Local decryption is not Keymesh login, and there is no account, escrow or support reset. Mandatory typed items: Login, Secret/API credential, Contact, CryptoWalletRecord, Ed25519Key, TOTP, SecureNote. Strong password/random-secret generators, Ed25519 key generation, TOTP and import FROM 1Password through the `op` CLI are core features.
 
+**M5 product rollout (authorized 2026-11-15, task `keymesh-product-rollout`):**
+* **Phase A:** PWA/offline, TOTP QR import, TOTP countdown, local login icons.
+* **Phase B:** Ed25519 Base58/sign/verify, DEK rotation, passphrases.
+* **Phase C:** WebAuthn PRF quick unlock and auto-lock, optional favicon route.
+
+These are implemented in that order with an independent review per phase. All stay experimental and synthetic-only; see `docs/ROADMAP.md` (M5 checklist). A browser-only custom PIN is not equivalent to a hardware PIN (ADR 0003).
+
 **Own-app authentication, mnemonic login, image keycards, wallet/identity/KMS integration, NATS and blockchain integration are deferred.** Saving another wallet's recovery words as an encrypted field is data storage, not implementing our own mnemonic authentication. Ed25519 key generation is a vault feature, not our login mechanism. TOTP generates codes for external services, not Keymesh login.
 
 ## Safety

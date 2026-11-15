@@ -40,6 +40,8 @@ const types = {
   '.css': 'text/css; charset=utf-8',
   '.wasm': 'application/wasm',
   '.ico': 'image/x-icon',
+  '.png': 'image/png',
+  '.webmanifest': 'application/manifest+json',
   '.json': 'application/json',
   '.txt': 'text/plain; charset=utf-8',
 };
@@ -85,8 +87,8 @@ async function servable(p) {
  * Serves only regular files whose real path (after resolving symlinks) lies
  * inside the build root. Malformed percent-encoding, NUL and backslashes are
  * 400; anything resolving outside the root is 404 (never the SPA shell);
- * missing paths inside the root get index.html (client-side routes), which
- * passes the same check.
+ * missing extensionless paths inside the root get index.html (client-side
+ * routes), which passes the same check; missing file names are 404.
  */
 async function handler(req, res) {
   let path;
@@ -102,8 +104,13 @@ async function handler(req, res) {
     let file;
     if ((await stat(candidate).catch(() => null))?.isFile()) {
       file = await servable(candidate);
-    } else {
+    } else if (extname(path) === '') {
+      // Only extensionless paths are app routes. A missing file name is a
+      // 404, never the shell: the service worker must not cache index.html
+      // as ngsw.json, a script chunk or the WASM.
       file = await servable(join(realRoot, 'index.html'));
+    } else {
+      return fail(res, 404);
     }
     if (!file) return fail(res, 404);
     const body = await readFile(file);

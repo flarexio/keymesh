@@ -228,6 +228,9 @@ pub struct Summary {
     pub kind: &'static str,
     pub title: String,
     pub subtitle: Option<String>,
+    /// Login items only: the first URL, so the list can pick a local icon.
+    /// Non-secret (URLs are shown in the item view and searched already).
+    pub url: Option<String>,
     pub tags: Vec<String>,
 }
 
@@ -814,6 +817,10 @@ impl Session {
                 kind: i.kind().as_str(),
                 title: i.title.clone(),
                 subtitle: subtitle(i),
+                url: match &i.data {
+                    ItemData::Login(l) => l.urls.first().cloned(),
+                    _ => None,
+                },
                 tags: i.tags.clone(),
             })
             .collect();
@@ -1515,6 +1522,23 @@ mod tests {
         assert_eq!(s.list("zed", "").unwrap().len(), 1);
         assert_eq!(s.list("", "secure_note").unwrap().len(), 1);
         assert!(s.list("", "bogus").is_err());
+    }
+
+    #[test]
+    fn summaries_carry_the_first_login_url_only() {
+        let (_k, mut s) = session();
+        s.create_item(input(serde_json::json!({"title": "A", "data": {"kind": "login", "urls": ["https://a.example.test/x?q=1", "https://b.example.test"]}}))).unwrap();
+        s.create_item(input(
+            serde_json::json!({"title": "B", "data": {"kind": "login", "username": "u"}}),
+        ))
+        .unwrap();
+        s.create_item(input(serde_json::json!({"title": "C", "data": {"kind": "secret", "secret": "s", "service": "https://svc.example.test"}}))).unwrap();
+        let urls: Vec<_> = s.list("", "").unwrap().into_iter().map(|x| x.url).collect();
+        assert_eq!(
+            urls,
+            vec![Some("https://a.example.test/x?q=1".to_string()), None, None],
+            "first URL of logins only; other kinds never expose one"
+        );
     }
 
     #[test]

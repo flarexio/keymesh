@@ -10,6 +10,7 @@ import { ItemKind, Summary } from '../core/types';
 import { GeneratedPassword } from '../shared/generated-password';
 import { Icon, KIND_ICONS } from '../shared/icon';
 import { PasswordOptionsPanel, passwordProblem } from '../shared/password-options';
+import { QrImport, TotpFromQr } from './qr-import';
 
 type TextKey = {
   [K in keyof FormModel]: FormModel[K] extends string ? K : never;
@@ -22,7 +23,7 @@ let nextForm = 0;
 
 @Component({
   selector: 'km-item-form',
-  imports: [Icon, NgTemplateOutlet, PasswordOptionsPanel, GeneratedPassword],
+  imports: [Icon, NgTemplateOutlet, PasswordOptionsPanel, GeneratedPassword, QrImport],
   template: `
     <form class="item-form" novalidate (submit)="save($event)" [attr.aria-label]="formLabel()">
       <header class="form-head">
@@ -181,8 +182,9 @@ let nextForm = 0;
                 @if (shownErrors().totpSetup; as e) {
                   <p class="field-error" [id]="uid + '-setup-err'"><km-icon name="alert" />{{ i18n.t(e) }}</p>
                 }
-                <p class="field-hint" [id]="uid + '-setup-hint'">{{ i18n.t('form.noQr') }}</p>
+                <p class="field-hint" [id]="uid + '-setup-hint'">{{ i18n.t('form.totpSetupHint') }}</p>
               </div>
+              <km-qr-import (found)="fromQr($event)" />
             }
             <div class="field-grid">
               <div class="field">
@@ -350,6 +352,21 @@ export class ItemForm implements OnInit, OnDestroy {
     const id = this.editId();
     if (id) this.m.set(modelFromView(this.vault.get(id)));
     if (this.kind() === 'login') this.totpItems.set(this.vault.summaries('totp'));
+  }
+
+  /**
+   * A TOTP setup read from a QR code: fills the (masked) setup field and
+   * pre-fills only empty title/issuer/account fields, which stay editable.
+   * Nothing is saved until the user submits; the core validates the URI then.
+   */
+  protected fromQr(t: TotpFromQr): void {
+    this.m.update((m) => ({
+      ...m,
+      totpSetup: t.uri,
+      issuer: m.issuer.trim() ? m.issuer : (t.issuer ?? ''),
+      accountName: m.accountName.trim() ? m.accountName : (t.account ?? ''),
+      title: m.title.trim() ? m.title : (t.issuer ?? t.account ?? ''),
+    }));
   }
 
   protected set(key: TextKey, ev: Event): void {

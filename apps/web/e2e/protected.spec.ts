@@ -14,6 +14,13 @@ import { writeFile } from 'node:fs/promises';
 import { en } from '../src/app/core/i18n/en';
 import { M, assertNoMarkers, createAllKinds, openItem, storedBytes, titles } from './helpers';
 
+// These tests hold the KDF worker *script* with page.route to make races
+// deterministic. Requests answered by a service worker bypass page.route
+// (Playwright), so the installed-app worker is blocked here. The service
+// worker with password vaults (create, offline reload, unlock) is covered in
+// pwa.spec.ts.
+test.use({ serviceWorkers: 'block' });
+
 const PW = 'synthetic e2e passphrase one';
 const PW2 = 'synthetic e2e passphrase two';
 const PDB = 'keymesh-vault';

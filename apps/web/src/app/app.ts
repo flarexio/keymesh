@@ -6,16 +6,19 @@ import { ConfirmDialog, ConfirmService, Toasts, ToastService } from './shared/fe
 import { Icon } from './shared/icon';
 import { Start } from './features/start';
 import { VaultShell } from './features/vault-shell';
+import { InstallApp, UpdateBanner } from './features/app-install';
+import { BrandCatalog } from './shared/brand-catalog';
 
 @Component({
   selector: 'app-root',
-  imports: [Start, VaultShell, DisplayPrefs, ConfirmDialog, Toasts, Icon],
+  imports: [Start, VaultShell, DisplayPrefs, ConfirmDialog, Toasts, Icon, UpdateBanner, InstallApp],
   template: `
     <a class="skip-link" href="#main">{{ i18n.t('app.skipToContent') }}</a>
     <div class="demo-strip" role="note" data-testid="demo-banner">
       <km-icon name="shieldAlert" />
       <p><strong>{{ i18n.t('demo.label') }}</strong> <span>{{ i18n.t('demo.detail') }}</span></p>
     </div>
+    <km-update-banner />
     <header class="appbar">
       <div class="brand">
         <span class="brand-mark"><km-icon name="logo" /></span>
@@ -23,6 +26,7 @@ import { VaultShell } from './features/vault-shell';
         <span class="brand-tag">{{ i18n.t('app.tagline') }}</span>
       </div>
       <div class="appbar-tools">
+        <km-install-app />
         <km-display-prefs />
         @if (open()) {
           <button type="button" class="btn btn-primary lock-btn" data-testid="lock" (click)="vault.lock()">
@@ -71,6 +75,7 @@ export class App implements OnInit {
   private readonly toast = inject(ToastService);
 
   constructor() {
+    inject(BrandCatalog); // start loading login brand icons (lazy chunk)
     // Locking closes any pending confirmation and clears notifications.
     let wasOpen = false;
     effect(() => {

@@ -162,7 +162,9 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await page.clock.setFixedTime(new Date(59_000));
   await openItem(page, 'Synthetic TOTP');
   await expect(page.getByTestId('totp-code')).toHaveText('94287082');
-  await expect(page.getByTestId('totp-remaining')).toHaveText('1s remaining');
+  // Last 5 s: text (not only colour) and the ring flag the coming change.
+  await expect(page.getByTestId('totp-remaining')).toHaveText('1s left — new code soon');
+  await expect(page.getByTestId('totp-ring')).toHaveAttribute('data-warn', 'true');
   await page.clock.setFixedTime(new Date(1_111_111_109_000));
   await expect(page.getByTestId('totp-code')).toHaveText('07081804', { timeout: 5000 });
 

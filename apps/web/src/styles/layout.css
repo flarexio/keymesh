@@ -664,3 +664,54 @@ html:lang(en) .eyebrow {
   gap: var(--space-6);
   min-width: 0;
 }
+
+/* Installed-app update notice (below the demo strip; never blocks the page). */
+.update-strip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-6);
+  background: var(--accent-soft);
+  color: var(--accent-soft-fg);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--text-sm);
+}
+.update-strip p {
+  flex: 1;
+  margin: 0;
+}
+.update-strip[data-state='broken'] {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* iOS "Add to Home Screen" hint: a disclosure, not a modal. */
+.install-hint {
+  position: relative;
+}
+.install-hint > summary {
+  list-style: none;
+}
+.install-hint > summary::-webkit-details-marker {
+  display: none;
+}
+.install-hint p {
+  position: absolute;
+  inset-inline-end: 0;
+  top: calc(100% + var(--space-1));
+  width: min(18rem, 80vw);
+  margin: 0;
+  padding: var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md, 0 4px 16px rgb(0 0 0 / 0.15));
+  font-size: var(--text-sm);
+  z-index: 40;
+}
+
+@media (max-width: 640px) {
+  .update-strip {
+    padding: var(--space-2) var(--space-4);
+  }
+}

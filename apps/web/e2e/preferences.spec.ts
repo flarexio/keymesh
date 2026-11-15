@@ -335,9 +335,10 @@ test('switching language/theme keeps unsaved input, selection, TOTP and keys; va
   await expect(page.getByTestId('totp-code')).toHaveText('94287082');
   await setLocale(page, 'en');
   await expect(page.getByTestId('totp-code')).toHaveText('94287082');
-  await expect(page.getByTestId('totp-remaining')).toHaveText('1s remaining');
+  // T=59 is inside the last-5-seconds warning, in both languages.
+  await expect(page.getByTestId('totp-remaining')).toHaveText('1s left — new code soon');
   await setLocale(page, 'zh-TW');
-  await expect(page.getByTestId('totp-remaining')).toHaveText('剩餘 1 秒');
+  await expect(page.getByTestId('totp-remaining')).toHaveText('剩 1 秒，即將換新碼');
 
   // Unsaved form input survives switches.
   await newItem(page, 'login');
