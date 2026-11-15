@@ -1,7 +1,7 @@
 import { Component, computed, inject, signal } from '@angular/core';
 import { errorKey } from '../core/errors';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
-import { VaultService } from '../core/vault.service';
+import { CredentialNoticeCode, VaultService } from '../core/vault.service';
 import { ConfirmService } from '../shared/feedback';
 import { Icon } from '../shared/icon';
 import { RecoveryConfirm } from '../shared/recovery-confirm';
@@ -21,6 +21,16 @@ type View = 'create' | 'unlock' | 'reset';
   imports: [Icon, RecoveryConfirm, SecretInput, ProtectedRestore, PassphraseSuggest],
   template: `
     <section class="card start-card" id="protected-card" tabindex="-1" aria-labelledby="protected-title" data-testid="protected-section">
+      @if (vault.credentialNotice(); as n) {
+        <div class="callout callout-warn notice" role="alert" data-testid="credential-notice" [attr.data-code]="n.code">
+          <km-icon name="alert" />
+          <div class="notice-body">
+            <p><strong>{{ i18n.t('notice.title') }}</strong></p>
+            <p>{{ i18n.t(noticeKey[n.code]) }}</p>
+            <button type="button" class="btn btn-sm" data-testid="credential-notice-ack" (click)="vault.acknowledgeNotice()">{{ i18n.t('notice.ack') }}</button>
+          </div>
+        </div>
+      }
       @if (!vault.secure) {
         <span class="state-icon"><km-icon name="shieldAlert" /></span>
         <h2 id="protected-title">{{ i18n.t('protected.insecure.title') }}</h2>
@@ -109,6 +119,10 @@ export class ProtectedStart {
   protected readonly vault = inject(VaultService);
   protected readonly i18n = inject(I18n);
   private readonly confirmDialog = inject(ConfirmService);
+  protected readonly noticeKey: Record<CredentialNoticeCode, MessageKey> = {
+    rotatedWhileLocked: 'notice.rotatedWhileLocked',
+    rotationUncertain: 'notice.rotationUncertain',
+  };
   protected readonly view = signal<View>('unlock');
   protected readonly password = signal('');
   protected readonly confirm = signal('');

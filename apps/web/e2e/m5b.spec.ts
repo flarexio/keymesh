@@ -19,6 +19,7 @@ import { createPublicKey, verify as nodeVerify } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { en } from '../src/app/core/i18n/en';
+import { zhTW } from '../src/app/core/i18n/zh-tw';
 import { M, assertNoMarkers, field, newItem, openItem, storedBytes, titles, create } from './helpers';
 
 // Deterministic vault flows; the installed-app worker is covered in pwa.spec.ts.
@@ -367,5 +368,119 @@ test('mobile, 中文: signing panel and rotation card fit the narrow layout', as
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await tools.scrollIntoViewIfNeeded();
   await page.screenshot({ path: shot(testInfo, 'm5b-ed25519-sign-mobile-zh-TW.png'), fullPage: true });
+  await ctx.close();
+});
+
+/**
+ * Review fix (m5b P2), production build: the rotation's outcome is only
+ * known after the vault locked. The only interception is test-side
+ * IndexedDB plumbing for the ONE strict-durability (rotation) transaction:
+ * its completion is held after it really committed, then either delivered
+ * late (the user locked meanwhile) or turned into a reported abort with the
+ * read-back failing (unknown outcome). Crypto and the app are unmodified.
+ */
+async function holdRotationWrite(page: Page, mode: 'late' | 'uncertain') {
+  await page.addInitScript((m) => {
+    const w = window as unknown as Record<string, unknown>;
+    w['__release'] = new Promise<void>((r) => (w['__doRelease'] = r));
+    const orig = IDBDatabase.prototype.transaction;
+    IDBDatabase.prototype.transaction = function (this: IDBDatabase, names: string | string[], txMode?: IDBTransactionMode, opts?: IDBTransactionOptions) {
+      const tx = orig.call(this, names, txMode, opts);
+      if (txMode === 'readwrite' && opts?.durability === 'strict') {
+        let onComplete: ((ev: Event) => unknown) | null = null;
+        let onAbort: ((ev: Event) => unknown) | null = null;
+        Object.defineProperty(tx, 'oncomplete', { set: (f) => (onComplete = f), get: () => onComplete });
+        Object.defineProperty(tx, 'onabort', { set: (f) => (onAbort = f), get: () => onAbort });
+        tx.addEventListener('complete', (ev) => {
+          w['__landed'] = true;
+          void (w['__release'] as Promise<void>).then(() => {
+            if (m === 'late') onComplete?.call(tx, ev);
+            else {
+              Object.defineProperty(tx, 'error', { get: () => new DOMException('synthetic', 'UnknownError') });
+              w['__failReads'] = true;
+              onAbort?.call(tx, ev);
+            }
+          });
+        });
+      }
+      return tx;
+    } as typeof IDBDatabase.prototype.transaction;
+    const get = IDBObjectStore.prototype.get;
+    IDBObjectStore.prototype.get = function (this: IDBObjectStore, q: IDBValidKey | IDBKeyRange) {
+      if (w['__failReads']) throw new DOMException('synthetic read failure', 'UnknownError');
+      return get.call(this, q);
+    };
+  }, mode);
+}
+
+async function rotateUntilCodeTypedBack(page: Page, pw: string, newPw: string, mobile = false) {
+  await page.goto('/');
+  await page.getByTestId('create-password').fill(pw);
+  await page.getByTestId('create-password-confirm').fill(pw);
+  await page.getByTestId('create-protected').click();
+  await expect(page.getByTestId('recovery-step')).toBeVisible({ timeout: 30_000 });
+  await confirmCode(page, await readCode(page));
+  await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected', { timeout: 30_000 });
+  await page.getByTestId(mobile ? 'bnav-backup' : 'nav-backup').click();
+  const r = page.getByTestId('rotate-section');
+  await r.getByTestId('rotate-current').fill(pw);
+  await r.getByTestId('rotate-new').fill(newPw);
+  await r.getByTestId('rotate-confirm').fill(newPw);
+  await r.getByTestId('begin-rotation').click();
+  await expect(r.getByTestId('recovery-step')).toBeVisible({ timeout: 60_000 });
+  const code = await readCode(page);
+  await r.getByTestId('recovery-saved').check();
+  await r.getByTestId('recovery-confirm-input').fill(code);
+}
+
+test('rotation committed while the user locked: the LOCKED screen says to use the new credentials', async ({ page }, testInfo) => {
+  test.setTimeout(120_000);
+  const NEW = 'synthetic m5b late passphrase two';
+  await holdRotationWrite(page, 'late');
+  await rotateUntilCodeTypedBack(page, PW, NEW);
+  await page.getByTestId('rotate-section').getByTestId('recovery-confirm').click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as Record<string, unknown>)['__landed'] === true)).toBe(true);
+  await page.getByTestId('lock').click();
+  await expect(page.locator('km-backup')).toHaveCount(0);
+  await page.evaluate(() => ((window as unknown as Record<string, () => void>)['__doRelease'])());
+  const notice = page.getByTestId('credential-notice');
+  await expect(notice).toBeVisible();
+  await expect(notice).toHaveAttribute('data-code', 'rotatedWhileLocked');
+  await expect(notice).toContainText(en['notice.rotatedWhileLocked']);
+  await expect(page.getByTestId('unlock-password')).toBeVisible();
+  await page.screenshot({ path: shot(testInfo, 'm5b-notice-late-commit-en-desktop.png'), fullPage: true });
+  // The old password no longer opens it; the new one does, and that resolves the notice.
+  await page.getByTestId('unlock-password').fill(PW);
+  await page.getByTestId('unlock-protected').click();
+  await expect(page.getByTestId('protected-error')).toContainText(en['errors.wrongPassword'], { timeout: 30_000 });
+  await expect(notice).toBeVisible();
+  await page.getByTestId('unlock-password').fill(NEW);
+  await page.getByTestId('unlock-protected').click();
+  await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected', { timeout: 30_000 });
+  await page.getByTestId('lock').click();
+  await expect(page.getByTestId('credential-notice')).toHaveCount(0);
+});
+
+test('rotation outcome unknown (zh-TW, mobile): vault locked, the locked screen explains how to reconcile', async ({ browser }, testInfo) => {
+  test.setTimeout(120_000);
+  const ctx = await browser.newContext({ locale: 'zh-TW', viewport: { width: 390, height: 844 }, isMobile: true, serviceWorkers: 'block' });
+  const page = await ctx.newPage();
+  const NEW = 'synthetic m5b uncertain passphrase two';
+  await holdRotationWrite(page, 'uncertain');
+  await rotateUntilCodeTypedBack(page, PW, NEW, true);
+  await page.getByTestId('rotate-section').getByTestId('recovery-confirm').click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as Record<string, unknown>)['__landed'] === true)).toBe(true);
+  await page.evaluate(() => ((window as unknown as Record<string, () => void>)['__doRelease'])());
+  const notice = page.getByTestId('credential-notice');
+  await expect(notice).toBeVisible();
+  await expect(notice).toHaveAttribute('data-code', 'rotationUncertain');
+  await expect(notice).toContainText(zhTW['notice.rotationUncertain']);
+  await expect(page.locator('km-backup')).toHaveCount(0);
+  await expect(page.getByTestId('unlock-password')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: shot(testInfo, 'm5b-notice-uncertain-zh-TW-mobile.png'), fullPage: true });
+  // Acknowledge: gone; nothing was guessed or reinstalled.
+  await page.getByTestId('credential-notice-ack').click();
+  await expect(notice).toHaveCount(0);
   await ctx.close();
 });

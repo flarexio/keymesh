@@ -512,4 +512,10 @@ export const zhTW: Record<MessageKey, string> = {
   'kit.sheetCode': '復原碼',
   'kit.sheetKeepApart': '任何人持有這張紙和保險庫資料就能開啟保險庫。Keymesh 沒有帳號或重設服務：兩種憑證都遺失，保險庫就無法開啟。',
   'kit.sheetExperimental': '預覽版本：在獨立審查前僅限範例資料。',
+
+  // M5 B review fix: rotation outcome notice on the locked screen
+  'notice.title': '關於上一次的金鑰輪替',
+  'notice.rotatedWhileLocked': '金鑰輪替已在保險庫鎖定前儲存。請用「新的」主密碼或「新的」復原碼解鎖；舊的已無法開啟此保險庫（較早的備份仍可用舊的開啟）。',
+  'notice.rotationUncertain': 'Keymesh 無法確認金鑰輪替是否已儲存，因此已鎖定保險庫。請先試「新的」主密碼；若無法開啟，表示輪替沒有儲存，「舊的」密碼仍然有效。在其中一個能開啟之前請兩個都保留，開啟後再建立新的備份。',
+  'notice.ack': '知道了',
 };

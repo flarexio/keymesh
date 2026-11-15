@@ -145,6 +145,13 @@ function sameBytes(a: Uint8Array | null, b: Uint8Array | null): boolean {
 
 type Guard = () => void;
 
+export type CredentialNoticeCode = 'rotatedWhileLocked' | 'rotationUncertain';
+export interface CredentialNotice {
+  code: CredentialNoticeCode;
+  /** Sequence number of the operation that produced it. */
+  seq: number;
+}
+
 @Injectable({ providedIn: 'root' })
 export class VaultService {
   private readonly clock = inject(CLOCK);
@@ -206,6 +213,32 @@ export class VaultService {
   readonly maxBytes = signal(64 * 1024 * 1024);
   /** The compiled core is loaded (policy checks and generators available). */
   readonly coreReady = signal(false);
+  /**
+   * Non-secret outcome of a credential operation whose result is only known
+   * after the vault locked (a rotation that landed during a lock, or one whose
+   * outcome could not be read back). Kept here, not in the view that started
+   * it (that view is destroyed by the lock), so the locked screen can tell
+   * the user which credentials to try. Holds a code only, never a secret.
+   * Cleared when acknowledged or by a successful password-vault unlock.
+   */
+  readonly credentialNotice = signal<CredentialNotice | null>(null);
+  /** Order of credential operations, so an older one never replaces a newer notice. */
+  private opSeq = 0;
+
+  credentialOpSeq(): number {
+    return this.opSeq;
+  }
+
+  /** Record `code` for the operation numbered `seq`, unless a newer one already left a notice. */
+  recordNotice(code: CredentialNoticeCode, seq: number): void {
+    const cur = this.credentialNotice();
+    if (cur && cur.seq > seq) return;
+    this.credentialNotice.set({ code, seq });
+  }
+
+  acknowledgeNotice(): void {
+    this.credentialNotice.set(null);
+  }
 
   constructor() {
     // Any write elsewhere: compare exact bytes (revisions can repeat after a
@@ -307,6 +340,8 @@ export class VaultService {
       this.key = key;
     }
     this.active = key ? 'demo' : 'protected';
+    // A password vault opened: whichever credential worked answers the notice.
+    if (!key) this.credentialNotice.set(null);
     this.protectedReloaded.set(false);
     this.snapshot = bytes;
     this.setStoredInfo(bytes);
@@ -869,6 +904,7 @@ export class VaultService {
    * A mistyped code keeps the rotation pending.
    */
   finishRotation(code: string): Promise<void> {
+    const seq = ++this.opSeq;
     return this.run(async (guard) => {
       this.requireSecure();
       const s = this.protectedSession();
@@ -913,7 +949,9 @@ export class VaultService {
           throw new ConflictError();
         }
         if (outcome === 'unknown') {
-          // Neither credential set can be assumed: drop the session.
+          // Neither credential set can be assumed: drop the session, and
+          // leave the locked screen a notice (the Backup view is gone now).
+          this.recordNotice('rotationUncertain', seq);
           if (!this.isStale(guard)) this.lock();
           throw new VaultError('rotationUncertain', 'Could not confirm the rotation.');
         }
@@ -923,6 +961,7 @@ export class VaultService {
         this.protSnap = bytes;
         this.protectedStored.set(this.info(bytes));
         this.broadcast();
+        this.recordNotice('rotatedWhileLocked', seq);
         throw new VaultError('rotatedWhileLocked', 'The rotation was stored before the vault was locked.');
       }
       s.commit(revision);

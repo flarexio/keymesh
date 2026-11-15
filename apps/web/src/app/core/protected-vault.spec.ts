@@ -19,6 +19,12 @@ import {
 } from './vault.service';
 import { ConflictError, StoredVault, VaultStore } from './vault-store';
 import type { Core } from './wasm';
+import { provideServiceWorker } from '@angular/service-worker';
+import { App } from '../app';
+import { PreferencesService } from './preferences';
+import { en } from './i18n/en';
+import { zhTW } from './i18n/zh-tw';
+import { PREFERENCE_STORAGE } from './preferences';
 
 function deferred<T = void>() {
   let resolve!: (v: T) => void;
@@ -263,6 +269,8 @@ class TestStore extends VaultStore {
   afterPut: Promise<void> | null = null;
   /** Reads fail (the outcome cannot be checked). */
   readFails = false;
+  /** Writes whose transaction actually committed. */
+  landed = 0;
   durabilities: (IDBTransactionDurability | undefined)[] = [];
   writes = 0;
   reads = 0;
@@ -286,6 +294,7 @@ class TestStore extends VaultStore {
     if (this.fail) throw new Error('QuotaExceededError (synthetic)');
     this.writes++;
     await super.compareAndSwap(expected, next, guard, durability);
+    this.landed++;
     if (this.afterPut) await this.afterPut;
     if (this.failAfterPut) throw new Error('UnknownError (synthetic, after put)');
   }
@@ -338,6 +347,7 @@ describe('VaultService password vault', () => {
     await vault.init();
     expect(vault.protectedStored()?.version).toBe(2);
     prot.writes = 0;
+    prot.landed = 0;
     return bytes;
   }
 
@@ -866,7 +876,7 @@ describe('VaultService password vault', () => {
       const held = deferred();
       prot.afterPut = held.promise;
       const p = vault.finishRotation(ROT_CODE);
-      await until(() => prot.writes === 1, 'write');
+      await until(() => prot.landed === 1, 'write committed (completion held)');
       vault.lock();
       held.resolve();
       expect(errorKey(await p.catch((x: unknown) => x))).toBe('errors.rotatedWhileLocked');
@@ -958,5 +968,148 @@ describe('VaultService password vault', () => {
       expect(vault.protectedStored()).toBeNull();
       expect(vault.status()).not.toBe('unlocked');
     });
+  });
+});
+
+/**
+ * Review fix (m5b P2): the real App is mounted. A rotation whose outcome is
+ * only known after the vault locked must leave a visible, localized notice on
+ * the LOCKED screen, after the Backup view (which started it) is destroyed.
+ */
+describe('rotation outcome notice in the mounted app', () => {
+  let prot: TestStore;
+  let kdf: ManualKdf;
+
+  beforeAll(() => {
+    // jsdom has no matchMedia (used by the theme and install button).
+    globalThis.matchMedia ??= ((q: string) =>
+      ({ matches: false, media: q, addEventListener() {}, removeEventListener() {}, onchange: null }) as unknown as MediaQueryList) as typeof matchMedia;
+  });
+
+  async function mountUnlocked() {
+    sessions.length = 0;
+    prot = new TestStore(new IDBFactory(), 'keymesh-vault');
+    kdf = new ManualKdf();
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        provideServiceWorker('ngsw-worker.js', { enabled: false }),
+        { provide: VAULT_STORE, useValue: new TestStore(new IDBFactory(), 'keymesh-demo') },
+        { provide: PROTECTED_VAULT_STORE, useValue: prot },
+        { provide: KDF_RUNNER, useValue: kdf },
+        { provide: SECURE_CONTEXT, useValue: true },
+        { provide: CORE_LOADER, useValue: () => Promise.resolve(fakeCore) },
+        { provide: PREFERENCE_STORAGE, useValue: null },
+      ],
+    });
+    TestBed.inject(PreferencesService).setLocale('en');
+    await prot.create(rec(v2(3)));
+    prot.writes = 0;
+    prot.landed = 0;
+    const fixture = TestBed.createComponent(App);
+    const el = fixture.nativeElement as HTMLElement;
+    const settle = async () => {
+      fixture.detectChanges();
+      await fixture.whenStable();
+      fixture.detectChanges();
+    };
+    const q = (id: string) => el.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+    const type = (id: string, v: string) => {
+      const input = q(id)!.querySelector('input') ?? (q(id) as HTMLInputElement);
+      (input as HTMLInputElement).value = v;
+      input.dispatchEvent(new Event('input'));
+    };
+    const vault = TestBed.inject(VaultService);
+    await settle();
+    await until(() => vault.status() !== 'loading' && vault.protectedStored() !== null, 'app started');
+    await settle();
+    type('unlock-password', GOOD_PW);
+    await settle();
+    q('unlock-protected')!.click();
+    await kdf.started(1);
+    kdf.release(0);
+    await until(() => vault.status() === 'unlocked', 'unlock');
+    await settle();
+    kdf.calls = [];
+    kdf.returned = [];
+    // Backup view → rotation form → new code typed back.
+    q('nav-backup')!.click();
+    await settle();
+    type('rotate-current', GOOD_PW);
+    type('rotate-new', NEW_PW);
+    type('rotate-confirm', NEW_PW);
+    await settle();
+    (q('begin-rotation')!.closest('form') as HTMLFormElement).dispatchEvent(new Event('submit'));
+    await kdf.started(1);
+    kdf.release(0);
+    await kdf.started(2);
+    kdf.release(1);
+    await until(() => !!q('recovery-step'), 'new recovery code shown');
+    await settle();
+    (q('recovery-saved') as HTMLInputElement).click();
+    await settle();
+    type('recovery-confirm-input', ROT_CODE);
+    await settle();
+    return { fixture, el, q, settle, vault };
+  }
+
+  async function submitCode(q: (id: string) => HTMLElement | null) {
+    (q('recovery-confirm')!.closest('form') as HTMLFormElement).dispatchEvent(new Event('submit'));
+  }
+
+  it('late committed write + lock: the locked screen says the NEW credentials are needed', async () => {
+    const { fixture, el, q, settle, vault } = await mountUnlocked();
+    const held = deferred();
+    prot.afterPut = held.promise;
+    await submitCode(q);
+    await until(() => prot.landed === 1, 'write committed (completion still held)');
+    q('lock')!.click(); // the user locks while the write is completing
+    await settle();
+    expect(el.querySelector('km-backup')).toBeNull(); // the view that started it is gone
+    held.resolve();
+    await until(() => (fixture.detectChanges(), !!q('credential-notice')), 'notice rendered on the locked screen');
+    await settle();
+    const notice = q('credential-notice');
+    expect(notice).not.toBeNull();
+    expect(notice!.getAttribute('data-code')).toBe('rotatedWhileLocked');
+    expect(notice!.textContent).toContain(en['notice.rotatedWhileLocked']);
+    expect(q('unlock-password')).not.toBeNull(); // still the locked screen
+    // Acknowledged: gone.
+    q('credential-notice-ack')!.click();
+    await settle();
+    expect(q('credential-notice')).toBeNull();
+  });
+
+  it('uncertain outcome: the vault is locked and the locked screen explains how to reconcile (zh-TW)', async () => {
+    const { fixture, el, q, settle, vault } = await mountUnlocked();
+    TestBed.inject(PreferencesService).setLocale('zh-TW');
+    prot.failAfterPut = true;
+    prot.readFails = true;
+    await submitCode(q);
+    await until(() => (fixture.detectChanges(), !!q('credential-notice')), 'notice rendered on the locked screen');
+    prot.failAfterPut = false;
+    prot.readFails = false;
+    await settle();
+    expect(vault.status()).not.toBe('unlocked');
+    expect(el.querySelector('km-backup')).toBeNull();
+    const notice = q('credential-notice');
+    expect(notice?.getAttribute('data-code')).toBe('rotationUncertain');
+    expect(notice!.textContent).toContain(zhTW['notice.rotationUncertain']);
+    // A successful unlock (with whichever credential works) resolves it.
+    const p = vault.unlockWithPassword(NEW_PW);
+    await until(() => kdf.calls.length > 0 && kdf.returned.length < kdf.calls.length, 'KDF call');
+    kdf.release();
+    await p;
+    await settle();
+    expect(vault.credentialNotice()).toBeNull();
+  });
+
+  it('an older operation never overwrites a newer notice', async () => {
+    TestBed.resetTestingModule();
+    const { vault } = await mountUnlocked();
+    const older = vault.credentialOpSeq();
+    vault.recordNotice('rotationUncertain', older + 1);
+    vault.recordNotice('rotatedWhileLocked', older);
+    expect(vault.credentialNotice()?.code).toBe('rotationUncertain');
   });
 });

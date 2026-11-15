@@ -2,9 +2,11 @@
 
 Local-first encrypted vault core in Rust, with an Angular browser demo running the same core compiled to WebAssembly.
 
-> **Status: M4 local unlock + M5 phase A, experimental. NOT production ready and not independently accepted.**
+> **Status: M4 local unlock + M5 phases A and B, experimental. NOT production ready; synthetic data only.**
 > * **Password vaults** (master password + independent recovery code, envelope v2, `docs/adr/0002-envelope-v2.md`) work natively and in the browser, but stay **synthetic-data only until independent acceptance**. Demo vaults keep their public fixture or ephemeral keys.
-> * **M5 phase A** (installable offline app, TOTP from QR, TOTP countdown, local login icons) is implemented and Chromium-tested, under review. Phases B and C are not started (`docs/ROADMAP.md`).
+> * **M5 phase A** (installable offline app, TOTP from QR, TOTP countdown, local login icons): independently accepted for experimental, synthetic-only use, and privately deployed to `keymesh.cloud` (commit `7079932`).
+> * **M5 phase B** (Ed25519 Base58/sign/verify, data-key rotation, EFF passphrases, emergency kit): implemented and Chromium-tested; independent review requested fixes, which are being addressed. Not deployed.
+> * **M5 phase C** (WebAuthn PRF quick unlock, auto-lock, optional favicon route): not implemented. See `docs/ROADMAP.md`.
 > * **Not built:** Keymesh's own authentication, accounts and sync.
 > * **Private HTTPS:** a private HTTPS endpoint (`https://keymesh.cloud` on the VPN, internal CA) runs, but no real client device has yet been verified to trust it (gate C, `docs/DELIVERY.md`).
 

@@ -1603,3 +1603,13 @@ km-secret-field .field-error {
 .verify-card {
   grid-column: 1 / -1;
 }
+
+/* Credential-operation notice on the locked screen. */
+.callout.notice .notice-body {
+  display: grid;
+  gap: var(--space-2);
+  justify-items: start;
+}
+.callout.notice .notice-body p {
+  margin: 0;
+}

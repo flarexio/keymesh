@@ -509,6 +509,12 @@ export const en = {
   'kit.sheetCode': 'Recovery code',
   'kit.sheetKeepApart': 'Anyone with this sheet and the vault data can open the vault. Keymesh has no account or reset service: losing both credentials loses the vault.',
   'kit.sheetExperimental': 'Preview version: synthetic data only until independently reviewed.',
+
+  // M5 B review fix: rotation outcome notice on the locked screen
+  'notice.title': 'About your last key rotation',
+  'notice.rotatedWhileLocked': 'The key rotation was saved just before the vault locked. Unlock with the NEW master password or the NEW recovery code; the old ones no longer open this vault (older backups still open with them).',
+  'notice.rotationUncertain': 'Keymesh couldn’t confirm whether the key rotation was saved, so the vault was locked. Try the NEW master password first; if it doesn’t open the vault, the rotation wasn’t saved and the OLD password still works. Keep both until one opens it, then make a fresh backup.',
+  'notice.ack': 'Got it',
 } as const satisfies Record<string, string>;
 
 export type MessageKey = keyof typeof en;
