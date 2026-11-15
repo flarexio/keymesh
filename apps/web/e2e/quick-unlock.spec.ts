@@ -230,7 +230,7 @@ test('中文 mobile dark: an orphan passkey is explained on the LOCKED screen wi
  * Releasing the capability must LOCK the vault: no passkey ceremony and no
  * enrolment write. Virtual authenticator; not a real frozen-page proof.
  */
-async function expiredDuringEnrolment(page: Page, baseURL: string | undefined, holdAt: 'capability') {
+async function expiredDuringEnrolment(page: Page, baseURL: string | undefined, holdAt: 'capability' | 'ceremony') {
   await page.clock.install({ time: new Date('2026-11-16T10:00:00Z') });
   await page.addInitScript((at) => {
     const w = window as unknown as Record<string, unknown>;
@@ -240,10 +240,22 @@ async function expiredDuringEnrolment(page: Page, baseURL: string | undefined, h
     const pending = new Promise<Record<string, boolean>>((r) => (release = r));
     w['__entered'] = false;
     w['__release'] = () => release({ 'extension:prf': true });
-    (PublicKeyCredential as unknown as { getClientCapabilities: () => Promise<Record<string, boolean>> }).getClientCapabilities = () => {
-      w['__entered'] = true;
-      return at === 'capability' ? pending : Promise.resolve({ 'extension:prf': true }); // KDF/ceremony cases: core/protected-vault.spec.ts
-    };
+    if (at === 'capability') {
+      (PublicKeyCredential as unknown as { getClientCapabilities: () => Promise<Record<string, boolean>> }).getClientCapabilities = () => {
+        w['__entered'] = true;
+        return pending;
+      };
+    } else {
+      // The REAL create() runs (the virtual authenticator makes a
+      // credential); only its return to the app is held.
+      const create = navigator.credentials.create.bind(navigator.credentials);
+      navigator.credentials.create = async (o?: CredentialCreationOptions) => {
+        const result = await create(o);
+        w['__entered'] = true;
+        await pending;
+        return result;
+      };
+    }
   }, holdAt);
   const { cdp, id } = await authenticator(page);
   const origin = localhost(baseURL);
@@ -261,7 +273,81 @@ async function expiredDuringEnrolment(page: Page, baseURL: string | undefined, h
   await expect(page.getByTestId('lock')).toHaveCount(0, { timeout: 30_000 }); // locked
   await expect(page.getByTestId('autolock-reason')).toHaveAttribute('data-reason', 'idle');
   expect(Buffer.from(await storedBytes(page, 'keymesh-vault')).equals(before)).toBe(true); // nothing written
-  expect((await cdp.send('WebAuthn.getCredentials', { authenticatorId: id })).credentials).toHaveLength(0); // no ceremony
+  const creds = (await cdp.send('WebAuthn.getCredentials', { authenticatorId: id })).credentials;
+  if (holdAt === 'capability') {
+    expect(creds).toHaveLength(0); // no ceremony
+    return;
+  }
+  // A credential exists that is not in the vault: the LOCKED screen must say so.
+  expect(creds).toHaveLength(1);
+  await expect(page.getByTestId('credential-notice')).toHaveAttribute('data-code', 'quickUnlockOrphan');
+  await expect(page.getByTestId('credential-notice-passkey')).toContainText('Synthetic deadline probe');
+  // The original password still opens the unchanged vault; the guidance stays until acknowledged.
+  await page.getByTestId('unlock-password').fill(PW);
+  await page.getByTestId('unlock-protected').click();
+  await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected', { timeout: 30_000 });
+  expect(Buffer.from(await storedBytes(page, 'keymesh-vault')).equals(before)).toBe(true);
+  await expect(page.getByTestId('credential-notice')).toHaveAttribute('data-code', 'quickUnlockOrphan');
+}
+
+test('idle deadline passes while the real create() result is held: locked, no write, orphan guidance on the locked screen (real WASM)', async ({ page, baseURL }) => {
+  test.setTimeout(150_000);
+  await expiredDuringEnrolment(page, baseURL, 'ceremony');
+});
+
+/** Real IndexedDB boundaries of the enrolment write (from the independent review's probes). */
+for (const boundary of ['preput-deadline', 'postput-pagehide'] as const) {
+  test(`enrolment write boundary ${boundary}: exact persistence and the right locked-screen notice`, async ({ page, baseURL }) => {
+    test.setTimeout(150_000);
+    const { cdp, id } = await authenticator(page);
+    await createVault(page, localhost(baseURL));
+    const before = Buffer.from(await storedBytes(page, 'keymesh-vault'));
+    await page.evaluate((at) => {
+      const w = window as unknown as Record<string, unknown>;
+      w['__puts'] = 0;
+      w['__hit'] = false;
+      const get = IDBObjectStore.prototype.get;
+      const put = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.get = function (this: IDBObjectStore, key: IDBValidKey | IDBKeyRange) {
+        const r = get.call(this, key);
+        if (at === 'preput-deadline' && this.transaction.db.name === 'keymesh-vault' && this.transaction.mode === 'readwrite') {
+          r.addEventListener('success', () => {
+            w['__hit'] = true;
+            const later = Date.now() + 301_000; // the deadline passes between the CAS read and put
+            Date.now = () => later;
+          });
+        }
+        return r;
+      };
+      IDBObjectStore.prototype.put = function (this: IDBObjectStore, ...a: Parameters<IDBObjectStore['put']>) {
+        const r = put.apply(this, a);
+        if (this.transaction.db.name === 'keymesh-vault') {
+          w['__puts'] = (w['__puts'] as number) + 1;
+          if (at === 'postput-pagehide') {
+            r.addEventListener('success', () => {
+              w['__hit'] = true;
+              dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
+            });
+          }
+        }
+        return r;
+      };
+    }, boundary);
+    await page.getByTestId('nav-backup').click();
+    const q = page.getByTestId('quick-unlock-section');
+    await q.getByTestId('qu-current').fill(PW);
+    await q.getByTestId('qu-label').fill('Synthetic ' + boundary);
+    await q.getByTestId('qu-add').click();
+    await expect.poll(() => page.evaluate(() => (window as unknown as Record<string, unknown>)['__hit']), { timeout: 30_000 }).toBe(true);
+    await expect(page.getByTestId('unlock-password')).toBeVisible();
+    const pre = boundary === 'preput-deadline';
+    await expect(page.getByTestId('credential-notice')).toHaveAttribute('data-code', pre ? 'quickUnlockOrphan' : 'quickUnlockSavedWhileLocked', { timeout: 30_000 });
+    const after = Buffer.from(await storedBytes(page, 'keymesh-vault'));
+    expect(after.equals(before)).toBe(pre);
+    expect(await page.evaluate(() => (window as unknown as Record<string, unknown>)['__puts'])).toBe(pre ? 0 : 1);
+    expect(JSON.parse(after.toString()).slots.filter((s: { kind: string }) => s.kind === 'webauthn-prf')).toHaveLength(pre ? 0 : 1);
+    expect((await cdp.send('WebAuthn.getCredentials', { authenticatorId: id })).credentials).toHaveLength(1);
+  });
 }
 
 test('idle deadline passes while getClientCapabilities() is pending: locks, no ceremony, no write', async ({ page, baseURL }) => {

@@ -231,6 +231,8 @@ class FakeSession {
     this.passkey = true;
   }
   cancelPrfEnrolment() {
+    // Like real WASM: a freed handle throws (review finding P2).
+    if (this.freed) throw new Error('null pointer passed to rust');
     this.prfPending = false;
   }
   removePrfSlot(cur: Uint8Array) {

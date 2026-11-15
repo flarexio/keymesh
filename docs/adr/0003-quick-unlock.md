@@ -102,6 +102,7 @@ KEK            = HKDF-SHA256(salt = none, ikm = PRF output (exactly 32 bytes),
                              info = fields("keymesh.vault","2","kek","webauthn-prf", vault_id, slot_id, credential_id))
 wrapped        = XChaCha20-Poly1305(KEK, nonce[24], DEK, slot_aad)
 ```
+* **Credential id encoding:** strict, canonical base64url with no padding, at most 1364 characters (the encoded length of 1023 bytes), decoded to 16..=1023 bytes. It has its own decoder: the salt's 64-character bound does not apply. Ids of 49 to 1023 bytes made vaults unreadable before review fix C-CORE-1; regressions cover 16, 48, 49, 64, 255 and 1023 bytes, and refuse 1024, natively and through the bridge.
 * **Slot rules:** exactly one password slot, exactly one recovery slot, and 0..=4 `webauthn-prf` slots (≤ 8 slots in total). Slot ids and credential ids are unique.
 * **Bounds:** bounds, unknown kinds, unknown algorithms and unknown fields are refused before any derivation.
 * **Older readers:** the A/B builds and the older CLI **refuse the whole file** once a passkey slot exists. That is fail-closed by design and is shown by a test with the `4e65efb` CLI.

@@ -1233,12 +1233,17 @@ export class VaultService {
           if (!prf || !(flags & FLAG_UV)) orphan();
           s.finishPrfEnrolment(curKey, new Uint8Array(created.rawId), rp, (flags & FLAG_BE) !== 0, meta.label, prf!);
         } catch (err) {
-          s.cancelPrfEnrolment();
-          // A credential exists if create() returned one; it MAY exist if a
-          // lock aborted the ceremony after it started. A user cancelling
-          // (NotAllowedError) means no credential was made.
+          // Guidance FIRST, so nothing below can lose it. A credential exists
+          // if create() returned one; it MAY exist if a lock (or an expired
+          // deadline) aborted the ceremony after it started. A user
+          // cancelling (NotAllowedError) means no credential was made.
           const alreadyReported = err instanceof VaultError && err.code === 'quickUnlockOrphan';
-          if (!alreadyReported && (created || (createStarted && err instanceof StaleWorkError))) orphan();
+          const orphaned = !alreadyReported && (created || (createStarted && err instanceof StaleWorkError));
+          if (orphaned) this.recordNotice('quickUnlockOrphan', seq, { passkey: meta });
+          // A lock frees the captured WASM session: touch it only while it is
+          // still the live one (never a freed handle).
+          this.ifLive(s, () => s.cancelPrfEnrolment());
+          if (orphaned) throw new VaultError('quickUnlockOrphan', 'The passkey was created but not added to this vault.');
           if (err instanceof DOMException && err.name === 'NotAllowedError') {
             throw new VaultError('quickUnlockFailed', 'The passkey request was cancelled.');
           }
@@ -1322,6 +1327,20 @@ export class VaultService {
     this.refreshStoredQuickUnlock(bytes);
     this.version.update((v) => v + 1);
     this.broadcast();
+  }
+
+  /**
+   * Run `fn` on session `s` only while it is the live session (a lock frees
+   * it; calling into a freed WASM object throws). Cleanup-only: no secret
+   * access, so no freshness check here.
+   */
+  private ifLive(s: VaultSession, fn: () => void): void {
+    if (this.session !== s) return;
+    try {
+      fn();
+    } catch {
+      // best-effort cleanup
+    }
   }
 
   /** Remove a passkey from this vault (needs the master password). */

@@ -2306,6 +2306,81 @@ mod tests {
         add(&mut v, &code, &p).unwrap();
     }
 
+    /// Review fix C-CORE-1: every credential id the writer accepts
+    /// (16..=1023 bytes) must read back; 1024 is refused on write AND read.
+    #[test]
+    fn prf_credential_ids_of_every_accepted_length_round_trip() {
+        for n in [16usize, 48, 49, 64, 255, 1023] {
+            let (mut v, code, _) = protected();
+            let cred: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+            let prf = [n as u8; 32];
+            enrol(&mut v, &code, &cred, &prf);
+            let b = sealed(&mut v);
+            assert!(Vault::open_with_password(&b, PW).is_ok(), "{n}: password");
+            assert!(
+                Vault::open_with_recovery(&b, &code).is_ok(),
+                "{n}: recovery"
+            );
+            let r = Vault::open_with_prf(&b, &cred, &auth_data(RP, 0x05), &prf, RP).unwrap();
+            assert_eq!(r.prf_slots().unwrap()[0].credential_id, cred, "{n}: prf");
+            assert_eq!(prf_request(&b).unwrap()[0].credential_id, cred);
+        }
+        // 1024 bytes: refused when enrolling...
+        let (mut v, code, _) = protected();
+        let p = v
+            .begin_prf(Authority::Recovery(&code), &mut OsRandom)
+            .unwrap();
+        assert!(v
+            .add_prf_slot(
+                Authority::Recovery(&code),
+                &p,
+                &[7; 1024],
+                RP,
+                false,
+                "",
+                &[1; 32],
+                &mut OsRandom
+            )
+            .is_err());
+        // ...and when a file carries one (strict, before any derivation).
+        let (mut w, wc, _) = protected();
+        enrol(&mut w, &wc, &[3; 16], &[3; 32]);
+        let b = sealed(&mut w);
+        let mut j = json(&b);
+        let i = j["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|s| s["kind"] == "webauthn-prf")
+            .unwrap();
+        j["slots"][i]["kdf"]["credential_id"] =
+            serde_json::json!(data_encoding::BASE64URL_NOPAD.encode(&[3u8; 1024]));
+        assert!(matches!(
+            Vault::open_with_password(&bytes_of(&j), PW),
+            Err(Error::Format(_))
+        ));
+        // Non-canonical base64url (padding, wrong alphabet, stray trailing bits) is refused.
+        for bad in [
+            "AwMDAwMDAwMDAwMDAwMDAw==",
+            "AwMDAwMDAwMDAwMDAwMDAw+/",
+            "AwMDAwMDAwMDAwMDAwMDAx",
+        ] {
+            j["slots"][i]["kdf"]["credential_id"] = serde_json::json!(bad);
+            assert!(
+                Vault::open_with_password(&bytes_of(&j), PW).is_err(),
+                "{bad}"
+            );
+        }
+        // Salt bounds are unchanged (still ≤ 64 encoded characters).
+        j["slots"][i]["kdf"]["credential_id"] =
+            serde_json::json!(data_encoding::BASE64URL_NOPAD.encode(&[3u8; 16]));
+        j["slots"][i]["kdf"]["salt"] = serde_json::json!("A".repeat(65));
+        assert!(matches!(
+            Vault::open_with_password(&bytes_of(&j), PW),
+            Err(Error::Format(_))
+        ));
+    }
+
     #[test]
     fn rotation_never_silently_keeps_prf_slots() {
         let (mut v, code, _) = protected();

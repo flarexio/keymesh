@@ -2567,4 +2567,36 @@ mod tests {
         s.lock();
         assert!(s.begin_prf_enrolment(&cur[..]).is_err());
     }
+
+    /// Review fix C-CORE-1 through the bridge: finish + seal + commit, then
+    /// reopen with password, recovery and PRF, for long credential ids.
+    #[test]
+    fn long_prf_credential_ids_persist_and_reopen_through_the_bridge() {
+        use sha2::{Digest, Sha256};
+        for n in [49usize, 64, 1023] {
+            let (mut s, code) = new_protected();
+            let cur = derive(PW, &s.current_password_request().unwrap());
+            s.begin_prf_enrolment(&cur[..]).unwrap();
+            let cred: Vec<u8> = (0..n).map(|i| (i * 7 % 256) as u8).collect();
+            s.finish_prf_enrolment(&cur[..], &cred, "keymesh.cloud", false, "long", &[9; 32])
+                .unwrap();
+            let b = persist_v2(&mut s);
+            assert_eq!(prf_request(&b).unwrap()[0].credential_id, cred, "{n}");
+            let k = derive(PW, &password_request(&b).unwrap());
+            assert!(
+                Session::open_with_password_key(&b, &k[..]).is_ok(),
+                "{n}: password"
+            );
+            assert!(
+                Session::open_with_recovery(&b, &code).is_ok(),
+                "{n}: recovery"
+            );
+            let mut ad = Sha256::digest(b"keymesh.cloud").to_vec();
+            ad.extend_from_slice(&[0x05, 0, 0, 0, 1]);
+            assert!(
+                Session::open_with_prf(&b, &cred, &ad, &[9; 32], "keymesh.cloud").is_ok(),
+                "{n}: prf"
+            );
+        }
+    }
 }

@@ -82,7 +82,9 @@ pub enum KdfRecord {
     /// PRF output (32 bytes) → HKDF-SHA256; every field is authenticated.
     #[serde(rename = "webauthn-prf-hkdf")]
     WebauthnPrfHkdf {
-        #[serde(with = "b64")]
+        // Its own bounded decoder: credential ids are up to 1023 bytes, far
+        // longer than the 64-character salt limit (review fix C-CORE-1).
+        #[serde(with = "b64_credential")]
         credential_id: Vec<u8>,
         rp_id: String,
         #[serde(with = "b64")]
@@ -687,6 +689,28 @@ mod b64 {
         let s = String::deserialize(d)?;
         if s.len() > 64 {
             return Err(serde::de::Error::custom("salt too long"));
+        }
+        data_encoding::BASE64URL_NOPAD
+            .decode(s.as_bytes())
+            .map_err(|_| serde::de::Error::custom("invalid base64url"))
+    }
+}
+
+/// Strict base64url (no padding, canonical trailing bits) for WebAuthn
+/// credential ids: at most the encoded length of [`MAX_CREDENTIAL_ID`]
+/// bytes, checked before decoding. The decoded length (16..=1023) is
+/// validated with the rest of the slot.
+mod b64_credential {
+    use super::MAX_CREDENTIAL_ID;
+    use serde::{Deserialize, Deserializer, Serializer};
+    const MAX_ENCODED: usize = (MAX_CREDENTIAL_ID * 4).div_ceil(3);
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&data_encoding::BASE64URL_NOPAD.encode(v))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        if s.len() > MAX_ENCODED {
+            return Err(serde::de::Error::custom("credential id too long"));
         }
         data_encoding::BASE64URL_NOPAD
             .decode(s.as_bytes())
