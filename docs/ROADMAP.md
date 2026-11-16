@@ -14,11 +14,11 @@
 | M3 UI polish, locale and theme | Accepted |
 | Generator finish | Accepted |
 | **M4 local unlock** (password and recovery slots, backup/restore, HTTPS mechanics) | **Partial, not accepted.** A private HTTPS endpoint (`keymesh.cloud`, Docker, internal CA) now runs; **gate C** (a real client device trusting it) is still unverified by the human |
-| **M5 product rollout** (PWA + backlog) | **Phase A accepted** (`7079932`) and **Phase B accepted** (`4e65efb`). Both are experimental, synthetic only, and privately deployed to `keymesh.cloud`, A and then B on 2026-11-16. **Phase C is implemented and tested in Chromium, but not reviewed and not deployed.** The C1 format and the C3 architecture passed their design gates; outbound icon fetching is still not approved. See the checklist below |
+| **M5 product rollout** (PWA + backlog) | **Phases A (`7079932`), B (`4e65efb`) and C (`88dee8b`) are independently accepted** for experimental, synthetic-only use. They were privately deployed to `keymesh.cloud` in that order on 2026-11-16; the deployed web image is now C. Explicit dispositions: the custom short PIN is **blocked**; real devices, Safari, phones and client trust are **not verified**; outbound website-icon fetching is **off**. See the checklist below |
 
 ## M5 checklist (versioned)
 
-**v4.1, 2026-11-16** (A and B deployed; C implemented with independent-review fixes), on branch `feature/m5-pwa-product-features`. The exact commits are listed in the draft PR. "Deployed" for A means the accepted `7079932` web image; B is not deployed and stays off the private endpoint until its independent review.
+**v5, 2026-11-16** (A, B and C accepted and privately deployed), on branch `feature/m5-pwa-product-features` (draft PR #5, not merged). The deployed web image is source `88dee8b` (OCI revision `88dee8b`); A and B were deployed before it, and their features are part of it.
 * **States:** *implemented* · *tested* (automated, Chromium on the Pi) · *deployed* (private `keymesh.cloud` image) · *blocked*.
 * **Not covered by "tested":** real phones, Safari and Firefox; iOS install; and real camera hardware. Those need human device checks.
 
@@ -32,12 +32,25 @@
 | A | Circular TOTP countdown (last 5 s warning) | yes | yes | yes | Fixed-clock unit and E2E tests; reduced motion |
 | A | Local login icons (brand, private host, category, letter) | yes | yes | yes | 81 reviewed Simple Icons: no per-icon licence (Rust, CC-BY-SA-4.0, removed); explicit domain aliases. No network. Not a security indicator |
 | B | Ed25519 Base58 public key, sign and verify | yes | yes | yes | Raw 32-byte Base58 (no prefix/checksum); pure Ed25519 over the exact shown bytes; `verify_strict`. RFC 8032 + Base58 + negative vectors natively, through WASM, and Node/OpenSSL in E2E |
-| B | DEK rotation (password + recovery slots) | yes | yes | yes | No wire-format change. Native, CLI, bridge, browser; rotation vector checked by Node/OpenSSL. Browser outcome reconciliation tested with a fake store and, in the production build, with held IndexedDB completion. If the outcome is only known after a lock, a non-secret notice stays on the locked screen (review fix). IndexedDB post-commit durability can't be observed. Design gate approved; code review fixes pending re-review |
+| B | DEK rotation (password + recovery slots) | yes | yes | yes | No wire-format change. Native, CLI, bridge, browser; rotation vector checked by Node/OpenSSL. Browser outcome reconciliation tested with a fake store and, in the production build, with held IndexedDB completion. If the outcome is only known after a lock, a non-secret notice stays on the locked screen (review fix). IndexedDB post-commit durability can't be observed. Accepted with B |
 | B | Passphrase wordlist and emergency kit | yes | yes | yes | EFF Long Wordlist pinned by SHA-256; core CSPRNG with rejection sampling. Kit never prints the password; code only on request. Real printers/PDF untested |
-| C | WebAuthn PRF quick unlock | yes | virtual authenticator only | no | ADR 0003 §4.1.1. Idle deadlines are checked on every async continuation (capability query, KDF, ceremony, before the write). Real-device capability (§5) is not recorded: no TouchID, FaceID, Windows Hello, Android or iOS proof |
-| C | Auto-lock (idle, hidden, pagehide, clock) | yes | yes | no | Deadline checks; visibility simulated in tests (no real OS app switch or freeze) |
-| C | Custom short PIN | no | n/a | no | **Blocked**: no protected mechanism in the web app (ADR 0003 D2). The device PIN as WebAuthn UV is the supported route; it is not a Keymesh PIN |
-| C | Optional favicon route | yes (off) | mock network plus a local TLS production-connector test | no | `KEYMESH_FAVICON` unset in Docker; outbound use is not approved.<br>• **Fixed:** address allowlist; one deadline (monotonic, including DNS); no shared cache, `no-store`; connector works with Node family autoselection.<br>• **Not hard limits:** native DNS jobs can't be cancelled; the PNG decode is synchronous and not preempted |
+| C | WebAuthn PRF quick unlock | yes | virtual authenticator only | yes (`88dee8b`) | ADR 0003 §4.1.1. Idle deadlines are checked on every async continuation (capability query, KDF, ceremony, before the write). Real-device capability (§5) is not recorded: no TouchID, FaceID, Windows Hello, Android or iOS proof |
+| C | Auto-lock (idle, hidden, pagehide, clock) | yes | yes | yes (`88dee8b`) | Deadline checks; visibility simulated in tests (no real OS app switch or freeze) |
+| C | Custom short PIN | no | n/a | no | **BLOCKED (disposition)**: no protected mechanism in the web app (ADR 0003 D2). The device PIN as WebAuthn UV is the supported route; it is not a Keymesh PIN |
+| C | Optional favicon route | yes | mock network plus a local TLS production-connector test | in the image, **OFF** | `KEYMESH_FAVICON` unset in Docker; outbound use is not approved.<br>• **Fixed:** address allowlist; one deadline (monotonic, including DNS); no shared cache, `no-store`; connector works with Node family autoselection.<br>• **Not hard limits:** native DNS jobs can't be cancelled; the PNG decode is synchronous and not preempted |
+
+### Rollout dispositions (v5)
+* **Delivered (experimental, synthetic only, privately deployed):** all A, B and C rows marked "yes" above.
+* **BLOCKED:** a custom short Keymesh PIN. A browser-only PIN does not resist an offline copy of the profile. The device PIN used as WebAuthn user verification is a different thing: it is the authenticator's own PIN, not a Keymesh PIN (ADR 0003 D2).
+* **NOT VERIFIED:**
+  * real hardware: TouchID, FaceID, Windows Hello, Android, iOS, security keys and cameras;
+  * Safari and Firefox;
+  * installation on phones;
+  * client-device trust of the private CA (gate C);
+  * real OS freeze and suspend;
+  * real printers and PDF output.
+* **OFF:** outbound website-icon fetching. The route is in the image but `KEYMESH_FAVICON` is unset, and activation is not approved.
+* **Not done:** merge or release, and any real data or real secrets.
 
 ### Gates shared by several items
 * **G-HTTPS (gate C).** A client-trusted HTTPS origin for LAN/VPN use, because the plain-HTTP previews are not secure contexts. It is required for non-loopback password vaults, WebAuthn, the camera and the Clipboard API. The decision is the human's; no CA or certificate is created without approval.

@@ -144,7 +144,7 @@ tmux new-session -d -s keymesh-vpn-https \
 
 **Deployment:** rebuilding the `keymesh-web` image (`deploy/README.md`) publishes a new version. Installed copies pick it up on their next online visit.
 
-## 7. Quick unlock, auto-lock and website icons (M5 phase C; experimental, review pending)
+## 7. Quick unlock, auto-lock and website icons (M5 phase C; experimental, accepted `88dee8b`, privately deployed 2026-11-16)
 
 * **Passkeys need a domain origin.** WebAuthn RP ids are domain names, so quick unlock works on `https://keymesh.cloud` (or `http://localhost` for development), never on an IP address or plain-HTTP preview. A passkey is bound to the RP id it was made on: one made on `localhost` does not unlock the vault on `keymesh.cloud`.
 * **What was tested:** only Chromium's DevTools virtual authenticator (CTAP 2.1, internal, UV, PRF). No TouchID, FaceID, Windows Hello, Android, iOS or security-key result is recorded (ADR 0003 §5 is still open). Real devices need a human with the device.

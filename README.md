@@ -2,14 +2,14 @@
 
 Local-first encrypted vault core in Rust, with an Angular browser demo running the same core compiled to WebAssembly.
 
-> **Status: M4 local unlock + M5 phases A and B, experimental. NOT production ready; synthetic data only.**
+> **Status: M4 local unlock + M5 phases A, B and C, experimental. NOT production ready; synthetic data only.**
 > * **Password vaults** (master password + independent recovery code, envelope v2, `docs/adr/0002-envelope-v2.md`) work natively and in the browser, but stay **synthetic-data only until independent acceptance**. Demo vaults keep their public fixture or ephemeral keys.
 > * **M5 phase A** (installable offline app, TOTP from QR, TOTP countdown, local login icons): independently accepted for experimental, synthetic-only use, and privately deployed to `keymesh.cloud` (commit `7079932`).
 > * **M5 phase B** (Ed25519 Base58/sign/verify, data-key rotation, EFF passphrases, emergency kit): independently accepted (commit `4e65efb`) and privately deployed to `keymesh.cloud` on 2026-11-16.
-> * **M5 phase C** has three parts. All are implemented and tested in Chromium; they are not yet reviewed or deployed.
->   * **Quick unlock:** WebAuthn PRF passkeys, tested only with a virtual authenticator.
->   * **Auto-lock:** deadline based.
->   * **Website icons:** an optional server route that is OFF by default, with outbound requests not yet approved.
+> * **M5 phase C** (WebAuthn PRF quick unlock and deadline-based auto-lock): independently accepted (commit `88dee8b`) and privately deployed to `keymesh.cloud` on 2026-11-16.
+>   * **Testing scope:** passkeys were tested only with Chromium's **virtual authenticator**.
+>   * **Website icons:** the optional route is in the image but **OFF**; outbound fetching is not approved.
+> * **Not verified:** real hardware (TouchID, FaceID, Windows Hello, phones, security keys), Safari and Firefox, and client-device trust.
 > * **Not offered:** a custom short Keymesh PIN is deliberately blocked. See `docs/ROADMAP.md`.
 > * **Not built:** Keymesh's own authentication, accounts and sync.
 > * **Private HTTPS:** a private HTTPS endpoint (`https://keymesh.cloud` on the VPN, internal CA) runs, but no real client device has yet been verified to trust it (gate C, `docs/DELIVERY.md`).
@@ -51,9 +51,9 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | Installable app / offline startup (PWA) | ✅ experimental | Angular service worker in secure contexts only (HTTPS or loopback; not the plain-HTTP previews). After one online visit it reopens offline and unlocks the vault stored in that browser. Updates are offered, never forced. A failed update keeps the open tab working but prevents offline reopening until a retry succeeds. Damaged cached app files can be repaired online (vault data untouched). Not native autofill or an app store; vaults stay per browser. **Install on real phones/Safari untested** (`docs/DELIVERY.md` §6) |
 | 1Password import in the browser | ❌ by design | Native CLI only; no endpoint runs `op`; the browser shows CLI instructions |
 | Production use of password vaults | ⏳ pending review | Experimental until independent acceptance; lost password **and** recovery code ⇒ data unrecoverable (no escrow, no reset); lost ephemeral demo key ⇒ demo ciphertext unrecoverable |
-| Quick unlock with a WebAuthn PRF passkey (M5 C) | ✅ experimental, **review pending** | `webauthn-prf` slot (ADR 0003 §4.1.1). The master password is needed to enrol or remove a passkey, and stays a fallback with the recovery code. Unlock checks rpIdHash, UP and UV in the core. Orphan and uncertain outcomes are reconciled. Tested with Chromium's **virtual authenticator only**; no TouchID, FaceID or Windows Hello proof |
-| Auto-lock (M5 C) | ✅ experimental, review pending | Idle (5 min default) and hidden (30 s desktop, immediate on touch) deadlines, checked before access. `pagehide` locks. Monotonic plus wall clock; a clock moved backwards locks |
-| Optional website icons (M5 C) | ⏳ implemented, **off** | Same-process `/api/favicon`, off unless `KEYMESH_FAVICON=1` and the user opts in.<br>• **Hosts:** public only (address allowlist, pinned connection, normal TLS checks).<br>• **Images:** PNG decoded and re-encoded.<br>• **Storage:** no result cache; `no-store`.<br>• **Not hard limits:** DNS lookups can't be cancelled, and the decode is synchronous; late results are discarded.<br>Live outbound use is not approved yet |
+| Quick unlock with a WebAuthn PRF passkey (M5 C) | ✅ experimental, accepted (`88dee8b`), deployed | `webauthn-prf` slot (ADR 0003 §4.1.1). The master password is needed to enrol or remove a passkey, and stays a fallback with the recovery code. Unlock checks rpIdHash, UP and UV in the core. Orphan and uncertain outcomes are reconciled. Tested with Chromium's **virtual authenticator only**; no TouchID, FaceID or Windows Hello proof |
+| Auto-lock (M5 C) | ✅ experimental, accepted (`88dee8b`), deployed | Idle (5 min default) and hidden (30 s desktop, immediate on touch) deadlines, checked before access. `pagehide` locks. Monotonic plus wall clock; a clock moved backwards locks |
+| Optional website icons (M5 C) | ⏸ implemented, deployed **OFF** (dormant) | Same-process `/api/favicon`, off unless `KEYMESH_FAVICON=1` and the user opts in.<br>• **Hosts:** public only (address allowlist, pinned connection, normal TLS checks).<br>• **Images:** PNG decoded and re-encoded.<br>• **Storage:** no result cache; `no-store`.<br>• **Not hard limits:** DNS lookups can't be cancelled, and the decode is synchronous; late results are discarded.<br>Live outbound use is not approved yet |
 | Custom short Keymesh PIN | ⛔ blocked | A browser-only PIN does not resist a copied profile (ADR 0003 §3, D2). Use a passkey whose device unlock is a PIN instead |
 | Device slots, mnemonic or keycard encodings | ❌ deferred | ADR 0001 |
 | Keymesh login (mnemonic, image keycards), wallet/identity/KMS, NATS, blockchain | ❌ deferred | Out of scope |

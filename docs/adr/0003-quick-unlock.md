@@ -1,6 +1,6 @@
 # ADR 0003: Quick unlock, auto-lock and master-password custody
 
-* **Status:** **Implemented as experimental in M5 phase C (2026-11-16); independent code review pending.**
+* **Status:** **Implemented as experimental in M5 phase C; independently accepted (`88dee8b`) and privately deployed on 2026-11-16.** It is still synthetic-data only.
   * Covered: the `webauthn-prf` slot (§4.1, exact format in §4.1.1) and deadline-based auto-lock (§4.2).
   * Not covered: real-device capability results (§5 is still open; only Chromium's virtual authenticator was used), real-secret entry, Keymesh login, trust changes.
   * Earlier this ADR was proposal-only; the parent gate decision of 2026-11-16 approved the C1 format for implementation and synthetic tests.
@@ -249,12 +249,11 @@ A recovery-code path remains for each of them where ADR 0002 already allows it.
 ### 4.5 Device loss, revocation and rotation
 
 * **Removing a PRF slot** needs an unlocked vault. Removal deletes the slot entry, but copies made earlier (backups, another browser profile) still carry it.
-* **Lost or stolen authenticator, or a compromised sync account:** removing the slot is not enough, because any copy made earlier still has it. The complete response is a **DEK rotation**. Rotation for password and recovery slots exists since M5 B (ADR 0002 §8, review pending); a PRF slot must be added to its re-enrol-or-revoke extension point before PRF ships. Until then:
-  * the UI must **not** offer or mention rotation as an available action;
-  * it says plainly that removing the slot protects only future copies of this vault, and that copies already taken stay openable with that authenticator;
-  * it advises changing the site credentials stored in the vault.
-  * This gap is why quick unlock stays **experimental and synthetic-data only** until a compromise-response policy is approved (D5): either rotation lands first, or a bounded interim release is approved that states it has no revocation.
-* **When rotation exists** (roadmap item 2): it follows ADR 0001 §3 staging. Every surviving PRF slot needs a fresh PRF evaluation by its own authenticator, or it is invalidated, never silently kept. Rewrap alone is insufficient, because the old slot still opens old copies.
+* **Lost or stolen authenticator, or a compromised sync account:** removing the slot is not enough, because any copy made earlier still has it. The complete response is a **DEK rotation**.
+  * **As implemented (M5 C):** rotation refuses while passkey slots exist, unless the user explicitly confirms revoking them. The rotated vault has none; their authenticators are not present to re-wrap the new DEK, so they are enrolled again afterwards.
+  * **Never silently kept:** a PRF slot that wraps the old DEK is never carried into the rotated vault (test `rotation_never_silently_keeps_prf_slots`).
+  * **Old copies are not revoked:** rotation does not revoke copies already taken; a retained old copy still opens with that authenticator.
+  * **What the UI says:** it explains this, and it advises changing site credentials stored in the vault.
 * **Deleting the passkey at the provider** leaves a stale slot. Unlock fails closed, and the UI offers to remove it.
 * **Rotation never revokes copies an attacker already holds.** It protects revisions written afterwards. Stored site credentials that may have been seen must be changed at those sites.
 
