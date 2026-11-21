@@ -1,7 +1,7 @@
 #!/bin/sh
 # Deploy a CI-built keymesh-web image on the Pi (see deploy/README.md).
 #
-#   KEYMESH_RUNTIME=/path/to/runtime KEYMESH_IMAGE_REPO=<namespace>/keymesh-web \
+#   KEYMESH_IMAGE_REPO=<namespace>/keymesh-web \
 #     deploy/pull-deploy.sh <full 40-hex commit sha> [<namespace>/keymesh-web]
 #
 # 1. Pulls docker.io/<repo>:sha-<sha> and pins it by digest.
@@ -13,13 +13,11 @@
 # 6. Recreates ONLY the web service (--no-deps --no-build) from the digest.
 # 7. Waits for it to be healthy; otherwise rolls back and exits non-zero.
 #
-# It never touches the proxy, certificates, the contents of KEYMESH_RUNTIME
-# (compose only needs the variable to interpolate the file), DNS, VPN or
-# firewall, and never sets KEYMESH_FAVICON. Running it again with the same sha
+# It never touches the host's reverse proxy, certificates, DNS, VPN or firewall,
+# and never sets KEYMESH_FAVICON. Running it again with the same sha
 # is a no-op once that image is running and healthy.
 #
 # Environment:
-#   KEYMESH_RUNTIME             required by compose.yaml (see deploy/README.md)
 #   KEYMESH_IMAGE_REPO          Docker Hub repository <namespace>/<name>, the value of the
 #                               DOCKERHUB_REPOSITORY variable in CI (or the 2nd argument)
 #   KEYMESH_VERIFY_ATTESTATION  auto (default: verify when gh exists) | 1 (require) | 0 (skip)
@@ -44,13 +42,12 @@ die() { printf 'pull-deploy: ERROR: %s\n' "$*" >&2; exit 1; }
 # $SUDO is intentionally unquoted: empty means "no prefix".
 # shellcheck disable=SC2086
 d() { $SUDO docker "$@"; }
-# compose <web image> <args...>: only web is ever named; proxy is never recreated.
+# compose <web image> <args...>: web is the only service, and it is always named.
 # shellcheck disable=SC2086
 compose() {
   img=$1
   shift
-  $SUDO env KEYMESH_RUNTIME="$KEYMESH_RUNTIME" KEYMESH_WEB_IMAGE="$img" \
-    docker compose -f "$COMPOSE_FILE" "$@"
+  $SUDO env KEYMESH_WEB_IMAGE="$img" docker compose -f "$COMPOSE_FILE" "$@"
 }
 label() { d image inspect --format "{{ index .Config.Labels \"$2\" }}" "$1"; }
 web_container() {
@@ -92,7 +89,6 @@ printf '%s' "$NAME" | grep -Eqx '[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0
 REPO=$REGISTRY/$NAME
 case $SHA in *[!0-9a-f]* | '') die "commit sha must be lowercase hex: $SHA" ;; esac
 [ ${#SHA} -eq 40 ] || die "commit sha must be the full 40 characters: $SHA"
-[ -n "${KEYMESH_RUNTIME:-}" ] || die "set KEYMESH_RUNTIME (see deploy/README.md)"
 case $VERIFY in auto | 0 | 1) ;; *) die "KEYMESH_VERIFY_ATTESTATION must be auto, 0 or 1" ;; esac
 REF=$REPO:sha-$SHA
 
