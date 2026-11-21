@@ -2,9 +2,9 @@
 
 Local-first encrypted vault core in Rust, with an Angular browser demo running the same core compiled to WebAssembly.
 
-> **Status: M2 synthetic demo — NOT production ready.** The only key providers are synthetic/demo ones, development-only. Real unlock, recovery and Keymesh's own authentication don't exist yet. Use synthetic data only.
+> **Status: M3 synthetic demo — NOT production ready.** The only key providers are synthetic/demo ones, development-only. Real unlock, recovery and Keymesh's own authentication don't exist yet. Use synthetic data only.
 
-## Capability matrix (M1 core + M2 browser slice)
+## Capability matrix (M1 core, M2 browser slice, M3 UI)
 
 | Area | State | Notes |
 |---|---|---|
@@ -12,7 +12,7 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | AEAD encryption (XChaCha20-Poly1305), versioned envelope, AAD binding | ✅ | KEK → random DEK; per-item records plus an encrypted manifest; see `docs/ARCHITECTURE.md` |
 | Key-provider port | ✅ | Ephemeral (tests) and **synthetic demo** (CLI env var) only |
 | Atomic local persistence, load/edit/save, encrypted backup/restore | ✅ | Fails closed on a wrong key, corruption, truncation or an unknown format; lost-update guard |
-| Password generator (24 default / 32 strong, custom allowlist, unbiased sampling) | ✅ | |
+| Password generator (24 default / 32 strong presets, custom length 8–128, character types, custom ASCII-punctuation symbol set, look-alike exclusion, one-of-each-type; unbiased sampling) | ✅ | Same 64-bit floor for custom settings, checked against the generator's exact min-entropy |
 | Random 256-bit secrets (hex / base64url / base32) | ✅ | Local random values, not provider-issued credentials |
 | Passphrase generator | ⏳ pending | No reviewed, versioned wordlist bundled |
 | Ed25519 generation, storage, RFC 8032 vectors, OpenSSH public-key line | ✅ | No signing API; no private-key export formats |
@@ -20,7 +20,10 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | TOTP QR decode | ⏳ deferred | Future UI adapter |
 | Import from 1Password via `op` CLI (explicit item or `op://` ref) | ✅ (fixtures only) | Tested only with a fake `op` and synthetic fixtures; not yet run against a real account |
 | WASM bridge (`crates/keymesh-wasm`, wasm-bindgen 0.2.129) | ✅ runs in browser | Validation, encryption, generators, Ed25519 and TOTP execute in headless Chromium (Playwright E2E) |
-| Angular 22 app (`apps/web`): list/search/filter/create/edit/delete all 7 item types | ✅ | Per-type forms; secrets masked, explicit reveal/copy; responsive; accessible labels; "synthetic demo" banner |
+| Angular 22 app (`apps/web`): list/search/filter/create/edit/delete all 7 item types | ✅ | Per-type forms with inline validation; secrets masked, explicit reveal/copy; in-app confirmation for destructive actions; persistent "synthetic demo" warning |
+| UI design system (M3) | ✅ | Semantic tokens, local icon set, system fonts; desktop sidebar + list/detail, mobile single column with bottom navigation; keyboard and screen-reader labels, visible focus, reduced motion; see `docs/DESIGN.md` |
+| Runtime language: 繁體中文 (zh-TW) / English | ✅ | Typed catalogs (missing key = build error); default from browser language; explicit choice persisted; switching keeps form input and never writes the vault; localized, secret-free error messages |
+| Appearance: System / Light / Dark | ✅ | System follows the OS live; explicit choice overrides it; applied before first paint without inline script; only `{locale, theme}` stored, under `keymesh.settings.v1` |
 | Browser generators → encrypted items | ✅ | Password, random secret, Ed25519 generated inside WASM and stored directly; passphrase still pending |
 | Browser TOTP: live code + remaining time, otpauth URI / Base32 entry | ✅ | Clock injectable (E2E uses Playwright's clock); QR/camera scanning ❌ not implemented |
 | IndexedDB persistence of the encrypted envelope only | ✅ | No plaintext, key or search index stored; E2E checks that planted markers are absent |
@@ -42,6 +45,7 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 - **Browser key handling (M2):** the demo key provider lives in WASM memory only.
   - With the *ephemeral* key, a reload loses the key, and the stored demo ciphertext becomes permanently inaccessible.
   - The *synthetic fixture* key is public: anyone can decrypt data stored under it.
+- **UI (M3):** E2E runs in Chromium only; Firefox and Safari are untested. Theme tokens use CSS `light-dark()`, which needs Chrome/Edge 123+, Firefox 120+ or Safari 17.5+. Chinese text uses whatever Traditional Chinese system font is installed (no bundled fonts). The zh-TW catalog was written and checked in-project, without a separate professional or native-speaker review.
 - **Browser memory:** JavaScript and WASM cannot guarantee zeroization. Revealed or copied values, form inputs and the clipboard are outside Keymesh's control. Lock removes decrypted vault state in WASM, but the browser may still retain copies.
 
 ## Build and test

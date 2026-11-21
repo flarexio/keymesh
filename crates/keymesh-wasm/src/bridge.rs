@@ -9,7 +9,8 @@
 use keymesh::crypto::{EphemeralKeyProvider, Key256, KeyProvider};
 use keymesh::ed25519::Ed25519KeyPair;
 use keymesh::generate::{
-    generate_password, generate_secret, PasswordPolicy, PasswordProfile, SecretEncoding,
+    generate_password, generate_secret, PasswordOptions, PasswordPolicy, PasswordProfile,
+    PolicySummary, SecretEncoding,
 };
 use keymesh::model::{
     Contact, CryptoWalletRecord, CustomField, Ed25519KeyRecord, FieldKind, Item, ItemData, ItemId,
@@ -22,6 +23,7 @@ use keymesh::totp::{code_now, parse_base32_secret, parse_otpauth_uri, FixedClock
 use keymesh::vault::{read_header, Vault};
 use keymesh::{Error, Result};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 /// Same bound as native storage: the browser refuses larger envelopes.
@@ -485,6 +487,16 @@ pub struct Session {
     pending: Option<u64>,
     /// Same bound as [`Session::open`]; smaller only in tests.
     max_bytes: usize,
+    /// Values shown to the user before saving; see [`Session::save_preview`].
+    previews: Previews,
+}
+
+/// The latest generated-but-unsaved value per generator. Zeroized on drop,
+/// replaced by every new preview and dropped on lock.
+#[derive(Default)]
+struct Previews {
+    password: Option<SecretString>,
+    secret: Option<(SecretString, SecretEncoding)>,
 }
 
 impl Session {
@@ -494,6 +506,7 @@ impl Session {
             vault: Some(vault),
             pending: None,
             max_bytes: MAX_ENVELOPE_BYTES,
+            previews: Previews::default(),
         }
     }
 
@@ -520,6 +533,7 @@ impl Session {
         self.vault = None;
         self.committed = None;
         self.pending = None;
+        self.previews = Previews::default();
     }
 
     pub fn is_locked(&self) -> bool {
@@ -919,6 +933,102 @@ impl Session {
         Ok(self.vm()?.insert(item)?.to_string())
     }
 
+    /// Like [`Session::generate_password_item`], with user settings
+    /// (validated before any random number is drawn).
+    pub fn generate_password_item_with(
+        &mut self,
+        title: &str,
+        options_json: &str,
+        service: &str,
+    ) -> Result<String> {
+        let pw = generate_password(&parse_password_options(options_json)?, &mut OsRandom)?;
+        let data = ItemData::Secret(SecretCredential {
+            secret: pw,
+            format: SecretFormat::Text,
+            origin: SecretOrigin::Generated,
+            username: None,
+            service: text(Some(service.into())),
+            expires_at: None,
+        });
+        let item = self.new_item(title.into(), data)?;
+        Ok(self.vm()?.insert(item)?.to_string())
+    }
+
+    /// Generate a password with user settings (validated before any random
+    /// number is drawn) and keep it as the current password preview. The
+    /// returned copy is what the user sees; [`Session::save_preview`] stores
+    /// exactly this value.
+    pub fn preview_password(&mut self, options_json: &str) -> Result<Zeroizing<String>> {
+        self.v()?;
+        self.previews.password = None;
+        let pw = gen_password_with(options_json)?;
+        let shown = Zeroizing::new(pw.expose().to_owned());
+        self.previews.password = Some(pw);
+        Ok(shown)
+    }
+
+    /// Like [`Session::preview_password`], for an encoded random secret.
+    pub fn preview_secret(&mut self, n_bytes: usize, encoding: &str) -> Result<Zeroizing<String>> {
+        self.v()?;
+        self.previews.secret = None;
+        let enc = parse_encoding(encoding)?;
+        let secret = generate_secret(n_bytes, enc, &mut OsRandom)?;
+        let shown = Zeroizing::new(secret.expose().to_owned());
+        self.previews.secret = Some((secret, enc));
+        Ok(shown)
+    }
+
+    /// Store the current preview of `kind` ("password" or "secret") as a
+    /// generated Secret item. `shown` must equal that preview exactly, so a
+    /// replaced, discarded or already saved preview is refused instead of
+    /// silently storing something else. The preview is consumed on success
+    /// and kept when validation fails.
+    pub fn save_preview(
+        &mut self,
+        kind: &str,
+        shown: &str,
+        title: &str,
+        service: &str,
+    ) -> Result<String> {
+        self.v()?;
+        let (secret, format) = match kind {
+            "password" => (self.previews.password.as_ref(), SecretFormat::Text),
+            "secret" => match &self.previews.secret {
+                Some((v, enc)) => (Some(v), SecretFormat::Encoded(*enc)),
+                None => (None, SecretFormat::Text),
+            },
+            _ => return Err(Error::Validation("unknown preview".into())),
+        };
+        let secret = match secret {
+            Some(v) if bool::from(v.expose().as_bytes().ct_eq(shown.as_bytes())) => v.clone(),
+            _ => {
+                return Err(Error::Validation(
+                    "generated value is no longer available".into(),
+                ))
+            }
+        };
+        let data = ItemData::Secret(SecretCredential {
+            secret,
+            format,
+            origin: SecretOrigin::Generated,
+            username: None,
+            service: text(Some(service.into())),
+            expires_at: None,
+        });
+        let item = self.new_item(title.into(), data)?;
+        let id = self.vm()?.insert(item)?.to_string();
+        match kind {
+            "password" => self.previews.password = None,
+            _ => self.previews.secret = None,
+        }
+        Ok(id)
+    }
+
+    /// Forget all previews (the generator view was closed).
+    pub fn discard_previews(&mut self) {
+        self.previews = Previews::default();
+    }
+
     /// Seal the next revision without changing the session. The caller
     /// persists the bytes and then calls [`Session::commit`].
     ///
@@ -988,6 +1098,29 @@ pub fn gen_password(profile: &str, length: usize, alphabet: &str) -> Result<Secr
         PasswordPolicy::allowlist(length, alphabet)?
     };
     generate_password(&pol, &mut OsRandom)
+}
+
+/// Largest accepted password-options JSON; bounds parsing work.
+pub const MAX_OPTIONS_JSON: usize = 2048;
+
+/// Strict JSON `PasswordOptions` (camelCase, no unknown or missing fields)
+/// to a validated policy.
+pub fn parse_password_options(json: &str) -> Result<PasswordPolicy> {
+    if json.len() > MAX_OPTIONS_JSON {
+        return Err(Error::Policy("password options too large".into()));
+    }
+    let o: PasswordOptions = serde_json::from_str(json)
+        .map_err(|_| Error::Policy("malformed password options".into()))?;
+    PasswordPolicy::from_options(&o)
+}
+
+pub fn gen_password_with(options_json: &str) -> Result<SecretString> {
+    generate_password(&parse_password_options(options_json)?, &mut OsRandom)
+}
+
+/// Validate settings and describe them; draws no random numbers.
+pub fn password_policy_summary(options_json: &str) -> Result<PolicySummary> {
+    Ok(parse_password_options(options_json)?.summary())
 }
 
 pub fn gen_secret(n_bytes: usize, encoding: &str) -> Result<SecretString> {
@@ -1277,6 +1410,99 @@ mod tests {
         assert!(Session::open(&eb, &e).is_ok());
     }
 
+    fn opts(j: serde_json::Value) -> String {
+        let mut base = serde_json::json!({
+            "length": 24, "lowercase": true, "uppercase": true, "digits": true, "symbols": true,
+            "symbolSet": "!#$%&()*+,-./:;<=>?@[]^_{|}~", "excludeAmbiguous": false, "requireEachClass": true
+        });
+        for (k, v) in j.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        base.to_string()
+    }
+
+    #[test]
+    fn password_options_api_is_strict_and_typed() {
+        let pw = gen_password_with(&opts(serde_json::json!({"length": 40, "lowercase": false,
+            "symbolSet": "#@!", "excludeAmbiguous": true})))
+        .unwrap();
+        let s = pw.expose();
+        assert_eq!(s.chars().count(), 40);
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || "#@!".contains(c)));
+        assert!(!s.chars().any(|c| "Il1O0o".contains(c)));
+        // Unknown, missing, wrongly typed or oversized options are refused.
+        let mut extra: serde_json::Value =
+            serde_json::from_str(&opts(serde_json::json!({}))).unwrap();
+        extra["alphabet"] = "ab".into();
+        assert!(gen_password_with(&extra.to_string()).is_err());
+        let mut missing = extra.clone();
+        missing.as_object_mut().unwrap().remove("alphabet");
+        missing.as_object_mut().unwrap().remove("requireEachClass");
+        assert!(gen_password_with(&missing.to_string()).is_err());
+        assert!(gen_password_with(&opts(serde_json::json!({"length": 24.5}))).is_err());
+        assert!(gen_password_with(&opts(serde_json::json!({"length": -1}))).is_err());
+        assert!(gen_password_with(&opts(serde_json::json!({"symbols": "yes"}))).is_err());
+        let huge = opts(serde_json::json!({"symbolSet": "!".repeat(MAX_OPTIONS_JSON)}));
+        assert!(gen_password_with(&huge)
+            .unwrap_err()
+            .to_string()
+            .contains("too large"));
+        assert!(
+            gen_password_with(&opts(serde_json::json!({"symbolSet": "ab"})))
+                .unwrap_err()
+                .to_string()
+                .contains("ASCII punctuation")
+        );
+    }
+
+    #[test]
+    fn password_policy_summary_validates_without_generating() {
+        let s = password_policy_summary(&opts(serde_json::json!({"symbolSet": "!!@@"}))).unwrap();
+        assert_eq!((s.length, s.alphabet_size, s.classes), (24, 64, 4));
+        assert!(s.min_entropy_bits >= 64.0 && s.min_entropy_bits < s.upper_bound_bits);
+        let j = serde_json::to_value(&s).unwrap();
+        assert!(j["minEntropyBits"].is_f64() && j["upperBoundBits"].is_f64());
+        // Reviewer's case: upper bound above 64, real output below; refused.
+        assert!(password_policy_summary(&opts(
+            serde_json::json!({"length": 11, "symbolSet": "!"})
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("entropy"));
+        assert!(
+            password_policy_summary(&opts(serde_json::json!({"length": 8})))
+                .unwrap_err()
+                .to_string()
+                .contains("entropy")
+        );
+    }
+
+    #[test]
+    fn generated_password_item_uses_the_options_and_round_trips() {
+        let (k, mut s) = session();
+        let o = opts(
+            serde_json::json!({"length": 30, "lowercase": false, "uppercase": false,
+            "symbols": false, "digits": true}),
+        );
+        let id = s
+            .generate_password_item_with("Synthetic PIN-like", &o, "svc")
+            .unwrap();
+        let bytes = persist(&mut s, &k);
+        let s2 = Session::open(&bytes, &DemoKey::fixture()).unwrap();
+        let pw = s2.reveal(&id, "secret").unwrap();
+        assert_eq!(pw.chars().count(), 30);
+        assert!(pw.chars().all(|c| c.is_ascii_digit()));
+        // Invalid options change nothing.
+        let before = s2.list("", "").unwrap().len();
+        let mut s3 = s2;
+        assert!(s3
+            .generate_password_item_with("x", &opts(serde_json::json!({"length": 8})), "")
+            .is_err());
+        assert_eq!(s3.list("", "").unwrap().len(), before);
+    }
+
     #[test]
     fn generators() {
         assert_eq!(
@@ -1299,5 +1525,84 @@ mod tests {
         assert!(gen_password("", 4, "ab").is_err());
         assert_eq!(gen_secret(32, "hex").unwrap().len(), 64);
         assert!(gen_secret(32, "rot13").is_err());
+    }
+
+    #[test]
+    fn previewed_password_is_saved_exactly_and_only_once() {
+        let (k, mut s) = session();
+        let o = opts(serde_json::json!({"length": 40, "lowercase": false}));
+        let shown = s.preview_password(&o).unwrap();
+        assert_eq!(shown.chars().count(), 40);
+        let id = s
+            .save_preview("password", &shown, "Synthetic preview", "svc")
+            .unwrap();
+        // Saved once: a second click (or a stale tab) has nothing to save.
+        assert!(s.save_preview("password", &shown, "again", "").is_err());
+        assert_eq!(s.list("", "").unwrap().len(), 1);
+        let bytes = persist(&mut s, &k);
+        let s2 = Session::open(&bytes, &DemoKey::fixture()).unwrap();
+        assert!(s2.reveal(&id, "secret").unwrap().as_str() == shown.as_str());
+        let v = s2.get(&id).unwrap();
+        assert_eq!(v.data["origin"], "generated");
+        assert_eq!(v.data["format"], "text");
+        assert_eq!(v.data["service"], "svc");
+    }
+
+    #[test]
+    fn save_preview_accepts_only_the_current_preview() {
+        let (_k, mut s) = session();
+        let o = opts(serde_json::json!({}));
+        // Nothing generated yet.
+        assert!(s.save_preview("password", "x", "t", "").is_err());
+        let first = s.preview_password(&o).unwrap();
+        let second = s.preview_password(&o).unwrap();
+        // A replaced preview, or any other value, is refused; nothing stored.
+        assert!(s.save_preview("password", &first, "t", "").is_err());
+        assert!(s
+            .save_preview("password", "not-the-preview", "t", "")
+            .is_err());
+        assert!(s.save_preview("secret", &second, "t", "").is_err());
+        assert!(s.save_preview("bogus", &second, "t", "").is_err());
+        // A validation failure keeps the preview for a corrected retry.
+        assert!(s.save_preview("password", &second, "", "").is_err());
+        assert!(s.list("", "").unwrap().is_empty());
+        assert!(s.save_preview("password", &second, "ok", "").is_ok());
+        // Invalid settings draw nothing and leave no preview behind.
+        assert!(s
+            .preview_password(&opts(serde_json::json!({"length": 8})))
+            .is_err());
+        assert!(s.save_preview("password", &second, "t", "").is_err());
+    }
+
+    #[test]
+    fn previewed_random_secret_keeps_its_encoding() {
+        let (_k, mut s) = session();
+        let shown = s.preview_secret(32, "hex").unwrap();
+        assert_eq!(shown.len(), 64);
+        let pw = s.preview_password(&opts(serde_json::json!({}))).unwrap();
+        // Separate slots: the password preview did not replace the secret.
+        let id = s
+            .save_preview("secret", &shown, "Synthetic hex", "")
+            .unwrap();
+        assert!(s.reveal(&id, "secret").unwrap().as_str() == shown.as_str());
+        assert_eq!(s.get(&id).unwrap().data["format"], "hex");
+        assert_eq!(s.get(&id).unwrap().data["origin"], "generated");
+        assert!(s.save_preview("password", &pw, "pw", "").is_ok());
+        assert!(s.preview_secret(8, "hex").is_err());
+        assert!(s.preview_secret(32, "rot13").is_err());
+    }
+
+    #[test]
+    fn discard_and_lock_drop_previews() {
+        let (_k, mut s) = session();
+        let o = opts(serde_json::json!({}));
+        let shown = s.preview_password(&o).unwrap();
+        s.discard_previews();
+        assert!(s.save_preview("password", &shown, "t", "").is_err());
+        let shown = s.preview_password(&o).unwrap();
+        s.lock();
+        assert!(s.save_preview("password", &shown, "t", "").is_err());
+        assert!(s.preview_password(&o).is_err());
+        assert!(s.preview_secret(32, "hex").is_err());
     }
 }

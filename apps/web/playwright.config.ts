@@ -14,6 +14,9 @@ export default defineConfig({
   outputDir: 'test-results',
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
+    // Deterministic defaults; locale/theme tests override these per context.
+    locale: 'en-US',
+    colorScheme: 'light',
     trace: 'off',
     video: 'off',
     screenshot: 'off',

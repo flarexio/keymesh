@@ -5,7 +5,9 @@
  */
 import { TestBed } from '@angular/core/testing';
 import { IDBFactory } from 'fake-indexeddb';
-import { CORE_LOADER, StaleWorkError, VAULT_STORE, VaultService } from './vault.service';
+import { CORE_LOADER, LockedError, StaleWorkError, VAULT_STORE, VaultService } from './vault.service';
+import { errorKey } from './errors';
+import { PASSWORD_PRESETS } from './password-options';
 import { ConflictError, StoredVault, VaultStore } from './vault-store';
 import { FIXTURE_KEY_ID } from './types';
 import type { Core } from './wasm';
@@ -55,6 +57,22 @@ class FakeSession {
   list() {
     return JSON.stringify(this.items.map((t) => ({ id: t, kind: 'secure_note', title: t, subtitle: null, tags: [] })));
   }
+  /** Mirrors the core's preview slots: exact match, consumed on save. */
+  previews: Record<string, string> = {};
+  savePreviewCalls = 0;
+  previewPassword() {
+    return (this.previews['password'] = `pv-${++counter}`);
+  }
+  savePreview(kind: string, shown: string, title: string) {
+    this.savePreviewCalls++;
+    if (this.previews[kind] !== shown) throw new Error('validation failed: generated value is no longer available');
+    delete this.previews[kind];
+    this.items.push(title);
+    return title;
+  }
+  discardPreviews() {
+    this.previews = {};
+  }
   createItem(json: string) {
     const t = (JSON.parse(json) as { title: string }).title;
     this.items.push(t);
@@ -87,17 +105,21 @@ const fakeCore = {
   },
   VaultSession: FakeSession,
   generatePassword: () => 'x',
-  generateRandomSecret: () => 'x',
 } as unknown as Core;
 
-/** Store whose compareAndSwap can be paused before it reaches IndexedDB. */
+/**
+ * Store whose compareAndSwap can be paused before it reaches IndexedDB
+ * (`gate`, still cancellable) or after the write committed (`afterCommit`).
+ */
 class GatedStore extends VaultStore {
   gate: Promise<void> | null = null;
+  afterCommit: Promise<void> | null = null;
   writes = 0;
-  override async compareAndSwap(expected: Uint8Array | null, next: StoredVault): Promise<void> {
+  override async compareAndSwap(expected: Uint8Array | null, next: StoredVault, guard?: () => void): Promise<void> {
     if (this.gate) await this.gate;
     this.writes++;
-    return super.compareAndSwap(expected, next);
+    await super.compareAndSwap(expected, next, guard);
+    if (this.afterCommit) await this.afterCommit;
   }
 }
 
@@ -176,11 +198,11 @@ describe('VaultService lock / restore / concurrency', () => {
     expect(vault.status()).toBe('locked');
     expect(vault.items()).toEqual([]);
     expect(candidate.freed).toBe(true);
-    // The verified backup was persisted; unlocking reads it (no plaintext
-    // was repopulated by the cancelled operation itself).
-    expect(Array.from((await store.read())!.bytes)).toEqual(Array.from(backup));
+    // The write had not started: it was cancelled at the storage boundary,
+    // so the stored ciphertext is unchanged and unlocking reads the original.
+    expect((await store.read())!.revision).toBe(3);
     await vault.openStored();
-    expect(vault.revision()).toBe(7);
+    expect(vault.revision()).toBe(3);
   });
 
   it('a restore queued before a lock never starts', async () => {
@@ -207,7 +229,7 @@ describe('VaultService lock / restore / concurrency', () => {
     await expect(restore).rejects.toBeInstanceOf(StaleWorkError);
     expect(reads()).toBe(0);
     expect(vault.status()).toBe('locked');
-    expect((await store.read())!.revision).toBe(4); // only the slow mutation's write landed
+    expect((await store.read())!.revision).toBe(3); // the waiting write was cancelled too
   });
 
   it('a stale tab cannot restore, and storage is untouched', async () => {
@@ -277,5 +299,99 @@ describe('VaultService lock / restore / concurrency', () => {
     hold.resolve();
     await expect(open).rejects.toBeInstanceOf(StaleWorkError);
     expect(vault.status()).toBe('locked');
+  });
+  describe('saving a generated preview', () => {
+    it('stores exactly the shown value once; a duplicate save is refused and writes nothing', async () => {
+      await unlockedWith(3);
+      const shown = vault.previewPassword(PASSWORD_PRESETS.default);
+      await expect(vault.savePreview('password', shown, 'gen')).resolves.toBe('gen');
+      expect(store.writes).toBe(1);
+      expect(vault.revision()).toBe(4);
+      const dup = vault.savePreview('password', shown, 'gen');
+      await expect(dup).rejects.toThrow(/no longer available/);
+      expect(errorKey(await dup.catch((e) => e))).toBe('errors.previewGone');
+      expect(store.writes).toBe(1);
+      expect(vault.revision()).toBe(4);
+    });
+
+    it('a save invoked before a lock never reaches the core or storage', async () => {
+      await unlockedWith(3);
+      const session = sessions[sessions.length - 1];
+      const shown = vault.previewPassword(PASSWORD_PRESETS.default);
+      const save = vault.savePreview('password', shown, 'gen');
+      vault.lock();
+      await expect(save).rejects.toBeInstanceOf(StaleWorkError);
+      expect(session.savePreviewCalls).toBe(0);
+      expect(store.writes).toBe(0);
+      expect(() => vault.previewPassword(PASSWORD_PRESETS.default)).toThrow(LockedError);
+    });
+
+    it('lock during the write: success is never reported and the freed session is not committed', async () => {
+      await unlockedWith(3);
+      const session = sessions[sessions.length - 1];
+      const shown = vault.previewPassword(PASSWORD_PRESETS.default);
+      const hold = deferred();
+      store.gate = hold.promise;
+      const save = vault.savePreview('password', shown, 'gen');
+      for (let i = 0; i < 50 && session.pending === null; i++) await new Promise((r) => setTimeout(r, 0));
+      vault.lock();
+      store.gate = null;
+      hold.resolve();
+      const err = await save.catch((e) => e);
+      expect(err).toBeInstanceOf(StaleWorkError);
+      expect((err as StaleWorkError).committed).toBe(false);
+      expect(errorKey(err)).toBe('errors.cancelled');
+      expect(session.revision()).toBe(3); // never committed
+      expect(vault.status()).toBe('locked');
+      expect(vault.items()).toEqual([]);
+      // Ciphertext unchanged: the write was still waiting when the lock came.
+      expect((await store.read())!.revision).toBe(3);
+    });
+
+    it('a queued save behind a pending one is cancelled too; storage unchanged', async () => {
+      await unlockedWith(3);
+      const session = sessions[sessions.length - 1];
+      const hold = deferred();
+      store.gate = hold.promise;
+      const first = vault.savePreview('password', vault.previewPassword(PASSWORD_PRESETS.default), 'one');
+      for (let i = 0; i < 50 && session.pending === null; i++) await new Promise((r) => setTimeout(r, 0));
+      const queued = vault.createItem({ title: 'two', tags: [], notes: null, custom_fields: [], data: { kind: 'secure_note', body: 'x' } });
+      vault.lock();
+      store.gate = null;
+      hold.resolve();
+      await expect(first).rejects.toBeInstanceOf(StaleWorkError);
+      await expect(queued).rejects.toBeInstanceOf(StaleWorkError);
+      expect((await store.read())!.revision).toBe(3);
+      await vault.openStored();
+      expect(vault.items()).toEqual([]);
+    });
+
+    it('a write that committed before the lock is reported as saved-but-locked, never as success', async () => {
+      await unlockedWith(3);
+      const session = sessions[sessions.length - 1];
+      const hold = deferred();
+      store.afterCommit = hold.promise;
+      const save = vault.savePreview('password', vault.previewPassword(PASSWORD_PRESETS.default), 'gen');
+      for (let i = 0; i < 50 && (await store.read())!.revision !== 4; i++) await new Promise((r) => setTimeout(r, 0));
+      vault.lock();
+      store.afterCommit = null;
+      hold.resolve();
+      const err = await save.catch((e) => e);
+      expect(err).toBeInstanceOf(StaleWorkError);
+      expect((err as StaleWorkError).committed).toBe(true);
+      expect(errorKey(err)).toBe('errors.lockedAfterSave');
+      expect(session.revision()).toBe(3); // the freed session is never touched
+      expect(vault.status()).toBe('locked');
+      await vault.openStored();
+      expect(vault.revision()).toBe(4); // unlock reads the committed ciphertext
+    });
+
+    it('a stale tab cannot save a preview', async () => {
+      await unlockedWith(3);
+      const shown = vault.previewPassword(PASSWORD_PRESETS.default);
+      vault.status.set('stale');
+      await expect(vault.savePreview('password', shown, 'gen')).rejects.toBeInstanceOf(ConflictError);
+      expect(store.writes).toBe(0);
+    });
   });
 });

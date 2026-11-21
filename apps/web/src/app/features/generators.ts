@@ -1,121 +1,265 @@
-import { Component, inject, output, signal } from '@angular/core';
+import { Component, OnDestroy, computed, inject, output, signal } from '@angular/core';
+import { errorKey } from '../core/errors';
+import { I18n, MessageKey } from '../core/i18n/i18n.service';
+import { GeneratedDraft } from '../core/generated-draft';
+import { PasswordSettings, sameOptions } from '../core/password-options';
 import { VaultService } from '../core/vault.service';
+import { ToastService } from '../shared/feedback';
+import { GeneratedPassword } from '../shared/generated-password';
+import { Icon } from '../shared/icon';
+import { PasswordOptionsPanel, passwordProblem } from '../shared/password-options';
+
+type TitleField = 'pw' | 'secret' | 'key';
+
+const DEFAULT_TITLES: Record<TitleField, MessageKey> = {
+  pw: 'gen.pw.defaultTitle',
+  secret: 'gen.secret.defaultTitle',
+  key: 'gen.key.defaultTitle',
+};
+
+type SecretParams = { bytes: string; encoding: string };
 
 /**
  * Generators run in the Rust core (OS CSPRNG via `crypto.getRandomValues`).
- * "Save" actions generate the value *inside* WASM and store it directly as an
- * encrypted item; the preview is only for copying elsewhere.
+ *
+ * Password and random secret: Generate shows a masked preview that the core
+ * also keeps; Save stores exactly that preview (the core refuses any other
+ * value) and consumes it, so a double click or a second tab cannot save it
+ * twice. A preview made with other settings than the current ones is shown
+ * as outdated and cannot be saved. Previews are dropped when this view is
+ * left or the vault locks. The Ed25519 key is generated and stored in one
+ * step; only its public key is ever shown.
+ *
+ * Default titles follow the language until the user edits them; edited
+ * values are never replaced by a language switch.
  */
 @Component({
   selector: 'km-generators',
+  imports: [Icon, PasswordOptionsPanel, GeneratedPassword],
   template: `
-    <section class="panel" aria-labelledby="gen-title">
-      <h2 id="gen-title">Generators</h2>
+    <div class="page">
+      <header class="page-head">
+        <h2 id="gen-title">{{ i18n.t('gen.title') }}</h2>
+        <p class="lead">{{ i18n.t('gen.lead') }}</p>
+      </header>
+      <div class="card-grid">
+        <section class="card tool-card tool-card-wide" aria-labelledby="gen-pw">
+          <h3 id="gen-pw" class="card-title"><km-icon name="key" />{{ i18n.t('gen.pw.title') }}</h3>
+          <km-password-options />
+          <div class="field">
+            <label class="field-label" for="gen-pw-title">{{ i18n.t('gen.savedTitle') }}</label>
+            <input id="gen-pw-title" [value]="title('pw')" (input)="setTitle('pw', $event)" />
+          </div>
+          @if (pwDraft.current(); as v) {
+            <km-generated-password [value]="v" [label]="i18n.t('gen.pw.result')" />
+          } @else if (pwDraft.outdated()) {
+            <div class="callout callout-info" data-testid="generated-outdated"><km-icon name="info" /><p>{{ i18n.t('gen.outdated') }}</p></div>
+          }
+          <div class="tool-actions">
+            <button type="button" class="btn" data-testid="generate-password" [disabled]="!!pwProblem() || busy()" (click)="previewPassword()">
+              <km-icon name="dice" /><span>{{ i18n.t('gen.preview') }}</span>
+            </button>
+            <button type="button" class="btn btn-primary" data-testid="save-password" [disabled]="!pwDraft.current() || busy()"
+              (click)="savePassword()" aria-describedby="gen-pw-save-hint">
+              <km-icon name="plus" /><span>{{ i18n.t(saving() === 'password' ? 'gen.saving' : 'gen.save') }}</span>
+            </button>
+          </div>
+          <p id="gen-pw-save-hint" class="field-hint" data-testid="save-password-hint">
+            {{ i18n.t(pwDraft.current() ? 'gen.pw.saveHint' : 'gen.pw.none') }}
+          </p>
+        </section>
 
-      <fieldset>
-        <legend>Password</legend>
-        <label>Profile
-          <select #profile>
-            <option value="default">Default (24 characters)</option>
-            <option value="strong">Strong (32 characters)</option>
-          </select>
-        </label>
-        <label>Title for saved item <input #pwTitle value="Generated password" /></label>
-        <div class="actions">
-          <button type="button" (click)="preview('pw', profile.value)">Preview</button>
-          <button type="button" class="primary" (click)="savePassword(pwTitle.value, profile.value)">Generate &amp; save as Secret</button>
-        </div>
-        @if (shown()['pw']; as v) {
-          <p class="mono preview" data-testid="password-preview">{{ v }}</p>
-        }
-      </fieldset>
+        <section class="card tool-card" aria-labelledby="gen-secret">
+          <h3 id="gen-secret" class="card-title"><km-icon name="dice" />{{ i18n.t('gen.secret.title') }}</h3>
+          <div class="field-grid">
+            <div class="field">
+              <label class="field-label" for="gen-bytes">{{ i18n.t('gen.secret.bytes') }}</label>
+              <input id="gen-bytes" type="number" min="16" max="1024" inputmode="numeric" [value]="bytes()"
+                (input)="bytes.set(value($event))" [attr.aria-invalid]="!bytesValid()" aria-describedby="gen-bytes-hint" />
+            </div>
+            <div class="field">
+              <label class="field-label" for="gen-enc">{{ i18n.t('gen.secret.encoding') }}</label>
+              <select id="gen-enc" [value]="encoding()" (change)="encoding.set(value($event))">
+                <option value="hex">hex</option>
+                <option value="base64url">base64url</option>
+                <option value="base32">base32</option>
+              </select>
+            </div>
+          </div>
+          <p id="gen-bytes-hint" class="field-hint" [class.field-error]="!bytesValid()">{{ i18n.t('gen.secret.bytesHint') }}</p>
+          <div class="field">
+            <label class="field-label" for="gen-secret-title">{{ i18n.t('gen.savedTitle') }}</label>
+            <input id="gen-secret-title" [value]="title('secret')" (input)="setTitle('secret', $event)" />
+          </div>
+          <p class="field-hint">{{ i18n.t('gen.secret.notProvider') }}</p>
+          @if (secretDraft.current(); as v) {
+            <km-generated-password [value]="v" [label]="i18n.t('gen.secret.result')" />
+          } @else if (secretDraft.outdated()) {
+            <div class="callout callout-info"><km-icon name="info" /><p>{{ i18n.t('gen.outdated') }}</p></div>
+          }
+          <div class="tool-actions">
+            <button type="button" class="btn" data-testid="generate-secret" [disabled]="!bytesValid() || busy()" (click)="previewSecret()">
+              <km-icon name="dice" /><span>{{ i18n.t('gen.preview') }}</span>
+            </button>
+            <button type="button" class="btn btn-primary" data-testid="save-secret" [disabled]="!secretDraft.current() || busy()"
+              (click)="saveSecret()" aria-describedby="gen-secret-save-hint">
+              <km-icon name="plus" /><span>{{ i18n.t(saving() === 'secret' ? 'gen.saving' : 'gen.save') }}</span>
+            </button>
+          </div>
+          <p id="gen-secret-save-hint" class="field-hint">
+            {{ i18n.t(secretDraft.current() ? 'gen.secret.saveHint' : 'gen.secret.none') }}
+          </p>
+        </section>
 
-      <fieldset>
-        <legend>Random secret (256-bit default)</legend>
-        <label>Bytes <input #bytes type="number" min="16" max="1024" value="32" /></label>
-        <label>Encoding
-          <select #enc>
-            <option value="hex">hex</option>
-            <option value="base64url">base64url</option>
-            <option value="base32">base32</option>
-          </select>
-        </label>
-        <label>Title for saved item <input #secTitle value="Generated secret" /></label>
-        <p class="hint">A local random value, not a provider-issued API credential.</p>
-        <div class="actions">
-          <button type="button" (click)="previewSecret(+bytes.value, enc.value)">Preview</button>
-          <button type="button" class="primary" (click)="saveSecret(secTitle.value, +bytes.value, enc.value)">Generate &amp; save as Secret</button>
-        </div>
-        @if (shown()['secret']; as v) {
-          <p class="mono preview">{{ v }}</p>
-        }
-      </fieldset>
+        <section class="card tool-card" aria-labelledby="gen-key">
+          <h3 id="gen-key" class="card-title"><km-icon name="signature" />{{ i18n.t('gen.key.title') }}</h3>
+          <div class="field">
+            <label class="field-label" for="gen-key-title">{{ i18n.t('field.title') }}</label>
+            <input id="gen-key-title" [value]="title('key')" (input)="setTitle('key', $event)" />
+          </div>
+          <div class="field">
+            <label class="field-label" for="gen-key-comment">{{ i18n.t('field.comment') }}</label>
+            <input id="gen-key-comment" [value]="comment()" (input)="comment.set(value($event))" />
+          </div>
+          <p class="field-hint">{{ i18n.t('gen.key.hint') }}</p>
+          <div class="tool-actions">
+            <button type="button" class="btn btn-primary" [disabled]="busy()" (click)="saveKey()"><km-icon name="plus" /><span>{{ i18n.t('gen.key.save') }}</span></button>
+          </div>
+        </section>
 
-      <fieldset>
-        <legend>Ed25519 key pair</legend>
-        <label>Title <input #keyTitle value="Generated Ed25519 key" /></label>
-        <label>Comment <input #keyComment value="" /></label>
-        <button type="button" class="primary" (click)="saveKey(keyTitle.value, keyComment.value)">Generate &amp; save key</button>
-      </fieldset>
-
-      <fieldset>
-        <legend>Passphrase</legend>
-        <p class="hint">Pending: no reviewed, versioned wordlist is bundled yet.</p>
-        <button type="button" disabled>Generate passphrase</button>
-      </fieldset>
-
-      @if (message()) {
-        <p role="status">{{ message() }}</p>
+        <section class="card tool-card muted-card" aria-labelledby="gen-pass">
+          <h3 id="gen-pass" class="card-title"><km-icon name="note" />{{ i18n.t('gen.passphrase.title') }}</h3>
+          <p class="field-hint">{{ i18n.t('gen.passphrase.pending') }}</p>
+          <div class="tool-actions">
+            <button type="button" class="btn" disabled>{{ i18n.t('gen.passphrase.button') }}</button>
+          </div>
+        </section>
+      </div>
+      @if (error(); as e) {
+        <div class="callout callout-danger" role="alert"><km-icon name="alert" /><p>{{ i18n.t(e) }}</p></div>
       }
-    </section>
+    </div>
   `,
 })
-export class Generators {
-  private readonly vault = inject(VaultService);
+export class Generators implements OnDestroy {
+  protected readonly vault = inject(VaultService);
+  private readonly toast = inject(ToastService);
+  protected readonly i18n = inject(I18n);
   readonly created = output<string>();
-  protected readonly shown = signal<Record<string, string>>({});
-  protected readonly message = signal<string | null>(null);
+  protected readonly error = signal<MessageKey | null>(null);
+  private readonly pw = inject(PasswordSettings);
+  protected readonly pwProblem = computed(() => passwordProblem(this.vault, this.pw.options()));
+  protected readonly bytes = signal('32');
+  protected readonly encoding = signal('hex');
+  protected readonly comment = signal('');
+  protected readonly pwDraft = new GeneratedDraft(this.pw.options, sameOptions);
+  protected readonly secretDraft = new GeneratedDraft<SecretParams>(
+    () => ({ bytes: this.bytes(), encoding: this.encoding() }),
+    (a, b) => a.bytes === b.bytes && a.encoding === b.encoding,
+  );
+  /** Which save is in flight; blocks every other action until it settles. */
+  protected readonly saving = signal<'password' | 'secret' | 'key' | null>(null);
+  /** Only an open, current vault can generate or save. */
+  protected readonly busy = computed(() => this.saving() !== null || !this.vault.unlocked());
+  private destroyed = false;
+  /** User-edited titles; absent = localized default. */
+  private readonly titles = signal<Partial<Record<TitleField, string>>>({});
 
-  private report(e: unknown): void {
-    this.message.set(e instanceof Error ? e.message : 'Generation failed');
+  protected value(ev: Event): string {
+    return (ev.target as HTMLInputElement).value;
   }
 
-  protected preview(key: string, profile: string): void {
+  protected title(f: TitleField): string {
+    return this.titles()[f] ?? this.i18n.t(DEFAULT_TITLES[f]);
+  }
+
+  protected setTitle(f: TitleField, ev: Event): void {
+    const v = this.value(ev);
+    this.titles.update((t) => ({ ...t, [f]: v }));
+  }
+
+  protected bytesValid(): boolean {
+    const n = Number(this.bytes());
+    return Number.isInteger(n) && n >= 16 && n <= 1024;
+  }
+
+  protected previewPassword(): void {
+    this.error.set(null);
+    // Drop the previous value first, so a failure never leaves it on screen.
+    this.pwDraft.clear();
+    const options = this.pw.options();
     try {
-      const v = this.vault.generatePassword(profile === 'strong' ? 'strong' : 'default');
-      this.shown.set({ ...this.shown(), [key]: v });
+      this.pwDraft.set(this.vault.previewPassword(options), options);
     } catch (e) {
-      this.report(e);
+      this.error.set(errorKey(e));
     }
   }
 
-  protected previewSecret(bytes: number, enc: string): void {
+  protected previewSecret(): void {
+    this.error.set(null);
+    this.secretDraft.clear();
+    const params = { bytes: this.bytes(), encoding: this.encoding() };
     try {
-      this.shown.set({ ...this.shown(), secret: this.vault.generateRandomSecret(bytes, enc) });
+      this.secretDraft.set(this.vault.previewSecret(Number(params.bytes), params.encoding), params);
     } catch (e) {
-      this.report(e);
+      this.error.set(errorKey(e));
     }
   }
 
-  private async done(p: Promise<string>, what: string): Promise<void> {
+  /** Success is reported only after the encrypted write was committed. */
+  private async save(what: 'password' | 'secret' | 'key', run: () => Promise<string>, ok: MessageKey): Promise<void> {
+    if (this.saving() !== null) return; // double click
+    this.saving.set(what);
+    this.error.set(null);
     try {
-      const id = await p;
-      this.message.set(`${what} generated and saved.`);
+      const id = await run();
+      if (this.destroyed) return;
+      this.toast.show(ok);
       this.created.emit(id);
     } catch (e) {
-      this.report(e);
+      if (this.destroyed) return;
+      this.error.set(errorKey(e));
+    } finally {
+      this.saving.set(null);
     }
   }
 
-  protected savePassword(title: string, profile: string): Promise<void> {
-    return this.done(this.vault.generatePasswordItem(title, profile, ''), 'Password');
+  private saveDraft(kind: 'password' | 'secret', draft: GeneratedDraft<unknown>, f: TitleField, ok: MessageKey) {
+    const shown = draft.current();
+    if (shown === null) return Promise.resolve();
+    return this.save(
+      kind,
+      async () => {
+        try {
+          const id = await this.vault.savePreview(kind, shown, this.title(f));
+          draft.clear();
+          return id;
+        } catch (e) {
+          // The core no longer holds it (saved elsewhere, replaced): don't offer it again.
+          if (errorKey(e) === 'errors.previewGone') draft.clear();
+          throw e;
+        }
+      },
+      ok,
+    );
   }
 
-  protected saveSecret(title: string, bytes: number, enc: string): Promise<void> {
-    return this.done(this.vault.generateSecretItem(title, bytes, enc, ''), 'Secret');
+  protected savePassword(): Promise<void> {
+    return this.saveDraft('password', this.pwDraft as GeneratedDraft<unknown>, 'pw', 'gen.pw.saved');
   }
 
-  protected saveKey(title: string, comment: string): Promise<void> {
-    return this.done(this.vault.generateEd25519(title, comment), 'Ed25519 key');
+  protected saveSecret(): Promise<void> {
+    return this.saveDraft('secret', this.secretDraft as GeneratedDraft<unknown>, 'secret', 'gen.secret.saved');
+  }
+
+  protected saveKey(): Promise<void> {
+    return this.save('key', () => this.vault.generateEd25519(this.title('key'), this.comment()), 'gen.key.saved');
+  }
+
+  ngOnDestroy(): void {
+    this.destroyed = true;
+    this.pwDraft.clear();
+    this.secretDraft.clear();
+    this.vault.discardPreviews();
   }
 }
