@@ -9,7 +9,7 @@
 
 | Service | Image | Binds | Role |
 |---|---|---|---|
-| `web` | `$KEYMESH_WEB_IMAGE` (a CI-built Docker Hub image pinned by digest, see below), else `keymesh-web:local` built from `deploy/web.Dockerfile` | `127.0.0.1:4320` (HTTP, loopback only) | `apps/web/scripts/serve.mjs` serving the already-built `apps/web/dist/web/browser` |
+| `web` | `$KEYMESH_WEB_IMAGE` (a CI-built multi-arch Docker Hub image pinned by index digest, see below), else `keymesh-web:local` built from `deploy/web.Dockerfile` | `127.0.0.1:4320` (HTTP, loopback only) | `apps/web/scripts/serve.mjs` serving the already-built `apps/web/dist/web/browser` |
 
 ## Design rules
 - **Host networking:** Docker publishes no ports and adds no NAT or iptables rules. `web` binds `127.0.0.1:4320` only, so nothing off the host reaches it except through the host proxy.
@@ -53,13 +53,17 @@ tls:
 
 ## CI-built image (Docker Hub)
 
-The preferred way to update `web`: GitHub Actions builds the image from the bundle that passed E2E, and the host pulls it by commit and pins it by digest.
+The preferred way to update `web`: GitHub Actions builds a **multi-arch** image (`linux/amd64` and `linux/arm64`) from the bundle that passed E2E, and the host pulls it by commit and pins it by digest. The Pi (arm64) and an amd64 host such as the cloud GCE VM pull the **same tag**; Docker selects the matching platform.
 
 **Flow.**
 1. **Build.** `ci.yml` job `web` builds the WASM and Angular bundle, runs unit tests and E2E, then uploads that exact `dist/web/browser` (artifact `web-dist`) with its asset ledger.
-2. **Image.** Job `image` (needs `rust` and `web`) downloads the artifact, checks it file by file against the tested ledger, and builds `deploy/web.Dockerfile` for `linux/arm64` (COPY-only, no QEMU). Labels: `org.opencontainers.image.revision` (full commit SHA), `source`, `created`.
-3. **Push.** Only on push to `main` or `workflow_dispatch` in `flarexio/keymesh`, and only when the Docker Hub settings below exist, it pushes `docker.io/<DOCKERHUB_REPOSITORY>:sha-<full sha>` (plus `:main` on main; no `latest`) and attests build provenance with `actions/attest-build-provenance` (pushed to the registry and stored on GitHub). Pull requests, including forks, build without logging in or pushing; missing settings only skip the push with a notice.
-4. **Record.** The job summary shows the digest and the sha256 of `wasm/keymesh_wasm_bg.wasm`, `main-*.js` and `ngsw.json`. Artifact `asset-ledger` (`asset-ledger.json`) lists every bundle file with sha256 and size.
+2. **Image (matrix).** Job `image` (needs `rust` and `web`) has one leg per platform, each on its own **native** runner: `linux/amd64` on `ubuntu-24.04` and `linux/arm64` on `ubuntu-24.04-arm` (COPY-only Dockerfile, no QEMU). Each leg downloads the artifact, checks it file by file against the tested ledger, and builds `deploy/web.Dockerfile` for its platform with labels `org.opencontainers.image.revision` (full commit SHA), `source` and `created`. When publishing, it pushes its manifest **by digest only** (no tag) and uploads the digest as artifact `digests-<arch>`.
+3. **Index (`manifest` job).** Only when the legs published: checks both legs used the identical bundle, then `docker buildx imagetools create` joins the two digests into one index with the annotation `org.opencontainers.image.revision=<sha>`. It checks the index **before** pushing any tag (`--dry-run`: exactly `linux/amd64` and `linux/arm64`, each the digest its leg pushed), then tags it `sha-<full sha>` (plus `main` on main; no `latest`), re-checks what the registry serves, and attests build provenance for the **index digest** with `actions/attest-build-provenance` (pushed to the registry and stored on GitHub).
+   - **Push rules:** only on push to `main` or `workflow_dispatch` in `flarexio/keymesh`, and only when the Docker Hub settings below exist. Pull requests, including forks, build both platforms without logging in or pushing, and `manifest` is skipped; missing settings only skip the push with a notice. `workflow_dispatch` is usable only once this workflow is on `main`.
+   - **Permissions:** only `manifest` has `id-token: write` and `attestations: write`; the legs have `contents: read`.
+4. **Record.** The `manifest` summary shows the index digest, both platform digests, the tags and the sha256 of `wasm/keymesh_wasm_bg.wasm`, `main-*.js` and `ngsw.json` (one bundle, identical in both platforms). Artifact `asset-ledger` (`asset-ledger.json`) records the same plus every bundle file with sha256 and size. Each leg's summary shows its own digest or why it did not push.
+
+**Index digest vs platform digests.** `sha-<sha>` names an **index** (manifest list). Its digest is what CI attests, what `pull-deploy.sh` pins and what acceptance refers to. Each platform image inside it has its own **platform digest** (listed in the summary and the ledger); a host pulls the one for its own platform through the index, so an amd64 host and the Pi report the same index digest but run different platform images. The bundle files inside both are byte-identical.
 5. **Deploy.** On the host, `deploy/pull-deploy.sh <full sha>` (below).
 
 **One-time setup (FlareX; Claude never creates or handles tokens).**
@@ -76,15 +80,17 @@ KEYMESH_IMAGE_REPO=<namespace>/keymesh-web deploy/pull-deploy.sh <full 40-hex sh
 ```
 
 The script, using `sudo docker`:
-1. Pulls `docker.io/<repo>:sha-<sha>` and pins it by digest.
-2. **Refuses** unless the revision label is exactly `<sha>` and the platform is `linux/arm64`.
-3. Runs `gh attestation verify oci://docker.io/<repo>@sha256:… --repo flarexio/keymesh` when `gh` is installed. Set `KEYMESH_VERIFY_ATTESTATION=1` to require it, or `0` to skip it.
+1. Pulls `docker.io/<repo>:sha-<sha>` for this host's platform and pins it by the **index** digest.
+2. **Refuses** unless the revision label is exactly `<sha>` and the pulled image's os/arch is this host's: the Docker daemon's `{{.Server.Os}}/{{.Server.Arch}}` (arm64 on the Pi, amd64 on an amd64 host), or `KEYMESH_PLATFORM` if set (`linux/amd64` or `linux/arm64` only).
+3. Runs `gh attestation verify oci://docker.io/<repo>@sha256:<index digest> --repo flarexio/keymesh` when `gh` is installed. Set `KEYMESH_VERIFY_ATTESTATION=1` to require it, or `0` to skip it.
 4. Copies the bundle out of the image and prints the sha256 of the key files. With `KEYMESH_LEDGER=asset-ledger.json` (the CI artifact; needs node), it compares every file.
 5. Tags the running web image `keymesh-web:rollback-<old revision>`.
 6. Recreates **only** `web` (`--no-deps --no-build --pull never`) with `KEYMESH_WEB_IMAGE=docker.io/<repo>@sha256:…`.
 7. Waits until it is healthy. Otherwise it rolls back to the previous image and exits non-zero.
 
-It never touches the host proxy, certificates, DNS, VPN or firewall, and never sets `KEYMESH_FAVICON`. Re-running with the same SHA is a no-op once that image is running and healthy.
+It never touches the host proxy, certificates, DNS, VPN or firewall, and never sets `KEYMESH_FAVICON`. Re-running with the same SHA is a no-op once that image is running, for the same platform, and healthy.
+
+An amd64 host can use the same script and tag. This repository does not deploy to or configure the GCE host; doing so is a separate, authorized step.
 
 `KEYMESH_WEB_IMAGE` is not persisted. Pass the value the script prints to any later manual `docker compose … up`; otherwise compose falls back to `keymesh-web:local`.
 

@@ -4,9 +4,12 @@
 #   KEYMESH_IMAGE_REPO=<namespace>/keymesh-web \
 #     deploy/pull-deploy.sh <full 40-hex commit sha> [<namespace>/keymesh-web]
 #
-# 1. Pulls docker.io/<repo>:sha-<sha> and pins it by digest.
-# 2. Refuses unless the revision label is <sha> and the platform is linux/arm64.
-# 3. Verifies the build provenance with `gh attestation verify` when gh is installed.
+# 1. Pulls docker.io/<repo>:sha-<sha> (a linux/amd64 + linux/arm64 index) for this
+#    host's platform and pins it by the INDEX digest.
+# 2. Refuses unless the revision label is <sha> and the pulled image's platform is
+#    this host's (the Docker daemon's os/arch, or KEYMESH_PLATFORM).
+# 3. Verifies the index's build provenance with `gh attestation verify` when gh is
+#    installed.
 # 4. Copies the bundle out of the image and prints sha256 of the key files
 #    (and compares every file with a CI asset ledger when KEYMESH_LEDGER is set).
 # 5. Tags the current web image keymesh-web:rollback-<old revision>.
@@ -22,6 +25,7 @@
 #                               DOCKERHUB_REPOSITORY variable in CI (or the 2nd argument)
 #   KEYMESH_VERIFY_ATTESTATION  auto (default: verify when gh exists) | 1 (require) | 0 (skip)
 #   KEYMESH_LEDGER              optional path to the CI asset-ledger.json (needs node)
+#   KEYMESH_PLATFORM            expected os/arch (default: the Docker daemon's, e.g. linux/arm64)
 #   KEYMESH_HEALTH_TIMEOUT      seconds to wait for healthy (default 150)
 #   SUDO                        command prefix for docker (default "sudo"; empty if root)
 #   KEYMESH_IMAGE_REGISTRY      registry host (default docker.io; override only for local testing)
@@ -29,7 +33,7 @@ set -eu
 
 REGISTRY=${KEYMESH_IMAGE_REGISTRY:-docker.io}
 ATTEST_REPO=flarexio/keymesh
-PLATFORM=linux/arm64
+PLATFORM=${KEYMESH_PLATFORM:-}
 SUDO=${SUDO-sudo}
 VERIFY=${KEYMESH_VERIFY_ATTESTATION:-auto}
 TIMEOUT=${KEYMESH_HEALTH_TIMEOUT:-150}
@@ -47,12 +51,31 @@ d() { $SUDO docker "$@"; }
 compose() {
   img=$1
   shift
-  $SUDO env KEYMESH_WEB_IMAGE="$img" docker compose -f "$COMPOSE_FILE" "$@"
+  $SUDO env KEYMESH_WEB_IMAGE="$img" DOCKER_DEFAULT_PLATFORM="$PLATFORM" \
+    docker compose -f "$COMPOSE_FILE" "$@"
 }
 label() { d image inspect --format "{{ index .Config.Labels \"$2\" }}" "$1"; }
+# pinspect <format> <ref>: inspect the $PLATFORM image of an index. The containerd
+# image store needs --platform (Docker >= 28); older Docker has no such flag and
+# stores only the pulled platform, so fall back to a plain inspect there.
+pinspect() {
+  d image inspect --platform "$PLATFORM" --format "$1" "$2" 2>/dev/null ||
+    d image inspect --format "$1" "$2"
+}
 web_container() {
   d ps -aq --filter label=com.docker.compose.project=keymesh \
     --filter label=com.docker.compose.service=web | head -n 1
+}
+# container_platform <container>: os/arch the container runs (empty on Docker
+# without ImageManifestDescriptor, where image IDs are per platform anyway).
+container_platform() {
+  d inspect --format '{{ with .ImageManifestDescriptor }}{{ with .Platform }}{{ .OS }}/{{ .Architecture }}{{ end }}{{ end }}' "$1" 2>/dev/null || true
+}
+# runs_new <container>: the container runs the pinned image for $PLATFORM.
+runs_new() {
+  [ "$(d inspect --format '{{ .Image }}' "$1")" = "$NEW_ID" ] || return 1
+  cp=$(container_platform "$1")
+  [ -z "$cp" ] || [ "$cp" = "$PLATFORM" ]
 }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 
@@ -91,10 +114,12 @@ case $SHA in *[!0-9a-f]* | '') die "commit sha must be lowercase hex: $SHA" ;; e
 [ ${#SHA} -eq 40 ] || die "commit sha must be the full 40 characters: $SHA"
 case $VERIFY in auto | 0 | 1) ;; *) die "KEYMESH_VERIFY_ATTESTATION must be auto, 0 or 1" ;; esac
 REF=$REPO:sha-$SHA
+[ -n "$PLATFORM" ] || PLATFORM=$(d version --format '{{ .Server.Os }}/{{ .Server.Arch }}')
+case $PLATFORM in linux/amd64 | linux/arm64) ;; *) die "unsupported platform '$PLATFORM' (the image has linux/amd64 and linux/arm64)" ;; esac
 
 # --- 1. pull and pin by digest -------------------------------------------------
-log "pulling $REF"
-pull_out=$(d pull "$REF") || die "pull failed (private repository? see 'Registry login' in deploy/README.md)"
+log "pulling $REF for $PLATFORM"
+pull_out=$(d pull --platform "$PLATFORM" "$REF") || die "pull failed (private repository? see 'Registry login' in deploy/README.md)"
 printf '%s\n' "$pull_out"
 digest=$(printf '%s\n' "$pull_out" | sed -n 's/^Digest: \(sha256:[0-9a-f]\{64\}\)$/\1/p' | tail -n 1)
 [ -n "$digest" ] || die "could not read the pulled digest"
@@ -104,9 +129,9 @@ d image inspect --format '{{ range .RepoDigests }}{{ println . }}{{ end }}' "$RE
   grep -qxF -e "$PINNED" -e "$NAME@$digest" || die "$PINNED is not a repo digest of $REF"
 
 # --- 2. revision and platform ------------------------------------------------
-rev=$(label "$PINNED" org.opencontainers.image.revision)
+rev=$(pinspect '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$PINNED")
 [ "$rev" = "$SHA" ] || die "revision label is '$rev', expected $SHA"
-plat=$(d image inspect --format '{{ .Os }}/{{ .Architecture }}' "$PINNED")
+plat=$(pinspect '{{ .Os }}/{{ .Architecture }}' "$PINNED")
 [ "$plat" = "$PLATFORM" ] || die "image platform is $plat, expected $PLATFORM"
 NEW_ID=$(d image inspect --format '{{ .Id }}' "$PINNED")
 log "verified $PINNED (revision $rev, $plat)"
@@ -129,7 +154,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-bundle_cid=$(d create "$PINNED")
+bundle_cid=$(d create --platform "$PLATFORM" "$PINNED")
 d cp "$bundle_cid:/app/dist/web/browser" - | tar -x -C "$tmp"
 d rm "$bundle_cid" >/dev/null
 bundle_cid=
@@ -147,7 +172,7 @@ old_cid=$(web_container)
 ROLLBACK=
 if [ -n "$old_cid" ]; then
   old_id=$(d inspect --format '{{ .Image }}' "$old_cid")
-  if [ "$old_id" = "$NEW_ID" ] && wait_healthy "$old_cid"; then
+  if runs_new "$old_cid" && wait_healthy "$old_cid"; then
     log "web already runs $PINNED and is healthy; nothing to do"
     exit 0
   fi
@@ -163,8 +188,7 @@ fi
 # --- 6 and 7. swap web, wait, roll back on failure ------------------------------
 log "recreating web from $PINNED"
 if recreate_web "$PINNED"; then
-  [ "$(d inspect --format '{{ .Image }}' "$(web_container)")" = "$NEW_ID" ] ||
-    die "web is healthy but not running $PINNED"
+  runs_new "$(web_container)" || die "web is healthy but not running $PINNED for $PLATFORM"
   log "deployed $PINNED (revision $SHA); web is healthy"
   log "for later manual compose commands use: KEYMESH_WEB_IMAGE=$PINNED"
   exit 0

@@ -65,18 +65,27 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Builds deploy/web.Dockerfile (COPY-only, so linux/arm64 needs no QEMU) from the
-  # bundle E2E tested. It pushes to Docker Hub and attests only on push to main or
+  # Multi-arch keymesh-web image, built from the bundle E2E tested. Each platform
+  # builds on its own native runner (COPY-only Dockerfile); `manifest` joins them
+  # into one index. Pushing and attesting happen only on push to main or
   # workflow_dispatch in flarexio/keymesh, and only when the DOCKERHUB_REPOSITORY
-  # variable and the REGISTRY_USERNAME/REGISTRY_PASSWORD (flarexio organization) secrets are set. Otherwise
-  # (pull requests, forks, missing settings) it builds without logging in or pushing.
+  # variable and the REGISTRY_USERNAME/REGISTRY_PASSWORD (flarexio organization)
+  # secrets are set. Otherwise (pull requests, forks, missing settings) both legs
+  # build without logging in or pushing, and `manifest` is skipped.
   image:
     needs: [rust, web]
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, arch: amd64, runner: ubuntu-24.04 }
+          - { platform: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      id-token: write
-      attestations: write
+    outputs:
+      publish: ${{ steps.meta.outputs.publish }}
+      image: ${{ steps.meta.outputs.image }}
     env:
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
       HAS_CREDENTIALS: ${{ secrets.REGISTRY_USERNAME != '' && secrets.REGISTRY_PASSWORD != '' }}
@@ -85,6 +94,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: web-dist
@@ -97,7 +109,7 @@ jobs:
         run: |
           node scripts/asset-ledger.mjs apps/web/dist/web/browser --revision "$GITHUB_SHA" --out "$RUNNER_TEMP/bundle-ledger.json"
           node scripts/asset-ledger.mjs --compare "$RUNNER_TEMP/tested/asset-ledger.json" "$RUNNER_TEMP/bundle-ledger.json"
-      - name: Decide push, tags and created time
+      - name: Decide push and created time
         id: meta
         run: |
           publish=false
@@ -113,19 +125,18 @@ jobs:
           fi
           if [ "$publish" = true ]; then
             image=docker.io/$DOCKERHUB_REPOSITORY
+            outputs="type=image,name=$image,push-by-digest=true,name-canonical=true,push=true"
           else
             image=keymesh-web
-            echo "::notice title=keymesh-web image not pushed::$reason"
+            outputs=
+            echo "::notice title=keymesh-web ${{ matrix.arch }} image not pushed::$reason"
           fi
           {
             echo "publish=$publish"
             echo "reason=$reason"
             echo "image=$image"
+            echo "outputs=$outputs"
             echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "tags<<EOF"
-            echo "$image:sha-$GITHUB_SHA"
-            if [ "$publish" = true ] && [ "$GITHUB_REF" = refs/heads/main ]; then echo "$image:main"; fi
-            echo "EOF"
           } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - if: steps.meta.outputs.publish == 'true'
@@ -138,10 +149,10 @@ jobs:
         with:
           context: apps/web
           file: deploy/web.Dockerfile
-          platforms: linux/arm64
-          push: ${{ steps.meta.outputs.publish == 'true' }}
-          # One plain manifest, so the digest CI reports is the one the Pi pulls;
-          # provenance comes from attest-build-provenance below.
+          platforms: ${{ matrix.platform }}
+          # Publishing pushes this platform's manifest by digest only (no tags);
+          # `manifest` tags the joined index. Otherwise this is a build check.
+          outputs: ${{ steps.meta.outputs.outputs }}
           provenance: false
           sbom: false
           build-args: KEYMESH_REVISION=${{ github.sha }}
@@ -149,43 +160,112 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ steps.meta.outputs.created }}
-          tags: ${{ steps.meta.outputs.tags }}
+      - name: Record digest
+        if: steps.meta.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          printf '%s' "$DIGEST" | grep -Eqx 'sha256:[0-9a-f]{64}' || { echo "::error::no pushed digest"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/digest"
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digest/digest"
+          printf '%s\n' "${{ matrix.platform }}" > "$RUNNER_TEMP/digest/platform"
+          cp "$RUNNER_TEMP/bundle-ledger.json" "$RUNNER_TEMP/digest/bundle-ledger.json"
       - if: steps.meta.outputs.publish == 'true'
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # Docker Hub must be named index.docker.io for push-to-registry.
-          subject-name: index.docker.io/${{ env.DOCKERHUB_REPOSITORY }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
-      - name: Summary and asset ledger
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest
+          if-no-files-found: error
+          retention-days: 14
+      - name: Leg summary
         env:
           PUBLISH: ${{ steps.meta.outputs.publish }}
           REASON: ${{ steps.meta.outputs.reason }}
-          IMAGE: ${{ steps.meta.outputs.image }}
           DIGEST: ${{ steps.build.outputs.digest }}
-          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          jq --arg image "$IMAGE" --arg digest "$DIGEST" --arg pushed "$PUBLISH" \
-            --arg tags "$TAGS" --arg platform linux/arm64 \
-            '{revision, image: {name: $image, digest: $digest, platform: $platform, pushed: ($pushed == "true"), tags: ($tags | split("\n") | map(select(length > 0)))}, files}' \
-            "$RUNNER_TEMP/bundle-ledger.json" > "$RUNNER_TEMP/asset-ledger.json"
+          {
+            echo "### keymesh-web ${{ matrix.platform }} (${{ matrix.runner }})"
+            if [ "$PUBLISH" = true ]; then echo "Pushed by digest: \`$DIGEST\`"; else echo "Not pushed: $REASON"; fi
+            echo
+            echo "| Bundle file | sha256 | bytes |"
+            echo "|---|---|---|"
+            jq -r '.files | to_entries[]
+              | select(.key == "wasm/keymesh_wasm_bg.wasm" or .key == "ngsw.json" or (.key | test("^main-[^/]*\\.js$")))
+              | "| `\(.key)` | `\(.value.sha256)` | \(.value.bytes) |"' "$RUNNER_TEMP/bundle-ledger.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Joins the per-platform digests into one tagged index, checks it, and attests
+  # the index digest. Runs only when the image legs published.
+  manifest:
+    needs: image
+    if: needs.image.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      IMAGE: ${{ needs.image.outputs.image }}
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digests-*
+          path: ${{ runner.temp }}/digests
+      - name: Collect digests and check both legs used the same bundle
+        id: legs
+        run: |
+          d=$RUNNER_TEMP/digests
+          for arch in amd64 arm64; do
+            [ "$(cat "$d/digests-$arch/platform")" = "linux/$arch" ] || { echo "::error::digests-$arch has the wrong platform"; exit 1; }
+            dg=$(cat "$d/digests-$arch/digest")
+            printf '%s' "$dg" | grep -Eqx 'sha256:[0-9a-f]{64}' || { echo "::error::bad digest for $arch"; exit 1; }
+            echo "$arch=$dg" >> "$GITHUB_OUTPUT"
+          done
+          node scripts/asset-ledger.mjs --compare "$d/digests-amd64/bundle-ledger.json" "$d/digests-arm64/bundle-ledger.json"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Create and check the index
+        id: index
+        env:
+          AMD64: ${{ steps.legs.outputs.amd64 }}
+          ARM64: ${{ steps.legs.outputs.arm64 }}
+        run: sh deploy/ci-manifest.sh
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          # Docker Hub must be named index.docker.io for push-to-registry.
+          subject-name: index.docker.io/${{ env.DOCKERHUB_REPOSITORY }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+      - name: Summary and asset ledger
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+          TAGS: ${{ steps.index.outputs.tags }}
+          AMD64: ${{ steps.legs.outputs.amd64 }}
+          ARM64: ${{ steps.legs.outputs.arm64 }}
+        run: |
+          jq --arg image "$IMAGE" --arg digest "$DIGEST" --arg tags "$TAGS" \
+            --arg amd64 "$AMD64" --arg arm64 "$ARM64" \
+            '{revision, image: {name: $image, index_digest: $digest, platforms: {"linux/amd64": $amd64, "linux/arm64": $arm64}, tags: ($tags | split("\n") | map(select(length > 0)))}, files}' \
+            "$RUNNER_TEMP/digests/digests-amd64/bundle-ledger.json" > "$RUNNER_TEMP/asset-ledger.json"
           {
             echo "## keymesh-web image"
             echo
             echo "| | |"
             echo "|---|---|"
             echo "| Revision | \`$GITHUB_SHA\` |"
-            echo "| Platform | linux/arm64 |"
-            if [ "$PUBLISH" = true ]; then
-              echo "| Pushed | yes |"
-              echo "| Digest | \`$IMAGE@$DIGEST\` |"
-              printf '%s\n' "$TAGS" | sed -n 's/.\{1,\}/| Tag | `&` |/p'
-            else
-              echo "| Pushed | no ($REASON) |"
-              echo "| Local build digest | ${DIGEST:-n/a} |"
-            fi
+            echo "| Index digest | \`$IMAGE@$DIGEST\` |"
+            echo "| linux/amd64 | \`$AMD64\` |"
+            echo "| linux/arm64 | \`$ARM64\` |"
+            printf '%s\n' "$TAGS" | sed -n 's/.\{1,\}/| Tag | `&` |/p'
             echo
-            echo "| Bundle file | sha256 | bytes |"
+            echo "| Bundle file (same in both platforms) | sha256 | bytes |"
             echo "|---|---|---|"
             jq -r '.files | to_entries[]
               | select(.key == "wasm/keymesh_wasm_bg.wasm" or .key == "ngsw.json" or (.key | test("^main-[^/]*\\.js$")))

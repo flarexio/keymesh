@@ -142,7 +142,7 @@ tmux new-session -d -s keymesh-vpn-https \
 * The SPA fallback answers only extensionless paths. A missing `ngsw.json`, script, WASM or icon gets 404, never `index.html`.
 * The manifest is served as `application/manifest+json`. Security headers and CSP are unchanged.
 
-**Deployment:** a new `keymesh-web` image publishes a new version, and installed copies pick it up on their next online visit. Since 2026-11-21 CI builds the image from the bundle that passed E2E and pushes it to Docker Hub (`sha-<full sha>`, with build provenance), and the Pi deploys it with `deploy/pull-deploy.sh` pinned by digest (`deploy/README.md`). Because WASM hashes differ by build host, acceptance is of the CI image digest and its asset ledger, not of a local rebuild.
+**Deployment:** a new `keymesh-web` image publishes a new version, and installed copies pick it up on their next online visit. Since 2026-11-21 CI builds a multi-arch image (`linux/amd64` and `linux/arm64`, each on a native runner) from the bundle that passed E2E and pushes it to Docker Hub as one index (`sha-<full sha>`, with build provenance for the index digest). The Pi deploys it with `deploy/pull-deploy.sh` pinned by the index digest, and an amd64 host can pull the same tag (`deploy/README.md`). Because WASM hashes differ by build host, acceptance is of the CI image digest and its asset ledger, not of a local rebuild.
 
 ## 7. Quick unlock, auto-lock and website icons (M5 phase C; experimental, accepted `88dee8b`, privately deployed 2026-11-16)
 
