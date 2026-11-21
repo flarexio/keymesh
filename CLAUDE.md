@@ -8,7 +8,7 @@ Rust local-first encrypted vault core (`src/`, also the `keymesh` CLI) with a br
 * **Demo vaults** (envelope v1) use a public fixture key or a memory-only ephemeral key, so nothing they store is protected.
 * **Password vaults** (envelope v2, M4) use a master password and an independent recovery code (`docs/adr/0002-envelope-v2.md`). They are real local-unlock mechanics but remain **experimental and synthetic-data only until Jarvis's independent acceptance**. They are allowed only in secure contexts (`docs/DELIVERY.md`).
 
-Local decryption is not Keymesh login, and there is no account, escrow or support reset. Mandatory typed items: Login, Secret/API credential, Contact, CryptoWalletRecord, Ed25519Key, TOTP, SecureNote. Strong password/random-secret generators, Ed25519 key generation and TOTP are core features.
+Local decryption is not Keymesh login, and there is no account, escrow or support reset. Mandatory typed items: Login, Secret/API credential, Contact, CryptoWalletRecord, Ed25519Key, TOTP, SecureNote. Strong password/random-secret generators, Ed25519 key generation, TOTP and import FROM 1Password through the `op` CLI are core features.
 
 **M5 product rollout (authorized 2026-11-15, task `keymesh-product-rollout`):**
 * **Phase A:** PWA/offline, TOTP QR import, TOTP countdown, local login icons.
@@ -21,7 +21,7 @@ These are implemented in that order with an independent review per phase. All st
 
 ## Safety
 
-Use synthetic data only. Never access real password-manager accounts or vaults, credentials, ~/.hermes/.env, private keys or other repositories. No secrets in prompts, logs, stdout, URLs or git.
+Use synthetic data only. Never access real op accounts/vaults/secrets, credentials, ~/.hermes/.env, private keys or other repositories. `op --help` / subcommand help / version are allowed; fetching actual items is NOT authorized for development. Test the importer with a fake executable fixture and injected process runner. No real imports without a separately authorized user action later. No secrets in prompts, logs, stdout, URLs or git. Never delete or mutate source 1Password records.
 
 Core encryption accepts an explicit key-provider port (demo vaults) or v2 key slots (password vaults).
 * Use an ephemeral synthetic test provider for v1 tests.
