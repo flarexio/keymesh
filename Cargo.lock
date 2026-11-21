@@ -417,6 +417,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hmac",
+ "js-sys",
  "libc",
  "percent-encoding",
  "serde",
@@ -426,6 +427,19 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "keymesh-wasm"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "keymesh",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wasm-bindgen",
  "zeroize",
 ]
 

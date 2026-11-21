@@ -114,7 +114,7 @@ pub(crate) fn create_limited(
     let (bytes, rev) = vault.seal_next(provider, rng)?;
     check_write_size(&bytes, limit)?;
     atomic_write(path, &bytes, true)?;
-    vault.mark_persisted(rev);
+    vault.mark_persisted(rev)?;
     Ok(())
 }
 
@@ -160,7 +160,7 @@ pub(crate) fn save_limited(
     let (bytes, rev) = vault.seal_next(provider, rng)?;
     check_write_size(&bytes, limit)?;
     atomic_write(path, &bytes, false)?;
-    vault.mark_persisted(rev);
+    vault.mark_persisted(rev)?;
     Ok(())
 }
 

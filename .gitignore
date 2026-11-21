@@ -11,3 +11,12 @@
 *.1pux
 *.1pif
 *.vault
+
+# Web app (nested paths) and generated artifacts
+node_modules/
+apps/web/dist/
+apps/web/.angular/
+apps/web/src/app/core/wasm-pkg/
+apps/web/public/wasm/
+apps/web/test-results/
+apps/web/playwright-report/

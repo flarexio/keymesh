@@ -7,6 +7,9 @@ description = "Local-first encrypted vault core (M1 foundation, not production r
 license = "UNLICENSED"
 publish = false
 
+[workspace]
+members = [".", "crates/keymesh-wasm"]
+
 [features]
 default = ["native"]
 # Filesystem persistence, the `op` subprocess runner and the CLI. Everything
@@ -48,3 +51,5 @@ opt-level = 1
 # Browser WASM: the OS CSPRNG is reached through `crypto.getRandomValues`.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
+# Wall clock: std::time::SystemTime panics on wasm32-unknown-unknown.
+js-sys = "0.3"

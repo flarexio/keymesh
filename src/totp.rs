@@ -103,10 +103,12 @@ pub trait Clock {
 pub struct SystemClock;
 impl Clock for SystemClock {
     fn now_unix(&self) -> Result<u64> {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .map_err(|_| Error::Totp("system clock before Unix epoch".into()))
+        match crate::model::unix_now() {
+            0 => Err(Error::Totp(
+                "system clock unavailable or before Unix epoch".into(),
+            )),
+            t => Ok(t),
+        }
     }
 }
 
