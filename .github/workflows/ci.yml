@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, "feature/**"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -47,3 +48,154 @@ jobs:
       - run: npm test
       - run: npx playwright install --with-deps chromium
       - run: npm run e2e
+      # Hand the exact bundle E2E ran against to the image job, with its ledger.
+      - name: Asset ledger of the tested bundle
+        run: node ../../scripts/asset-ledger.mjs dist/web/browser --revision "$GITHUB_SHA" --out "$RUNNER_TEMP/asset-ledger.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-dist
+          path: apps/web/dist/web/browser
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-dist-ledger
+          path: ${{ runner.temp }}/asset-ledger.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # Builds deploy/web.Dockerfile (COPY-only, so linux/arm64 needs no QEMU) from the
+  # bundle E2E tested. It pushes to Docker Hub and attests only on push to main or
+  # workflow_dispatch in flarexio/keymesh, and only when the DOCKERHUB_REPOSITORY
+  # variable and the DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets are set. Otherwise
+  # (pull requests, forks, missing settings) it builds without logging in or pushing.
+  image:
+    needs: [rust, web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+      HAS_CREDENTIALS: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+      PUBLISH_EVENT: ${{ github.repository == 'flarexio/keymesh' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: apps/web/dist/web/browser
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist-ledger
+          path: ${{ runner.temp }}/tested
+      - name: Check the bundle is the one E2E tested
+        run: |
+          node scripts/asset-ledger.mjs apps/web/dist/web/browser --revision "$GITHUB_SHA" --out "$RUNNER_TEMP/bundle-ledger.json"
+          node scripts/asset-ledger.mjs --compare "$RUNNER_TEMP/tested/asset-ledger.json" "$RUNNER_TEMP/bundle-ledger.json"
+      - name: Decide push, tags and created time
+        id: meta
+        run: |
+          publish=false
+          reason=
+          if [ "$PUBLISH_EVENT" != true ]; then
+            reason="build only: $GITHUB_EVENT_NAME on $GITHUB_REF does not publish"
+          elif ! printf '%s' "$DOCKERHUB_REPOSITORY" | grep -Eqx '[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*'; then
+            reason="build only: repository variable DOCKERHUB_REPOSITORY is missing or not <namespace>/<name>"
+          elif [ "$HAS_CREDENTIALS" != true ]; then
+            reason="build only: secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are not both set"
+          else
+            publish=true
+          fi
+          if [ "$publish" = true ]; then
+            image=docker.io/$DOCKERHUB_REPOSITORY
+          else
+            image=keymesh-web
+            echo "::notice title=keymesh-web image not pushed::$reason"
+          fi
+          {
+            echo "publish=$publish"
+            echo "reason=$reason"
+            echo "image=$image"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "tags<<EOF"
+            echo "$image:sha-$GITHUB_SHA"
+            if [ "$publish" = true ] && [ "$GITHUB_REF" = refs/heads/main ]; then echo "$image:main"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - if: steps.meta.outputs.publish == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: apps/web
+          file: deploy/web.Dockerfile
+          platforms: linux/arm64
+          push: ${{ steps.meta.outputs.publish == 'true' }}
+          # One plain manifest, so the digest CI reports is the one the Pi pulls;
+          # provenance comes from attest-build-provenance below.
+          provenance: false
+          sbom: false
+          build-args: KEYMESH_REVISION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+          tags: ${{ steps.meta.outputs.tags }}
+      - if: steps.meta.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          # Docker Hub must be named index.docker.io for push-to-registry.
+          subject-name: index.docker.io/${{ env.DOCKERHUB_REPOSITORY }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Summary and asset ledger
+        env:
+          PUBLISH: ${{ steps.meta.outputs.publish }}
+          REASON: ${{ steps.meta.outputs.reason }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          jq --arg image "$IMAGE" --arg digest "$DIGEST" --arg pushed "$PUBLISH" \
+            --arg tags "$TAGS" --arg platform linux/arm64 \
+            '{revision, image: {name: $image, digest: $digest, platform: $platform, pushed: ($pushed == "true"), tags: ($tags | split("\n") | map(select(length > 0)))}, files}' \
+            "$RUNNER_TEMP/bundle-ledger.json" > "$RUNNER_TEMP/asset-ledger.json"
+          {
+            echo "## keymesh-web image"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Revision | \`$GITHUB_SHA\` |"
+            echo "| Platform | linux/arm64 |"
+            if [ "$PUBLISH" = true ]; then
+              echo "| Pushed | yes |"
+              echo "| Digest | \`$IMAGE@$DIGEST\` |"
+              printf '%s\n' "$TAGS" | sed -n 's/.\{1,\}/| Tag | `&` |/p'
+            else
+              echo "| Pushed | no ($REASON) |"
+              echo "| Local build digest | ${DIGEST:-n/a} |"
+            fi
+            echo
+            echo "| Bundle file | sha256 | bytes |"
+            echo "|---|---|---|"
+            jq -r '.files | to_entries[]
+              | select(.key == "wasm/keymesh_wasm_bg.wasm" or .key == "ngsw.json" or (.key | test("^main-[^/]*\\.js$")))
+              | "| `\(.key)` | `\(.value.sha256)` | \(.value.bytes) |"' "$RUNNER_TEMP/asset-ledger.json"
+            echo
+            echo "Full ledger ($(jq '.files | length' "$RUNNER_TEMP/asset-ledger.json") files): artifact \`asset-ledger\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: asset-ledger
+          path: ${{ runner.temp }}/asset-ledger.json
+          if-no-files-found: error
+          retention-days: 90

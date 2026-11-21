@@ -20,12 +20,15 @@ x-hardening: &hardening
 services:
   web:
     <<: *hardening
+    # Local fallback: `up --build` builds keymesh-web:local from the current dist.
+    # CI-built images: deploy/pull-deploy.sh sets KEYMESH_WEB_IMAGE to the
+    # Docker Hub image pinned by digest and recreates web with --no-build.
     build:
       context: ../apps/web
       dockerfile: ../../deploy/web.Dockerfile
       args:
         KEYMESH_REVISION: ${KEYMESH_REVISION:-unknown}
-    image: keymesh-web:local
+    image: ${KEYMESH_WEB_IMAGE:-keymesh-web:local}
     user: "1000:1000"
     cap_drop: [ALL]
     environment:
