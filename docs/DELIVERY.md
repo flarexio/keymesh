@@ -7,7 +7,7 @@ Status (M4): HTTPS serving and secure-context gating are implemented and tested 
 Until then, the private-network previews stay plain HTTP and demo-only. Every flow, including password vaults, stays experimental and synthetic-only until independent acceptance.
 
 **Update (2026-11-15): private HTTPS deployment (option 1, using an existing CA).** The human chose `keymesh.cloud` and the existing FlareX step-ca at `ca.cloud`, which is resolved through the VPN DNS 10.8.0.1.
-* **What runs:** `deploy/` runs the web server and a Traefik TLS proxy in Docker on `10.8.0.22:443`. Traefik got its certificate from that CA by ACME HTTP-01. See `deploy/README.md`.
+* **What runs:** `deploy/` runs only the web container, on `127.0.0.1:4320`. Since 2026-11-21, TLS for `keymesh.cloud` is terminated by the host's shared Traefik (outside this repository), which gets its certificate from that CA by ACME and proxies to the web container. The route it needs is in `deploy/README.md`.
 * **Already verified:** gate B is verified against the real certificate (chain, hostname, headers, redirect, SNI refusal).
 * **Still open:** gate C. Each client must use the VPN DNS and trust the FlareX Root CA, and that must be checked on a real enrolled device.
 
@@ -142,7 +142,7 @@ tmux new-session -d -s keymesh-vpn-https \
 * The SPA fallback answers only extensionless paths. A missing `ngsw.json`, script, WASM or icon gets 404, never `index.html`.
 * The manifest is served as `application/manifest+json`. Security headers and CSP are unchanged.
 
-**Deployment:** rebuilding the `keymesh-web` image (`deploy/README.md`) publishes a new version. Installed copies pick it up on their next online visit.
+**Deployment:** a new `keymesh-web` image publishes a new version, and installed copies pick it up on their next online visit. Since 2026-11-21 CI builds a multi-arch image (`linux/amd64` and `linux/arm64`, each on a native runner) from the bundle that passed E2E and pushes it to Docker Hub as one index (`sha-<full sha>`, with build provenance for the index digest). The Pi deploys it with `deploy/pull-deploy.sh` pinned by the index digest, and an amd64 host can pull the same tag (`deploy/README.md`). Because WASM hashes differ by build host, acceptance is of the CI image digest and its asset ledger, not of a local rebuild.
 
 ## 7. Quick unlock, auto-lock and website icons (M5 phase C; experimental, accepted `88dee8b`, privately deployed 2026-11-16)
 
