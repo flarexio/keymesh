@@ -68,7 +68,7 @@ jobs:
   # Builds deploy/web.Dockerfile (COPY-only, so linux/arm64 needs no QEMU) from the
   # bundle E2E tested. It pushes to Docker Hub and attests only on push to main or
   # workflow_dispatch in flarexio/keymesh, and only when the DOCKERHUB_REPOSITORY
-  # variable and the DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets are set. Otherwise
+  # variable and the REGISTRY_USERNAME/REGISTRY_PASSWORD (flarexio organization) secrets are set. Otherwise
   # (pull requests, forks, missing settings) it builds without logging in or pushing.
   image:
     needs: [rust, web]
@@ -79,7 +79,7 @@ jobs:
       attestations: write
     env:
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
-      HAS_CREDENTIALS: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+      HAS_CREDENTIALS: ${{ secrets.REGISTRY_USERNAME != '' && secrets.REGISTRY_PASSWORD != '' }}
       PUBLISH_EVENT: ${{ github.repository == 'flarexio/keymesh' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
     steps:
       - uses: actions/checkout@v4
@@ -107,7 +107,7 @@ jobs:
           elif ! printf '%s' "$DOCKERHUB_REPOSITORY" | grep -Eqx '[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*'; then
             reason="build only: repository variable DOCKERHUB_REPOSITORY is missing or not <namespace>/<name>"
           elif [ "$HAS_CREDENTIALS" != true ]; then
-            reason="build only: secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are not both set"
+            reason="build only: secrets REGISTRY_USERNAME and REGISTRY_PASSWORD are not both set"
           else
             publish=true
           fi
@@ -131,8 +131,8 @@ jobs:
       - if: steps.meta.outputs.publish == 'true'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:

@@ -63,9 +63,9 @@ The preferred way to update `web`: GitHub Actions builds the image from the bund
 5. **Deploy.** On the host, `deploy/pull-deploy.sh <full sha>` (below).
 
 **One-time setup (FlareX; Claude never creates or handles tokens).**
-1. Create the Docker Hub repository, e.g. `<namespace>/keymesh-web`.
-2. Create a Docker Hub access token with **Read & Write** scope.
-3. In GitHub, *Settings → Secrets and variables → Actions*: add the secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`, and the variable `DOCKERHUB_REPOSITORY` = `<namespace>/keymesh-web`.
+1. **Credentials:** CI logs in with the flarexio **organization** secrets `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, which are already shared with this repository. The account needs push access to the namespace.
+2. **Repository:** set the Actions variable `DOCKERHUB_REPOSITORY` = `<namespace>/keymesh-web`. Docker Hub creates the repository on the first push, using the account's default privacy.
+3. **Visibility:** after the first push, check the repository's visibility on Docker Hub (see Registry login below).
 
 **Registry login on the host.** A public Docker Hub repository needs no login. A private one needs a one-time `sudo docker login` by FlareX, with a token that can read the repository (Read-only scope is enough). Don't put tokens in this repository, shell history or scripts.
 
