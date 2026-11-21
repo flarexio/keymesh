@@ -1,6 +1,6 @@
-# Keymesh M1 architecture and format decisions
+# Keymesh architecture and format decisions
 
-Status: **M1 foundation, not production ready.**
+Status: **M1–M4; not production ready.** Password vaults (M4) are experimental and synthetic-data only until independent acceptance.
 
 ## Crate layout
 
@@ -11,26 +11,32 @@ Single crate `keymesh` (library + `keymesh` CLI binary).
 | `rng` | `RandomSource` port; `OsRandom` (getrandom); unbiased `uniform_index` | |
 | `secret` | `SecretString` / `SecretBytes`: zeroize on drop, redacted `Debug` | |
 | `crypto` | XChaCha20-Poly1305 seal/open, `Key256`, `KeyProvider` port, synthetic providers | |
+| `kdf` | Argon2id (bounded parameters), NFC password normalization and new-password rules, HKDF slot KEKs | |
+| `keyslot` | v2 password/recovery key slots: validation, wrap/unwrap, slot-list digest, `Authority` | |
+| `recovery` | Recovery code: 256-bit secret, versioned Base32 text with check digits | |
 | `model` | Typed items + validation | |
 | `generate` | Passwords, random secrets (passphrase: pending) | |
 | `ed25519` | RFC 8032 keypair storage format, OpenSSH public-key line | |
 | `totp` | RFC 6238, Base32, `otpauth://totp` URIs, injectable clock | |
-| `vault` | In-memory vault + `keymesh.vault` v1 envelope | |
+| `vault` | In-memory vault + `keymesh.vault` v1 (demo) and v2 (password) envelopes | |
 | `storage` | Atomic file write, load/save, backup/restore | yes |
 | `import::op` | 1Password mapping, preview/apply, `OpRunner` port | |
 | `import::process` | Subprocess `OpRunner` | yes |
-| `bin/keymesh` | CLI harness | yes |
+| `bin/keymesh` | CLI (password vaults; `--demo` for v1) | yes |
 
 Native-only parts are behind the default `native` feature. `cargo check --lib --no-default-features --target wasm32-unknown-unknown` builds (the browser build reaches the CSPRNG through getrandom's `js` backend). The core has not been exercised in a browser yet.
 
 ## Key hierarchy
 
 ```
-KeyProvider (KEK, 256-bit)  ──wraps──▶  per-vault DEK (256-bit, random)  ──encrypts──▶  items + manifest
+v1 (demo):  KeyProvider (KEK, 256-bit)  ──wraps──▶  per-vault DEK (256-bit, random)  ──encrypts──▶  items + manifest
+v2:         password ─Argon2id─HKDF─▶ KEK_pw  ─┐
+            recovery code ──HKDF────▶ KEK_rc  ─┴─wraps (each)──▶  DEK  ──encrypts──▶  items + manifest
 ```
 
-* The KEK comes from a `KeyProvider`. M1 ships only `EphemeralKeyProvider` (tests) and `SyntheticDemoKeyProvider` (CLI, key from `KEYMESH_DEMO_KEY`). Neither stores a key next to the vault. **Production unlock and recovery are not implemented.** A proposed design (key slots: Argon2id password, recovery key, optional passkey PRF, later device enrolment; secure-context delivery; no migration of demo vaults) is in `docs/adr/0001-unlock-and-recovery.md`.
-* The DEK is random. `Vault::rotate_data_key` replaces it, and the next save re-encrypts everything.
+* **v1 (demo vaults):** the KEK comes from a `KeyProvider`: `EphemeralKeyProvider` (tests, browser "This session only") or `SyntheticDemoKeyProvider` (CLI, `KEYMESH_DEMO_KEY`) and the browser's public fixture key. Neither stores a key next to the vault.
+* **v2 (password vaults, M4, experimental):** exactly one password slot and one recovery slot, each wrapping the same random DEK. The full specification is in `docs/adr/0002-envelope-v2.md`: wire format, AAD, bounds, threat model, measurements and lifecycle. The design background is in `docs/adr/0001-unlock-and-recovery.md`.
+* The DEK is random. For v1, `Vault::rotate_data_key` replaces it, and the next save re-encrypts everything. For v2 it is refused: compromise rotation, which would also re-establish every slot, is deferred. Password and recovery-code changes are rewraps.
 * Ed25519 keys stored in the vault are item data. They are never used as or derived from the KEK/DEK.
 
 ## `keymesh.vault` v1 file
@@ -61,10 +67,16 @@ Public metadata is limited to the header plus item ids and revisions. The item c
 
 **Known limitation:** without external state, nothing detects a rollback of the whole file to an older valid revision.
 
+## `keymesh.vault` v2 file (password vaults)
+
+Same item and manifest structure, but `kek_id`/`wrapped_dek` are replaced by `slots` (exactly one `password` and one `recovery` slot), and every AAD uses length-prefixed fields that bind version 2. The manifest AAD also binds a digest of the whole slot list. The file's version decides how it opens: v1 only with a key provider, v2 only with its password or recovery code. The full specification is in `docs/adr/0002-envelope-v2.md`, and the shared vectors are in `tests/fixtures/v2/vectors.json`.
+
 ## Persistence safety
 
 * Writes go to a temp file in the same directory (mode 0600), then `fsync`, atomic rename and directory `fsync`.
-* `create` uses no-clobber. `save` re-reads the on-disk header and refuses if the vault id or revision differs from the loaded one (lost-update guard). This guard is not a lock: two writers racing inside the check→rename window are not excluded.
+* `create` uses no-clobber. `save` re-reads the file and refuses unless it is byte for byte (SHA-256) what this vault last read or wrote, including vault id and revision (lost-update guard).
+  * This catches a same-revision replacement with different content.
+  * The guard is not a lock: two writers racing inside the check→rename window are not excluded, and Keymesh assumes a single writer per file.
 * A failed decrypt never produces an empty vault, and there is no path that saves a fresh vault over an existing file.
 * `backup` and `restore` verify that the source decrypts before writing. Without `--force`, `restore` won't replace an existing file.
 * Reads and writes share one size bound, `MAX_VAULT_BYTES` (64 MiB). An oversize vault is refused when `create` or `save` is called, before any temp file is written: the old file stays byte-identical and loadable, and the in-memory revision does not advance. The caller must shrink the vault and save again.
@@ -136,9 +148,9 @@ Implemented with `ed25519-dalek` 2. The stored format is the 32-byte RFC 8032 se
 * Reports contain only hashed provenance ids (or `target:<n>` when a fetch failed before identification), allowlisted category codes, statuses, error codes, counts and constant warning codes. They never contain values, titles, raw ids, field ids, stderr or arguments.
 * The JSON field shape (`id/type/purpose/label/value/section`, `urls[].href`, `vault.id`) comes from the `op` item JSON format as understood at M1. The official reference pages do not specify it. **It has not been verified against real `op` output**, because accessing real data was not authorized.
 
-## Browser demo (M2, UI refined in M3)
+## Browser app (M2 demo, UI refined in M3, password vaults in M4)
 
-Status: **synthetic demo, development-only key handling, not production.**
+Status: **demo vaults use development-only keys; password vaults are experimental and synthetic-data only until independent acceptance. Not production.**
 
 ### Layers
 
@@ -168,7 +180,19 @@ Angular (apps/web)  ── JSON views / masked slots ──▶  keymesh-wasm (wa
 | `ephemeral` | random, generated in WASM | lost; the stored ciphertext becomes inaccessible, and the UI says so | no recovery exists |
 | `synthetic-fixture` | SHA-256 of a **public** label | reopens | anyone can decrypt; only for demos and tests |
 
-The key is never exported to JavaScript and never appears in the URL, storage, console or error messages. There is no key-entry or recovery product flow.
+The key is never exported to JavaScript and never appears in the URL, storage, console or error messages. A demo vault is never converted into a password vault.
+
+### Password vault (M4, experimental)
+
+* **Separate storage:** IndexedDB database `keymesh-vault` (same record shape; `kekId` is a fixed placeholder). It is opened only in a secure context, and reads never create it.
+* **Secure contexts only:** `SECURE_CONTEXT` is `isSecureContext`. On a plain-HTTP LAN/VPN origin every password-vault operation throws `insecureContext`, and the start screen explains why; the demo keeps working.
+* **Argon2id in a worker:** `core/kdf.ts` compiles the WASM module once and hands it to a short-lived module worker (`kdf.worker.ts`). The worker runs `deriveArgon2id` for a request the core issued: `passwordRequest(bytes)`, `ProtectedCreation.request()` or `beginPasswordChange()`. The core keeps every pending setup, so JavaScript only passes derived keys back, never parameters of its own choosing. Results are transferred and zeroed after use.
+* **One credential operation at a time:** a second one is refused (`busy`), not queued.
+* **Lock cancels:** `lock()` terminates the worker and frees an unconfirmed new vault. Every step re-checks the lock generation after the KDF, after IndexedDB and after file reads.
+* **Create:** a password → `VaultSession.createProtected` (in memory) → the recovery code is shown → the user types it back → the core verifies it by unwrapping the recovery slot → seal → compare-and-swap into empty storage → open.
+* **Stale password vault:** "Load latest version" locks the password vault, re-reads only its own database and returns to password entry, with a notice. It never opens or touches the demo vault. Unlocking then opens the current stored copy.
+* **Other flows:** unlock; reset with the recovery code; restore a v2 backup with its password (stored unchanged) or its recovery code plus a new password; change password; new recovery code; delete from this browser. All writes use the same exact-byte compare-and-swap. Failed credential writes roll the core back (`rollback`).
+* **Product copy mapping:** "Password vault" is envelope v2; "Demo vault" is v1 with the ephemeral or fixture key; "Securing your vault…" is the Argon2id step; "Password vaults need a secure connection" means a non-secure context.
 
 ### Persistence and concurrency
 
@@ -205,7 +229,11 @@ The key is never exported to JavaScript and never appears in the URL, storage, c
 * A CSP meta tag and server header allow `default-src 'self'` and `script-src 'self' 'wasm-unsafe-eval'`. Styles allow `'unsafe-inline'` for Angular component styles. Critical-CSS inlining is disabled, so no inline event handler is needed.
 * There are no third-party origins, analytics or remote fonts (system font stack only). E2E asserts that only same-origin requests are made.
 * The saved theme and language are applied before first paint by `public/preferences-boot.js`, a same-origin classic script loaded from `<head>`. No inline script and no new CSP allowance is needed; E2E asserts the page has no inline scripts and logs no CSP violations.
-* `scripts/serve.mjs` (production build) binds to 127.0.0.1 and sends `nosniff`, `no-referrer`, COOP and `frame-ancestors 'none'`. An explicit `HOST=<one literal IP>` enables a LAN preview; wildcards and hostnames are refused, and the headers are unchanged. That origin is plain HTTP and not a secure context: there is no Clipboard API, COOP is ignored and traffic is unencrypted (see `apps/web/README.md`).
+* `scripts/serve.mjs` (production build) binds to 127.0.0.1 and sends `nosniff`, `no-referrer`, COOP and `frame-ancestors 'none'`.
+  * An explicit `HOST=<one literal IP>` enables a LAN preview. Wildcards and hostnames are refused, and the headers are unchanged.
+  * That origin is plain HTTP and not a secure context: there is no Clipboard API, COOP is ignored, traffic is unencrypted and password vaults are off (see `apps/web/README.md`).
+  * `TLS_CERT`/`TLS_KEY` serve HTTPS (TLS 1.2+) with HSTS. See `docs/DELIVERY.md` for what is and isn't proven.
+* The CSP also allows `worker-src 'self'` for the KDF worker. The worker script is a same-origin build chunk, and the WASM module is compiled by the page and handed to it.
 
 ### Language and appearance (M3)
 
@@ -226,5 +254,6 @@ The key is never exported to JavaScript and never appears in the URL, storage, c
 * Offline startup is deferred: there is no service worker, so loading the app needs its origin.
 * QR or camera TOTP import is not implemented.
 * No passphrase generator yet.
-* The browser and CLI vault files are separate, and moving data between them is not implemented.
+* The browser and CLI vault files are separate stores; a v2 backup from one can be restored in the other (same format), but there is no sync.
+* The typed master password is a JavaScript string and cannot be reliably erased. Derived keys are zeroed, but only as `Uint8Array` copies.
 * Native limitations still apply: a single writer per file with no file lock (natively), and whole-file rollback cannot be detected.

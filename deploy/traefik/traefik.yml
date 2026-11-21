@@ -1,0 +1,28 @@
+# Traefik static configuration: TLS termination for keymesh.cloud on the VPN address only.
+# No dashboard or API. Ping (health check) is on loopback only.
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+log:
+  level: INFO
+entryPoints:
+  web:
+    address: 10.8.0.22:80
+  websecure:
+    address: 10.8.0.22:443
+  ping:
+    address: 127.0.0.1:8082
+ping:
+  entryPoint: ping
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+certificatesResolvers:
+  stepca:
+    acme:
+      # FlareX internal step-ca. Its TLS is verified with LEGO_CA_CERTIFICATES (the FlareX root).
+      caServer: https://ca.cloud:8343/acme/acme/directory
+      storage: /data/acme.json
+      keyType: EC256
+      httpChallenge:
+        entryPoint: web

@@ -1,0 +1,41 @@
+{
+  "argon2id": {
+    "m_kib": 65536,
+    "output_hex": "2b39a050e2efdb1f000b14604d2a3b60eaed0fc223d9025d287bca5b67714c22",
+    "p": 1,
+    "password": "synthetic vector café passphrase",
+    "salt_hex": "24242424242424242424242424242424",
+    "t": 3
+  },
+  "envelope": {
+    "json": "{\n  \"format\": \"keymesh.vault\",\n  \"version\": 2,\n  \"aead\": \"xchacha20poly1305\",\n  \"vault_id\": \"ad879f8580ed546e06a192d63c328b45\",\n  \"revision\": 1,\n  \"slots\": [\n    {\n      \"id\": \"c20f29e578bb34f9\",\n      \"kind\": \"password\",\n      \"kdf\": {\n        \"alg\": \"argon2id\",\n        \"v\": 19,\n        \"m_kib\": 65536,\n        \"t\": 3,\n        \"p\": 1,\n        \"salt\": \"IpKa0S8ciKUSP_B4m246aA\"\n      },\n      \"wrapped\": {\n        \"nonce\": \"aW3KJEU-XX2G_zhTZe1WvaVFlJHrRaLl\",\n        \"ct\": \"YgC2WNar_IVg2dT0mxp1UmuhDNVZ9VtMKpNOrywbpAFdj9FYzAiUWOedj9hlFAbk\"\n      }\n    },\n    {\n      \"id\": \"cd121a56e809c05e\",\n      \"kind\": \"recovery\",\n      \"kdf\": {\n        \"alg\": \"hkdf-sha256\",\n        \"salt\": \"drzeChm0K6nSaM6-LzzcBg\"\n      },\n      \"wrapped\": {\n        \"nonce\": \"HFRoxuGwl_r_NrqpVFaSY5FGPitVtV_i\",\n        \"ct\": \"3GFASHqg_fnDSloKlqmhlbnA-i8IOAAJTe7ylxmCnQoAm78LkDId-ocIAHZaD_3r\"\n      }\n    }\n  ],\n  \"manifest\": {\n    \"nonce\": \"xuCee4fQDpUfYnbZhjWoeB1-hutqZ2ak\",\n    \"ct\": \"ys5mwvgODRHv4IVHtAWCkLA94FKWshZrK9uwUd9xqKbHyHLzFCkRpw8-Z5iwjIk4BVEqVH3xo2hGM6DXWGyqFNW4O6TWV5762CPpttRliyujyEbqp3OxlTS1VMfmEOUlT_05hZtNAdT_igzO-4GlMjsK-Dyt27t8uW_FeifXmAwa3T9XOhmzDW3d24aux3B1mPGG3-HL8-MP2mezjwLwA4rdj4WbRiuRxbkUMcFQLPvJEI8F_rOdbmYDqc0_tnKWpuXTdfm7hvQY6I2p8ZUNY7RFgsyGFz8bf_5neqi6sPPY8K-GzykSvapFYAeA-BDVreVPq4Mxa_vnRsrXWL6vOCPwj6YbhvVO42HILqHCX3z-wM6rk5GyFDOWc8K6-YM_ouFQD8q-ZtCo3IIzoO-maLT416Qp0LP-OiZejWxcm-pBroAfmaq_StMCOQyxvykHvKkOSw\"\n  },\n  \"items\": [\n    {\n      \"id\": \"6ff2ed5fac2f26ba4e27705280d8a1a2\",\n      \"rev\": 1,\n      \"sealed\": {\n        \"nonce\": \"qkFWLwLQUJJC1_ADNkT_bNXOeN621X1B\",\n        \"ct\": \"g5iap0vFF3j8O5os_gpdW2QYK2w-2H7m7EfA0rS1HIffQrEwL0DvojMG0f2MkuudhF2vJXK4DWyybkK_3NbkdcmEFbtBPJfJosxUfAJKTgS3VQSZqJPKT42b5l8bGXgNkCzPMBclM1Fpj1Lhbqov8j_6TljrdrSdTZw-13gIG5LNKAD1NMTRcnFPRxk73TuVojYPTCI8j8jL_8dhP_eVVvG2PXw2yjzCqG_4LaOq99W4gwikFm9mwZoHs_BiYUEeLO9fQbjKMDk9lb8Ys6V4GI-h76xJbQTTtRq968jNFfdvM3N34VFup-U_P1FD6ILr22tig31-OjEq_XK7FUaY1buKgU-c\"\n      }\n    },\n    {\n      \"id\": \"d96c1940ffeef34fc859d585150620a7\",\n      \"rev\": 1,\n      \"sealed\": {\n        \"nonce\": \"6Fq0hmgGhkgVJ0Ub0xpSExHMl5g4gDiV\",\n        \"ct\": \"z2xfVAaSgtyOk4EaEhWaCSXloInxRLS5TejF5slYdqZkH7zgFdPRVO1UkwYh9jRksG11e0rlvM_oCJJGe78r31OOIfglRsoFpZ3uIr3X6jfZWFpFHQCDqB1iYyiODpYkO7hyiSC9dr2KCoWuK_6fpKwwRV7o9ZiGwcqzkH4A4GfXd5doxqjZR_JBRkrziWkb94db8wr_AX7mX0EaJPDat7yi9O0hacSZiQf8h8y8dfNXi1NWCF6Uiw5DwGUwAMN649sPsTu7d197BgGCeFWVz0rgPn5JIkpGJPj5I2G2o58I55p6AwPsM6dkqOrhUDu8JorpztfkodTCdjbBFPjUemgL7Wtkody0_XwMOTr3AbZQyfhQ4pq4U1LbeMkS5PD-SJerDyDCXEYkPLwKyhfrF5zu1H9dZdkkT0I2hkQV4EgHry-YZ3icPIEzWex6PB1k-32S8iA\"\n      }\n    }\n  ]\n}",
+    "password": "synthetic vector café passphrase",
+    "recovery_code": "AH4X-MTPP-SBVK-GN3L-W3JT-7ZKN-JTDL-2YSL-2ONY-ND7H-HCC6-KAB6-BBEI-D2EV",
+    "revision": 1,
+    "titles": [
+      "Vector login",
+      "Vector note"
+    ],
+    "vault_id": "ad879f8580ed546e06a192d63c328b45"
+  },
+  "kek": {
+    "password": {
+      "ikm_hex": "2b39a050e2efdb1f000b14604d2a3b60eaed0fc223d9025d287bca5b67714c22",
+      "kek_hex": "7a91290c42aa5160179ff7a904b205a6daf6407fa318c87ba9c2e2b08cbc5883",
+      "slot_id": "0123456789abcdef",
+      "vault_id": "00112233445566778899aabbccddeeff"
+    },
+    "recovery": {
+      "ikm_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "kek_hex": "d6d16d994caa6d754eb7e566d86a3da45e11c6f794ac8b872912c5ba196defa1",
+      "salt_hex": "24242424242424242424242424242424",
+      "slot_id": "fedcba9876543210",
+      "vault_id": "00112233445566778899aabbccddeeff"
+    }
+  },
+  "note": "Synthetic, public test vectors for keymesh.vault v2. Not secrets.",
+  "recovery_code": {
+    "secret_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+    "text": "AGQK-DIVD-USS2-NJ5I-VGVK-XLFN-V2X3-BMNS-WO2L-LNVX-XC43-VO54-XW7L-7D76"
+  }
+}

@@ -17,7 +17,7 @@ All colours are semantic custom properties defined with `light-dark(light, dark)
 |---|---|---|
 | Surfaces | `--bg`, `--surface`, `--surface-2`, `--surface-sunken`, `--surface-hover` | page, cards and panes, sidebar and subtle fills, inputs and code, hover |
 | Lines | `--border`, `--border-strong` | dividers and cards; inputs and secondary buttons |
-| Text | `--fg`, `--fg-muted`, `--fg-subtle` | body, secondary, labels/meta (all ≥ 4.5:1 on `--surface` and `--bg`) |
+| Text | `--fg`, `--fg-muted`, `--fg-subtle` | body, secondary, labels/meta. Token contrast against every surface token is ≥ 4.5:1; the lowest is `--fg-subtle` on `--accent-soft`, 4.72 light / 4.84 dark. E2E measures rendered secondary and status text in both themes |
 | Accent | `--accent`, `--accent-hover`, `--accent-fg`, `--accent-soft`, `--accent-soft-fg` | primary actions, selection, focus |
 | Status | `--danger*`, `--success*`, `--warn*`, `--info-*` | destructive actions and errors, confirmations, demo/stale warnings, neutral callouts |
 | Kinds | `--kind-<item kind>` | low-saturation hue per item type, always paired with an icon and a text label |
@@ -46,12 +46,36 @@ No remote fonts, images or icon fonts are loaded. Icons are a small local stroke
 - **Touch:** on `pointer: coarse`, buttons, nav items, menu items and the language/appearance segments are at least 44×44px. That rule sits last in `components.css` so later component rules cannot shrink it; E2E measures it at 320 and 390px in both locales.
 - **Feedback:** inline callouts (info, warning, danger, success) with an icon and text, and short-lived toasts in a polite live region. Errors are localized and never show raw low-level messages.
 - **States:** loading (spinner plus text, static under reduced motion), core failed to start (with a reload action), start, stored vault found, ephemeral key lost, locked, empty vault (a grid of item types to create), no search matches (clear filters), and stale tab (blocking warning plus reload).
+- **Start-screen orientation (M4 follow-up):**
+  - A "Vaults in this browser" overview opens the start screen. It has one row per kind: "Password vault" (protected by your master password, experimental) and "Demo vault" (not confidential, sample data only).
+  - Each row shows its state: not created, locked, saved, can't be opened, being created, or needs HTTPS. A button moves focus to that card without changing the URL.
+  - The cards follow the overview's order. An **existing** vault comes before creating a new one: a locked or saved demo vault comes before password-vault *creation*, while an existing or in-progress password vault always stays first.
+  - The demo card is the one that moves, in DOM order, so keyboard and screen-reader order match what is shown. The password card keeps its state.
+- **Demo-mode notice:** inside an open demo vault, a warning callout at the top of the workspace says what the mode means. It is shown on desktop and mobile, below the global preview strip, which stays.
+  - **Test key:** "uses a public test key, so anyone with the stored data can read it".
+  - **Session only:** "not protected by a password, and can't be opened after a reload".
+  - Password vaults don't show it.
+- **Password vault (M4):** the password vault card and the demo card, labelled "Demo vault", are ordered as above. Card states:
+  - create (password, repeat, hint "at least 15 characters");
+  - recovery code (shown once in 14 monospace groups, Copy, an "I've saved it" checkbox, then typed back);
+  - unlock (password with Show/Hide, "Forgot your password?");
+  - reset with the recovery code;
+  - restore a backup (choose "With its password" or "With the recovery code");
+  - delete from this browser (danger zone);
+  - "Password vaults need a secure connection" on plain HTTP.
+
+  Buttons show progress text ("Securing your vault…", "Unlocking…") and stay disabled while the key derivation runs. The Backup page adds "Password and recovery" (change password, new recovery code) and a plain note that these changes don't affect older backups.
 - **Motion:** short transitions only. `prefers-reduced-motion: reduce` disables transitions and animations.
 
 ## Writing and translation
 
 - Write for people managing credentials: name the goal and the result, not the mechanism. Implementation terms (Rust, WASM, IndexedDB, envelopes, compare-and-swap, key-provider names) belong in `docs/ARCHITECTURE.md`, not on screen. Keep technical terms people need to choose or use something: TOTP, Ed25519, OpenSSH, Base32, otpauth://, hex/base64url, `op`.
-- Limitations stay visible and plain: "Preview version. Do not store real passwords." (預覽版本，請勿存放真實密碼。), no recovery, data loss on reload for "This session only", and failed or blocked saves, each with its consequence and next step. Never claim production safety, audits or guaranteed security.
+- Limitations stay visible and plain, each with its consequence and next step:
+  - "Preview version. Do not store real passwords." (預覽版本，請勿存放真實密碼。);
+  - experimental password vaults;
+  - that no one can reset a lost password and recovery code;
+  - data loss on reload for "This session only";
+  - failed or blocked saves. Never claim production safety, audits or guaranteed security.
 
 - Catalog keys are grouped by area (`start.*`, `list.*`, `detail.*`, `field.*`, `form.*`, `errors.*`, …). Add a key to `en.ts` first; the build fails until `zh-tw.ts` has it too.
 - zh-TW uses Taiwan terminology: 保險庫, 項目, 金鑰, 登入資訊, 產生器, 匯入, 備份, 還原, 設定, 檔案, 剪貼簿 and so on. A unit test rejects common Simplified-only characters.

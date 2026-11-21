@@ -2,15 +2,20 @@
 
 Local-first encrypted vault core in Rust, with an Angular browser demo running the same core compiled to WebAssembly.
 
-> **Status: M3 synthetic demo — NOT production ready.** The only key providers are synthetic/demo ones, development-only. Real unlock, recovery and Keymesh's own authentication don't exist yet. Use synthetic data only.
+> **Status: M4 experimental — NOT production ready, not independently accepted.** Password vaults (master password + independent recovery code, envelope v2, `docs/adr/0002-envelope-v2.md`) work natively and in the browser, but stay **synthetic-data only until independent acceptance**. Demo vaults keep their public fixture or ephemeral keys. Keymesh's own authentication, accounts and sync don't exist. Trusted remote HTTPS is not set up yet (`docs/DELIVERY.md`).
 
-## Capability matrix (M1 core, M2 browser slice, M3 UI)
+## Capability matrix (M1 core, M2 browser slice, M3 UI, M4 local unlock)
 
 | Area | State | Notes |
 |---|---|---|
 | Typed items: Login, Secret/API credential, Contact, CryptoWalletRecord, Ed25519Key, TOTP, SecureNote | ✅ | Validation rules; multi-value contact fields; custom fields; Login → TOTP reference and recovery codes |
 | AEAD encryption (XChaCha20-Poly1305), versioned envelope, AAD binding | ✅ | KEK → random DEK; per-item records plus an encrypted manifest; see `docs/ARCHITECTURE.md` |
-| Key-provider port | ✅ | Ephemeral (tests) and **synthetic demo** (CLI env var) only |
+| Key-provider port (v1 demo vaults) | ✅ | Ephemeral (tests) and **synthetic demo** (CLI env var) only |
+| Password vault (envelope v2): master password + recovery code key slots | ✅ experimental | Argon2id 64 MiB/t=3/p=1 → HKDF-SHA256; 256-bit recovery code (Base32, version + check digits) confirmed before first save; bounds checked before derivation; shared vectors checked natively, in WASM and independently with Node/OpenSSL |
+| Password change, reset with recovery code, new recovery code | ✅ experimental | Need proof of authority verified by the core; **rewraps, not rotation**: earlier backups keep earlier credentials. Compromise rotation of the data key is deferred |
+| Native CLI unlock | ✅ experimental | `init`, `passwd [--recovery]`, `new-recovery-code`, `recover`; masked terminal input or `--password-stdin`; `init --demo` keeps the v1 demo |
+| Browser password vault | ✅ experimental | Secure contexts only (HTTPS or loopback); Argon2id in a worker; one credential operation at a time; lock cancels it; refused on plain-HTTP LAN/VPN origins, where the demo stays usable |
+| HTTPS serving | ✅ loopback-tested | `serve.mjs` TLS mode; `npm run tls-check` verifies chain/hostname/TLS floor/headers with a throwaway CA. **Trusted remote-browser access is blocked** on a certificate decision (`docs/DELIVERY.md`) |
 | Atomic local persistence, load/edit/save, encrypted backup/restore | ✅ | Fails closed on a wrong key, corruption, truncation or an unknown format; lost-update guard |
 | Password generator (24 default / 32 strong presets, custom length 8–128, character types, custom ASCII-punctuation symbol set, look-alike exclusion, one-of-each-type; unbiased sampling) | ✅ | Same 64-bit floor for custom settings, checked against the generator's exact min-entropy |
 | Random 256-bit secrets (hex / base64url / base32) | ✅ | Local random values, not provider-issued credentials |
@@ -32,21 +37,26 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 | Cross-tab writes | ✅ rejected | Exact-snapshot compare-and-swap on every write (mutation, restore, discard) plus a BroadcastChannel stale notice; stale tabs cannot edit or restore until they reload |
 | Offline startup (service worker / PWA) | ⏳ deferred | No service worker; the app needs its origin to load |
 | 1Password import in the browser | ❌ by design | Native CLI only; no endpoint runs `op`; the browser shows CLI instructions |
-| Production unlock / recovery | ❌ not started | Lost ephemeral demo key ⇒ demo ciphertext is unrecoverable |
+| Production use of password vaults | ⏳ pending review | Experimental until independent acceptance; lost password **and** recovery code ⇒ data unrecoverable (no escrow, no reset); lost ephemeral demo key ⇒ demo ciphertext unrecoverable |
+| Passkey / PRF, device slots, mnemonic or keycard encodings, compromise rotation | ❌ deferred | ADR 0001 stages 2–4 |
 | Keymesh login (mnemonic, image keycards), wallet/identity/KMS, NATS, blockchain | ❌ deferred | Out of scope |
 | Sync between devices; CLI ↔ browser vault transfer | ❌ deferred | |
 
 ## Known limitations
 
-- **Demo key provider only:** the CLI key comes from `KEYMESH_DEMO_KEY`. Real unlock and recovery aren't designed yet.
-- **Single writer:** `save` refuses when the file changed since it was loaded, but there is no file lock. Two writers racing during the save can still conflict.
+- **Experimental password vaults:** implemented to a reviewed-format proposal (ADR 0002); partially reviewed, not independently accepted. Synthetic data only.
+- **Rewrap, not rotation:** changing the password or recovery code doesn't revoke older backups or data already read. Compromise rotation is not implemented.
+- **Weak passwords stay guessable offline:** anyone with the file can try passwords at about one Argon2id (64 MiB, t=3) per guess. Use a long passphrase; the recovery code itself cannot be guessed.
+- **Single writer:** `save` refuses unless the file is byte for byte what was loaded, but there is no file lock. Two writers racing during the save can still conflict.
+- **Durability:** if the system can't sync the directory after the new file is in place, the CLI exits with status 3 and says the change is in effect but durability is unconfirmed. A failure before that point leaves the old file untouched.
 - **Whole-file rollback** to an older valid vault file can't be detected without external state.
 - **Size limit:** vault files are limited to 64 MiB for both reading and writing. A save that would exceed it is refused and leaves the old file intact.
 - **Browser key handling (M2):** the demo key provider lives in WASM memory only.
   - With the *ephemeral* key, a reload loses the key, and the stored demo ciphertext becomes permanently inaccessible.
   - The *synthetic fixture* key is public: anyone can decrypt data stored under it.
 - **UI (M3):** E2E runs in Chromium only; Firefox and Safari are untested. Theme tokens use CSS `light-dark()`, which needs Chrome/Edge 123+, Firefox 120+ or Safari 17.5+. Chinese text uses whatever Traditional Chinese system font is installed (no bundled fonts). The zh-TW catalog was written and checked in-project, without a separate professional or native-speaker review.
-- **Browser memory:** JavaScript and WASM cannot guarantee zeroization. Revealed or copied values, form inputs and the clipboard are outside Keymesh's control. Lock removes decrypted vault state in WASM, but the browser may still retain copies.
+- **Browser memory:** JavaScript and WASM cannot guarantee zeroization. The typed master password is a JavaScript string; revealed or copied values, form inputs and the clipboard are outside Keymesh's control. Lock removes decrypted vault state in WASM and terminates a running key derivation, but the browser may still retain copies.
+- **KDF measurements** are from a Raspberry Pi 4 (native and Chromium WASM). No phone, laptop, Firefox or Safari was measured.
 
 ## Build and test
 
@@ -54,7 +64,9 @@ Local-first encrypted vault core in Rust, with an Angular browser demo running t
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo clippy -p keymesh-wasm --target wasm32-unknown-unknown -- -D warnings
+cargo clippy -p keymesh -p keymesh-wasm --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
+node scripts/check-vectors.mjs          # independent Node/OpenSSL check of the v2 vectors (Node >= 24.7)
+cargo run --release --example kdf_bench # synthetic Argon2id timings
 ```
 
 Browser demo: see [`apps/web/README.md`](apps/web/README.md). In short:
@@ -63,14 +75,29 @@ Browser demo: see [`apps/web/README.md`](apps/web/README.md). In short:
 cd apps/web && npm ci && npm run build:wasm && npm run build && npm start   # http://127.0.0.1:4310
 ```
 
+## Password vault (CLI, experimental, synthetic data only)
+
+```sh
+export KEYMESH_VAULT=./vault.keymesh
+cargo run -q -- init                     # asks for a master password, shows the recovery code once, asks for it back
+cargo run -q -- add ed25519 --title "Synthetic key"   # every command asks for the password
+cargo run -q -- backup --to ./vault.bak
+cargo run -q -- passwd                   # current password, then the new one (older backups keep the old one)
+cargo run -q -- passwd --recovery        # forgot it: recovery code, then a new password
+cargo run -q -- new-recovery-code        # current password; the new code must be typed back
+cargo run -q -- --vault ./restored.keymesh recover --from ./vault.bak   # recovery code + new password
+```
+
+Passwords and recovery codes are read from the terminal without echo, or with `--password-stdin` one line each from stdin, followed by any other stdin input. They are never accepted as arguments or environment variables.
+
 ## Synthetic demo (CLI harness)
 
-The CLI reads the vault key from `KEYMESH_DEMO_KEY`: 64 hex characters, used only by the synthetic demo provider. The key is never written to disk. Don't put real secrets in a demo vault.
+The CLI reads the demo vault key from `KEYMESH_DEMO_KEY`: 64 hex characters, used only by the synthetic demo provider. The key is never written to disk. Don't put real secrets in a demo vault.
 
 ```sh
 export KEYMESH_DEMO_KEY=$(cargo run -q -- gen secret --bytes 32 --encoding hex)
 export KEYMESH_VAULT=./demo.keymesh
-cargo run -q -- init
+cargo run -q -- init --demo
 cargo run -q -- add login --title "Example" --username demo --url https://example.test --generate
 printf 'otpauth://totp/Example:demo?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Example' \
   | cargo run -q -- add totp --title "Example TOTP"
@@ -104,9 +131,12 @@ The importer:
 
 ```
 src/             crypto, model, generate, ed25519, totp, vault, storage, import/{op,process}, bin/keymesh
-tests/           op_import.rs (fake runner + fake executable), cli.rs (binary smoke tests), fixtures/
+tests/           op_import.rs (fake runner + fake executable), cli.rs / cli_protected.rs (binary tests), v2_vectors.rs, fixtures/
 crates/keymesh-wasm/  wasm-bindgen browser bridge (logic in bridge.rs, natively unit-tested)
 apps/web/        Angular 22 demo app, Vitest unit tests, Playwright E2E (e2e/)
-scripts/         build-wasm.sh (cargo wasm32 build + wasm-bindgen into apps/web)
-docs/            ARCHITECTURE.md (formats, key hierarchy, browser demo, decisions, limitations)
+scripts/         build-wasm.sh (cargo wasm32 build + wasm-bindgen into apps/web), check-vectors.mjs
+bench/kdf-wasm/  benchmark-only WASM crate (Argon2id timings in a browser; not part of the app)
+docs/            ARCHITECTURE.md (formats, key hierarchy, browser app, decisions, limitations), DESIGN.md,
+                 DELIVERY.md (HTTPS scope and decision), ROADMAP.md (backlog, gates, acceptance criteria),
+                 adr/0001 (unlock/recovery design), adr/0002 (envelope v2), adr/0003 (quick unlock, proposed)
 ```

@@ -12,15 +12,21 @@ use keymesh::generate::{
     generate_password, generate_secret, PasswordOptions, PasswordPolicy, PasswordProfile,
     PolicySummary, SecretEncoding,
 };
+use keymesh::kdf::{self, KdfParams};
+use keymesh::keyslot::{Authority, PasswordSetup};
 use keymesh::model::{
     Contact, CryptoWalletRecord, CustomField, Ed25519KeyRecord, FieldKind, Item, ItemData, ItemId,
     ItemKind, LabeledValue, Login, SecretCredential, SecretFormat, SecretOrigin, SecureNote,
     TotpRecord,
 };
+use keymesh::recovery::RecoveryCode;
 use keymesh::rng::OsRandom;
 use keymesh::secret::SecretString;
 use keymesh::totp::{code_now, parse_base32_secret, parse_otpauth_uri, FixedClock, TotpConfig};
-use keymesh::vault::{read_header, Vault};
+use keymesh::vault::{
+    password_request as envelope_password_request, read_header, PendingRecovery, ProtectedSetup,
+    Vault,
+};
 use keymesh::{Error, Result};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -449,8 +455,11 @@ fn view(i: &Item) -> Result<ItemView> {
 
 #[derive(Debug, Serialize)]
 pub struct EnvelopeInfo {
+    /// 1: demo key provider; 2: password + recovery key slots.
+    pub version: u32,
     pub vault_id: String,
-    pub kek_id: String,
+    /// v1 only.
+    pub kek_id: Option<String>,
     pub revision: u64,
 }
 
@@ -458,10 +467,94 @@ pub fn inspect_envelope(bytes: &[u8]) -> Result<EnvelopeInfo> {
     check_size(bytes)?;
     let h = read_header(bytes)?;
     Ok(EnvelopeInfo {
+        version: h.version,
         vault_id: h.vault_id,
         kek_id: h.kek_id,
         revision: h.revision,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Password key derivation (run by the browser in a worker)
+// ---------------------------------------------------------------------------
+
+/// Public Argon2id parameters for one password slot. Sent to the KDF worker;
+/// contains no secret.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct KdfRequest {
+    pub salt: String,
+    pub m_kib: u32,
+    pub t: u32,
+    pub p: u32,
+}
+
+impl KdfRequest {
+    fn of(setup: &PasswordSetup) -> Self {
+        Self {
+            salt: data_encoding::BASE64URL_NOPAD.encode(&setup.salt),
+            m_kib: setup.params.m_kib,
+            t: setup.params.t,
+            p: setup.params.p,
+        }
+    }
+}
+
+/// Parameters for unlocking a stored v2 envelope (bounds already checked).
+pub fn password_request(bytes: &[u8]) -> Result<KdfRequest> {
+    check_size(bytes)?;
+    Ok(KdfRequest::of(&envelope_password_request(bytes)?.setup))
+}
+
+/// Argon2id for a [`KdfRequest`]. The request is re-validated here (the
+/// worker trusts nothing it is sent) before any memory is allocated.
+pub fn derive_password_key(password: &str, request_json: &str) -> Result<Zeroizing<[u8; 32]>> {
+    if request_json.len() > 512 {
+        return Err(Error::Format("invalid key derivation request".into()));
+    }
+    let r: KdfRequest = serde_json::from_str(request_json)
+        .map_err(|_| Error::Format("invalid key derivation request".into()))?;
+    let salt = data_encoding::BASE64URL_NOPAD
+        .decode(r.salt.as_bytes())
+        .map_err(|_| Error::Format("invalid key derivation request".into()))?;
+    kdf::argon2id(
+        password,
+        &salt,
+        KdfParams {
+            m_kib: r.m_kib,
+            t: r.t,
+            p: r.p,
+        },
+    )
+}
+
+/// NIST SP 800-63B-4 checks for a new master password.
+pub fn check_new_password(password: &str) -> Result<()> {
+    kdf::check_new_password(password)
+}
+
+fn key32(b: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    let arr: [u8; 32] = b
+        .try_into()
+        .map_err(|_| Error::Validation("derived key must be 32 bytes".into()))?;
+    Ok(Zeroizing::new(arr))
+}
+
+/// A vault about to be created: fixed id and password slot parameters, so
+/// the derived key the browser returns is for exactly this setup.
+pub struct ProtectedCreation {
+    setup: ProtectedSetup,
+}
+
+impl ProtectedCreation {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            setup: ProtectedSetup::generate(&mut OsRandom)?,
+        })
+    }
+    pub fn request(&self) -> KdfRequest {
+        KdfRequest::of(&self.setup.password)
+    }
 }
 
 fn check_size(bytes: &[u8]) -> Result<()> {
@@ -489,6 +582,12 @@ pub struct Session {
     max_bytes: usize,
     /// Values shown to the user before saving; see [`Session::save_preview`].
     previews: Previews,
+    /// v2: the code of a NEW vault, shown until it is confirmed.
+    new_code: Option<RecoveryCode>,
+    /// v2: password slot parameters for a pending password change.
+    pending_password: Option<PasswordSetup>,
+    /// v2: a replacement recovery code waiting for confirmation.
+    pending_recovery: Option<PendingRecovery>,
 }
 
 /// The latest generated-but-unsaved value per generator. Zeroized on drop,
@@ -507,6 +606,9 @@ impl Session {
             pending: None,
             max_bytes: MAX_ENVELOPE_BYTES,
             previews: Previews::default(),
+            new_code: None,
+            pending_password: None,
+            pending_recovery: None,
         }
     }
 
@@ -534,6 +636,146 @@ impl Session {
         self.committed = None;
         self.pending = None;
         self.previews = Previews::default();
+        self.new_code = None;
+        self.pending_password = None;
+        self.pending_recovery = None;
+    }
+
+    // --- v2: password + recovery --------------------------------------------
+
+    /// New empty password vault for `creation` and the browser-derived key.
+    /// The recovery code is available from [`Session::shown_recovery_code`]
+    /// until [`Session::confirm_recovery`]; sealing is refused before that.
+    pub fn create_protected(creation: &ProtectedCreation, password_key: &[u8]) -> Result<Self> {
+        let key = key32(password_key)?;
+        let (vault, code) = Vault::create_protected(&creation.setup, &key, &mut OsRandom)?;
+        let mut s = Self::with_vault(vault);
+        s.new_code = Some(code);
+        Ok(s)
+    }
+
+    pub fn open_with_password_key(bytes: &[u8], password_key: &[u8]) -> Result<Self> {
+        check_size(bytes)?;
+        let key = key32(password_key)?;
+        Ok(Self::with_vault(Vault::open_with_password_key(
+            bytes, &key,
+        )?))
+    }
+
+    pub fn open_with_recovery(bytes: &[u8], code: &str) -> Result<Self> {
+        check_size(bytes)?;
+        let code = RecoveryCode::parse(code)?;
+        Ok(Self::with_vault(Vault::open_with_recovery(bytes, &code)?))
+    }
+
+    pub fn is_protected(&self) -> Result<bool> {
+        Ok(self.v()?.is_protected())
+    }
+
+    pub fn recovery_confirmed(&self) -> Result<bool> {
+        Ok(self.v()?.recovery_confirmed())
+    }
+
+    /// The recovery code waiting to be confirmed (new vault or a pending
+    /// replacement), formatted for display.
+    pub fn shown_recovery_code(&self) -> Result<Zeroizing<String>> {
+        self.v()?;
+        match (&self.new_code, &self.pending_recovery) {
+            (Some(c), _) => Ok(c.to_text()),
+            (None, Some(p)) => Ok(p.code().to_text()),
+            _ => Err(Error::Validation("no recovery code to show".into())),
+        }
+    }
+
+    /// Confirm a new vault's recovery code (verified by unwrapping its slot).
+    pub fn confirm_recovery(&mut self, code: &str) -> Result<()> {
+        let code = RecoveryCode::parse(code)?;
+        self.vm()?.confirm_recovery(&code)?;
+        self.committed = self.vault.clone();
+        self.new_code = None;
+        Ok(())
+    }
+
+    /// Parameters of the current password slot (to prove the current
+    /// password with [`Session::change_password_with_key`]).
+    pub fn current_password_request(&self) -> Result<KdfRequest> {
+        Ok(KdfRequest::of(&self.v()?.password_setup()?))
+    }
+
+    /// Fresh parameters for a new password; the core keeps them so only a
+    /// key derived for them is accepted.
+    pub fn begin_password_change(&mut self) -> Result<KdfRequest> {
+        self.v()?.password_setup()?;
+        let setup = PasswordSetup::generate(&mut OsRandom)?;
+        let r = KdfRequest::of(&setup);
+        self.pending_password = Some(setup);
+        Ok(r)
+    }
+
+    fn take_password_setup(&mut self) -> Result<PasswordSetup> {
+        self.pending_password
+            .take()
+            .ok_or_else(|| Error::Validation("start the password change first".into()))
+    }
+
+    /// Replace the password slot; authority is the CURRENT password's key.
+    /// Persist with [`Session::seal_protected`] + commit, or
+    /// [`Session::rollback`] if that fails.
+    pub fn change_password_with_key(&mut self, current_key: &[u8], new_key: &[u8]) -> Result<()> {
+        let setup = self.take_password_setup()?;
+        let (cur, new) = (key32(current_key)?, key32(new_key)?);
+        self.vm()?
+            .change_password(Authority::PasswordKey(&cur), &setup, &new, &mut OsRandom)
+    }
+
+    /// Replace the password slot; authority is the recovery code.
+    pub fn change_password_with_recovery(&mut self, code: &str, new_key: &[u8]) -> Result<()> {
+        let setup = self.take_password_setup()?;
+        let code = RecoveryCode::parse(code)?;
+        let new = key32(new_key)?;
+        self.vm()?
+            .change_password(Authority::Recovery(&code), &setup, &new, &mut OsRandom)
+    }
+
+    /// Start replacing the recovery code; authority is the current
+    /// password's key. The new code is shown via [`Session::shown_recovery_code`].
+    pub fn begin_recovery_change(&mut self, current_key: &[u8]) -> Result<()> {
+        let cur = key32(current_key)?;
+        let p = self
+            .v()?
+            .begin_recovery_change(Authority::PasswordKey(&cur), &mut OsRandom)?;
+        self.pending_recovery = Some(p);
+        Ok(())
+    }
+
+    pub fn finish_recovery_change(&mut self, code: &str) -> Result<()> {
+        let code = RecoveryCode::parse(code)?;
+        let matches = self
+            .pending_recovery
+            .as_ref()
+            .ok_or_else(|| Error::Validation("no recovery code change in progress".into()))?
+            .code()
+            .ct_eq(&code);
+        // A mistyped confirmation keeps the pending code so it can be retried.
+        if !matches {
+            return Err(Error::Validation("recovery code does not match".into()));
+        }
+        let p = self.pending_recovery.take().expect("checked above");
+        self.vm()?.finish_recovery_change(p, &code)
+    }
+
+    pub fn cancel_recovery_change(&mut self) {
+        self.pending_recovery = None;
+    }
+
+    /// Return to the last committed state (a credential change whose write
+    /// failed or was cancelled).
+    pub fn rollback(&mut self) -> Result<()> {
+        self.v()?;
+        self.vault = self.committed.clone();
+        self.pending = None;
+        self.pending_password = None;
+        Ok(())
     }
 
     pub fn is_locked(&self) -> bool {
@@ -1036,25 +1278,41 @@ impl Session {
     /// On any failure nothing is published (no pending revision) and the
     /// in-memory vault is rolled back to the last committed state.
     pub fn seal(&mut self, key: &DemoKey) -> Result<(Vec<u8>, u64)> {
+        self.seal_with(|v| v.seal_next(key.provider(), &mut OsRandom))
+    }
+
+    /// v2 counterpart of [`Session::seal`] (no key provider: the slots are
+    /// part of the vault). Refused before the recovery code is confirmed.
+    pub fn seal_protected(&mut self) -> Result<(Vec<u8>, u64)> {
+        if !self.v()?.is_protected() {
+            return Err(Error::KeyProvider(
+                "demo vault needs its key provider".into(),
+            ));
+        }
+        self.seal_with(|v| v.seal_next_protected(&mut OsRandom))
+    }
+
+    fn seal_with(
+        &mut self,
+        f: impl FnOnce(&Vault) -> Result<(Vec<u8>, u64)>,
+    ) -> Result<(Vec<u8>, u64)> {
         self.pending = None;
-        let sealed = self
-            .v()?
-            .seal_next(key.provider(), &mut OsRandom)
-            .and_then(|(bytes, rev)| {
-                if bytes.len() > self.max_bytes {
-                    Err(Error::Format(
-                        "vault would exceed the maximum size; the change was discarded".into(),
-                    ))
-                } else {
-                    Ok((bytes, rev))
-                }
-            });
+        let sealed = f(self.v()?).and_then(|(bytes, rev)| {
+            if bytes.len() > self.max_bytes {
+                Err(Error::Format(
+                    "vault would exceed the maximum size; the change was discarded".into(),
+                ))
+            } else {
+                Ok((bytes, rev))
+            }
+        });
         match sealed {
             Ok((bytes, rev)) => {
                 self.pending = Some(rev);
                 Ok((bytes, rev))
             }
             Err(e) => {
+                // Back to the last committed state (for a new vault: as created).
                 self.vault = self.committed.clone();
                 Err(e)
             }
@@ -1320,7 +1578,8 @@ mod tests {
         assert!(Session::open(&vec![b' '; MAX_ENVELOPE_BYTES + 1], &k).is_err());
         let info = inspect_envelope(&bytes).unwrap();
         assert_eq!(info.revision, 1);
-        assert_eq!(info.kek_id, FixtureKeyProvider::KEY_ID);
+        assert_eq!(info.kek_id.as_deref(), Some(FixtureKeyProvider::KEY_ID));
+        assert_eq!(info.version, 1);
     }
 
     #[test]
@@ -1604,5 +1863,151 @@ mod tests {
         assert!(s.save_preview("password", &shown, "t", "").is_err());
         assert!(s.preview_password(&o).is_err());
         assert!(s.preview_secret(32, "hex").is_err());
+    }
+
+    // --- v2 ---------------------------------------------------------------------
+
+    const PW: &str = "synthetic bridge passphrase";
+
+    fn derive(pw: &str, r: &KdfRequest) -> Zeroizing<[u8; 32]> {
+        derive_password_key(pw, &serde_json::to_string(r).unwrap()).unwrap()
+    }
+
+    fn new_protected() -> (Session, String) {
+        let c = ProtectedCreation::new().unwrap();
+        let key = derive(PW, &c.request());
+        let mut s = Session::create_protected(&c, &key[..]).unwrap();
+        let code = s.shown_recovery_code().unwrap().as_str().to_owned();
+        assert!(
+            s.seal_protected().is_err(),
+            "unconfirmed vault is never sealed"
+        );
+        assert!(s.confirm_recovery("AAAA").is_err());
+        assert!(s.shown_recovery_code().is_ok(), "kept after a wrong entry");
+        s.confirm_recovery(&code).unwrap();
+        assert!(
+            s.shown_recovery_code().is_err(),
+            "shown only until confirmed"
+        );
+        (s, code)
+    }
+
+    fn persist_v2(s: &mut Session) -> Vec<u8> {
+        let (b, r) = s.seal_protected().unwrap();
+        s.commit(r).unwrap();
+        b
+    }
+
+    #[test]
+    fn protected_create_confirm_persist_and_reopen() {
+        let (mut s, code) = new_protected();
+        assert!(s.is_protected().unwrap());
+        s.create_item(input(serde_json::json!({"title": "SYNTH-T", "data": {"kind": "secure_note", "body": "SYNTH-B"}})))
+            .unwrap();
+        let bytes = persist_v2(&mut s);
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!text.contains("SYNTH-") && !text.contains(PW));
+        assert!(!text.contains(&code) && !text.contains(&code.replace('-', "")));
+        assert_eq!(inspect_envelope(&bytes).unwrap().version, 2);
+        assert_eq!(inspect_envelope(&bytes).unwrap().kek_id, None);
+        let req = password_request(&bytes).unwrap();
+        let a = Session::open_with_password_key(&bytes, &derive(PW, &req)[..]).unwrap();
+        let b = Session::open_with_recovery(&bytes, &code).unwrap();
+        assert_eq!(a.list("", "").unwrap().len(), 1);
+        assert_eq!(b.list("", "").unwrap().len(), 1);
+        assert!(
+            Session::open_with_password_key(&bytes, &derive("synthetic wrong one", &req)[..])
+                .is_err()
+        );
+        assert!(Session::open_with_password_key(&bytes, &[0u8; 31]).is_err());
+        // Demo sealing never applies to a password vault and vice versa.
+        assert!(s.seal(&DemoKey::fixture()).is_err());
+        let (_k, mut demo) = session();
+        assert!(demo.seal_protected().is_err());
+        assert!(password_request(&persist(&mut demo, &DemoKey::fixture())).is_err());
+    }
+
+    #[test]
+    fn protected_password_change_needs_core_held_setup_and_authority() {
+        let (mut s, code) = new_protected();
+        let old = persist_v2(&mut s);
+        let cur_req = s.current_password_request().unwrap();
+        let cur = derive(PW, &cur_req);
+        // No pending setup: refused.
+        assert!(s.change_password_with_key(&cur[..], &[1; 32]).is_err());
+        let new_req = s.begin_password_change().unwrap();
+        assert_ne!(new_req.salt, cur_req.salt);
+        let new_pw = "synthetic bridge passphrase two";
+        let new = derive(new_pw, &new_req);
+        // Wrong current key: refused and the pending setup is consumed.
+        assert!(s.change_password_with_key(&[9; 32], &new[..]).is_err());
+        assert!(s.change_password_with_key(&cur[..], &new[..]).is_err());
+        let new_req = s.begin_password_change().unwrap();
+        let new = derive(new_pw, &new_req);
+        s.change_password_with_key(&cur[..], &new[..]).unwrap();
+        // Failed write: roll back to the committed slots.
+        s.rollback().unwrap();
+        let after_rollback = persist_v2(&mut s);
+        let req = password_request(&after_rollback).unwrap();
+        assert!(Session::open_with_password_key(&after_rollback, &derive(PW, &req)[..]).is_ok());
+        // Recovery authority path.
+        let new_req = s.begin_password_change().unwrap();
+        let new = derive(new_pw, &new_req);
+        assert!(s.change_password_with_recovery("AAAA", &new[..]).is_err());
+        let new_req = s.begin_password_change().unwrap();
+        let new = derive(new_pw, &new_req);
+        s.change_password_with_recovery(&code, &new[..]).unwrap();
+        let bytes = persist_v2(&mut s);
+        let req = password_request(&bytes).unwrap();
+        assert!(Session::open_with_password_key(&bytes, &derive(new_pw, &req)[..]).is_ok());
+        assert!(Session::open_with_password_key(&bytes, &derive(PW, &req)[..]).is_err());
+        // The earlier envelope keeps its old password (rewrap semantics).
+        let req = password_request(&old).unwrap();
+        assert!(Session::open_with_password_key(&old, &derive(PW, &req)[..]).is_ok());
+    }
+
+    #[test]
+    fn protected_recovery_change_and_lock_drop_pending_state() {
+        let (mut s, code) = new_protected();
+        persist_v2(&mut s);
+        let cur = derive(PW, &s.current_password_request().unwrap());
+        assert!(s.begin_recovery_change(&[3; 32]).is_err());
+        s.begin_recovery_change(&cur[..]).unwrap();
+        let new_code = s.shown_recovery_code().unwrap().as_str().to_owned();
+        assert_ne!(new_code, code);
+        assert!(s.finish_recovery_change(&code).is_err());
+        s.finish_recovery_change(&new_code).unwrap();
+        let bytes = persist_v2(&mut s);
+        assert!(Session::open_with_recovery(&bytes, &new_code).is_ok());
+        assert!(Session::open_with_recovery(&bytes, &code).is_err());
+        s.begin_recovery_change(&cur[..]).unwrap();
+        s.begin_password_change().unwrap();
+        s.lock();
+        assert!(s.shown_recovery_code().is_err());
+        assert!(s.finish_recovery_change(&new_code).is_err());
+        assert!(s.seal_protected().is_err());
+        assert!(s.current_password_request().is_err());
+    }
+
+    #[test]
+    fn kdf_requests_are_strict_and_bounded() {
+        let ok =
+            serde_json::json!({"salt": "AAAAAAAAAAAAAAAAAAAAAA", "mKib": 65536, "t": 3, "p": 1});
+        assert!(derive_password_key(PW, &ok.to_string()).is_ok());
+        for bad in [
+            serde_json::json!({"salt": "AAAAAAAAAAAAAAAAAAAAAA", "mKib": 4194304, "t": 3, "p": 1}),
+            serde_json::json!({"salt": "AAAAAAAAAAAAAAAAAAAAAA", "mKib": 65536, "t": 100, "p": 1}),
+            serde_json::json!({"salt": "AAAAAAAAAAAAAAAAAAAAAA", "mKib": 1024, "t": 3, "p": 1}),
+            serde_json::json!({"salt": "AAAA", "mKib": 65536, "t": 3, "p": 1}),
+            serde_json::json!({"salt": "AAAAAAAAAAAAAAAAAAAAAA", "mKib": 65536, "t": 3, "p": 1, "x": 1}),
+            serde_json::json!({"salt": "AAAAAAAAAAAAAAAAAAAAAA", "mKib": 65536, "t": 3}),
+        ] {
+            let t = std::time::Instant::now();
+            assert!(derive_password_key(PW, &bad.to_string()).is_err(), "{bad}");
+            assert!(t.elapsed() < std::time::Duration::from_millis(100));
+        }
+        assert!(derive_password_key(PW, &"x".repeat(1000)).is_err());
+        assert!(check_new_password("short").is_err());
+        assert!(check_new_password(PW).is_ok());
     }
 }

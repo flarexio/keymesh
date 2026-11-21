@@ -1,0 +1,57 @@
+# Keymesh private HTTPS deployment (experimental; synthetic data only).
+# Both services use host networking, so Docker publishes no ports and adds no NAT
+# or iptables rules. Each process binds one explicit address:
+#   web   -> 127.0.0.1:4320 (plain HTTP, loopback only)
+#   proxy -> 10.8.0.22:80 and 10.8.0.22:443 (VPN address only), ping on 127.0.0.1:8082
+# KEYMESH_RUNTIME is a local, git-ignored directory holding:
+#   flarex-root-ca.crt     public FlareX root, used to verify the ACME server
+#   traefik/resolv.conf    "nameserver 10.8.0.1" (VPN DNS; the host resolver is unchanged)
+#   traefik/data/          ACME account and certificate storage (root-owned, 0700/0600)
+# See deploy/README.md.
+name: keymesh
+
+x-hardening: &hardening
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  network_mode: host
+
+services:
+  web:
+    <<: *hardening
+    build:
+      context: ../apps/web
+      dockerfile: ../../deploy/web.Dockerfile
+      args:
+        KEYMESH_REVISION: ${KEYMESH_REVISION:-unknown}
+    image: keymesh-web:local
+    user: "1000:1000"
+    cap_drop: [ALL]
+    environment:
+      HOST: 127.0.0.1
+      PORT: "4320"
+
+  proxy:
+    <<: *hardening
+    image: traefik@sha256:2cd5cc75530c8d07ae0587c743d23eb30cae2436d07017a5ff78498b1a43d09f
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      LEGO_CA_CERTIFICATES: /certs/root-ca.crt
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ${KEYMESH_RUNTIME:?set KEYMESH_RUNTIME}/traefik/resolv.conf:/etc/resolv.conf:ro
+      - ${KEYMESH_RUNTIME:?set KEYMESH_RUNTIME}/flarex-root-ca.crt:/certs/root-ca.crt:ro
+      - ${KEYMESH_RUNTIME:?set KEYMESH_RUNTIME}/traefik/data:/data
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

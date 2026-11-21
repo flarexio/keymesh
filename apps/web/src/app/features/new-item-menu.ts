@@ -1,4 +1,4 @@
-import { Component, ElementRef, OnDestroy, inject, output, signal, viewChildren } from '@angular/core';
+import { AfterRenderRef, Component, ElementRef, Injector, OnDestroy, afterNextRender, inject, output, signal, viewChildren } from '@angular/core';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { ItemKind, KINDS } from '../core/types';
 import { Icon, KIND_ICONS } from '../shared/icon';
@@ -23,6 +23,18 @@ const MIN_BELOW = 240;
  * so scrolling/clipping panes (overflow: hidden/auto) can never cut it off.
  * It opens downwards or upwards, whichever fits, is capped to the viewport
  * and scrolls internally; it closes on resize or when anything else scrolls.
+ *
+ * Lifecycle rules (each has an E2E regression in preferences.spec.ts):
+ * * "Anything else scrolls" means a scroll that happened **after** opening.
+ *   Scroll events are dispatched at the next rendering frame, so one caused
+ *   before the menu opened (for example the vault view clamping `#main`) can
+ *   arrive after the listener is installed. Offsets are recorded at open, and
+ *   an event whose target has not moved since then is ignored.
+ * * The first item is focused after the menu has actually rendered
+ *   (`afterNextRender`), and that pending focus is cancelled by close, by a
+ *   newer open and by destroy, so stale work never runs.
+ * * Focus moves with `preventScroll` so it cannot scroll an ancestor (which
+ *   would close the menu); the menu scrolls itself to keep the item visible.
  */
 @Component({
   selector: 'km-new-item-menu',
@@ -59,9 +71,20 @@ export class NewItemMenu implements OnDestroy {
   protected readonly open = signal(false);
   protected readonly pos = signal<MenuPos>({ top: null, bottom: null, right: MARGIN, maxHeight: 0 });
   private readonly items = viewChildren<ElementRef<HTMLButtonElement>>('item');
+  private readonly injector = inject(Injector);
+  /** Focus waiting for the menu to render; cancelled by close, reopen and destroy. */
+  private pendingFocus: AfterRenderRef | null = null;
+  /** Scroll offsets at open of every element that was scrolled (others were at 0, 0). */
+  private offsetsAtOpen = new Map<Element, readonly [number, number]>();
   private readonly onScroll = (ev: Event) => {
+    const target = ev.target instanceof Document ? ev.target.scrollingElement : ev.target;
+    if (!(target instanceof Element)) return;
     const menu = this.host.nativeElement.querySelector('[role=menu]');
-    if (!menu || !menu.contains(ev.target as Node)) this.close();
+    if (menu?.contains(target)) return;
+    const [top, left] = this.offsetsAtOpen.get(target) ?? [0, 0];
+    // Dispatched now, but scrolled before the menu opened: not a user scroll.
+    if (target.scrollTop === top && target.scrollLeft === left) return;
+    this.close();
   };
 
   protected toggle(): void {
@@ -70,9 +93,17 @@ export class NewItemMenu implements OnDestroy {
 
   private show(index: number): void {
     this.place();
+    this.offsetsAtOpen = scrolledOffsets();
     this.open.set(true);
     document.addEventListener('scroll', this.onScroll, true);
-    setTimeout(() => this.focus(index), 0);
+    this.pendingFocus?.destroy();
+    this.pendingFocus = afterNextRender(
+      () => {
+        this.pendingFocus = null;
+        if (this.open()) this.focus(index);
+      },
+      { injector: this.injector },
+    );
   }
 
   private place(): void {
@@ -90,6 +121,9 @@ export class NewItemMenu implements OnDestroy {
 
   protected close(refocus = false): void {
     document.removeEventListener('scroll', this.onScroll, true);
+    this.pendingFocus?.destroy();
+    this.pendingFocus = null;
+    this.offsetsAtOpen.clear();
     if (!this.open()) return;
     this.open.set(false);
     if (refocus) this.host.nativeElement.querySelector<HTMLButtonElement>('[data-testid=new-item]')?.focus();
@@ -97,7 +131,16 @@ export class NewItemMenu implements OnDestroy {
 
   private focus(index: number): void {
     const list = this.items();
-    if (list.length) list[(index + list.length) % list.length].nativeElement.focus();
+    if (!list.length) return;
+    const item = list[(index + list.length) % list.length].nativeElement;
+    item.focus({ preventScroll: true });
+    // Keep the item visible by scrolling only the menu, never an ancestor.
+    const menu = item.closest<HTMLElement>('[role=menu]');
+    if (!menu) return;
+    const m = menu.getBoundingClientRect();
+    const r = item.getBoundingClientRect();
+    if (r.top < m.top) menu.scrollTop -= m.top - r.top;
+    else if (r.bottom > m.bottom) menu.scrollTop += r.bottom - m.bottom;
   }
 
   protected kindKey(k: ItemKind): MessageKey {
@@ -135,5 +178,16 @@ export class NewItemMenu implements OnDestroy {
 
   ngOnDestroy(): void {
     document.removeEventListener('scroll', this.onScroll, true);
+    this.pendingFocus?.destroy();
+    this.pendingFocus = null;
   }
+}
+
+/** Offsets of every element that is currently scrolled away from (0, 0). */
+function scrolledOffsets(): Map<Element, readonly [number, number]> {
+  const out = new Map<Element, readonly [number, number]>();
+  for (const el of document.querySelectorAll('*')) {
+    if (el.scrollTop !== 0 || el.scrollLeft !== 0) out.set(el, [el.scrollTop, el.scrollLeft]);
+  }
+  return out;
 }

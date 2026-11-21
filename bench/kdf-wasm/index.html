@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><title>kdf bench</title>
+<script type="module">
+import init, { run } from './pkg/kdf_bench_wasm.js';
+await init();
+const rows = [];
+for (const m of [19, 46, 64]) for (const t of [1, 2, 3]) for (const p of [1, 4]) {
+  const times = [];
+  for (let i = 0; i < 5; i++) { const s = performance.now(); run(m * 1024, t, p); times.push(performance.now() - s); }
+  times.sort((a, b) => a - b);
+  rows.push({ m, t, p, median: Math.round(times[2]), min: Math.round(times[0]), max: Math.round(times[4]) });
+}
+window.result = { ua: navigator.userAgent, threads: navigator.hardwareConcurrency, rows,
+  memory: performance.memory ? Math.round(performance.memory.jsHeapSizeLimit / 1048576) : null };
+</script>

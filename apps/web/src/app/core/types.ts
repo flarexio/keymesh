@@ -113,8 +113,11 @@ export interface ItemInput {
 }
 
 export interface EnvelopeInfo {
+  /** 1: demo vault; 2: password vault. */
+  version?: number;
   vault_id: string;
-  kek_id: string;
+  /** Demo vaults only. */
+  kek_id: string | null;
   revision: number;
 }
 

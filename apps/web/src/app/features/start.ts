@@ -1,16 +1,61 @@
-import { Component, inject, signal } from '@angular/core';
+import { NgTemplateOutlet } from '@angular/common';
+import { Component, computed, inject, signal } from '@angular/core';
 import { errorKey } from '../core/errors';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
-import { KeyMode, VaultService } from '../core/vault.service';
+import { DemoKeyMode, VaultService } from '../core/vault.service';
 import { ConfirmService } from '../shared/feedback';
-import { Icon } from '../shared/icon';
+import { Icon, IconName } from '../shared/icon';
+import { ProtectedStart } from './protected-start';
+
+type OverviewState = 'none' | 'locked' | 'stored' | 'lost' | 'creating' | 'unavailable';
+interface OverviewRow {
+  id: 'protected' | 'demo';
+  name: MessageKey;
+  note: MessageKey;
+  icon: IconName;
+  state: OverviewState;
+  target: string;
+}
 
 @Component({
   selector: 'km-start',
-  imports: [Icon],
+  imports: [Icon, ProtectedStart, NgTemplateOutlet],
   template: `
     <div class="start-wrap">
-      <section class="card start-card" aria-labelledby="start-title">
+      <div class="start-main">
+      <!-- Which vaults exist here, in the same order as the cards below. -->
+      <section class="card vault-overview" aria-labelledby="overview-title" data-testid="vault-overview">
+        <h2 id="overview-title" class="section-label">{{ i18n.t('start.overview.title') }}</h2>
+        <ul class="overview-list">
+          @for (row of rows(); track row.id) {
+            <li class="overview-row" [attr.data-testid]="'overview-' + row.id" [attr.data-state]="row.state">
+              <span class="overview-icon" [class.demo]="row.id === 'demo'"><km-icon [name]="row.icon" /></span>
+              <span class="overview-body">
+                <span class="overview-head">
+                  <span class="overview-name">{{ i18n.t(row.name) }}</span>
+                  <span class="overview-state">{{ i18n.t(stateKey(row.state)) }}</span>
+                </span>
+                <span class="overview-note">{{ i18n.t(row.note) }}</span>
+              </span>
+              <button type="button" class="btn btn-ghost btn-sm overview-go" [attr.aria-label]="i18n.t('start.overview.go', { name: i18n.t(row.name) })"
+                (click)="go(row.target)">
+                <km-icon name="chevronDown" />
+              </button>
+            </li>
+          }
+        </ul>
+      </section>
+      @if (demoFirst()) {
+        <ng-container *ngTemplateOutlet="demoCard" />
+      }
+      <km-protected-start />
+      @if (!demoFirst()) {
+        <ng-container *ngTemplateOutlet="demoCard" />
+      }
+      </div>
+      <ng-template #demoCard>
+      <section class="card start-card" id="demo-card" tabindex="-1" aria-labelledby="start-title" data-testid="demo-section">
+        <p class="eyebrow">{{ i18n.t('demo.section.title') }}</p>
         @switch (vault.status()) {
           @case ('locked') {
             <span class="state-icon"><km-icon name="lock" /></span>
@@ -41,9 +86,8 @@ import { Icon } from '../shared/icon';
             </div>
           }
           @default {
-            <span class="state-icon"><km-icon name="logo" /></span>
             <h2 id="start-title">{{ i18n.t('start.new.title') }}</h2>
-            <p class="lead">{{ i18n.t('start.new.lead') }}</p>
+            <p class="lead">{{ i18n.t('demo.section.lead') }}</p>
             <fieldset class="choice-group">
               <legend>{{ i18n.t('start.new.provider') }}</legend>
               @for (o of options; track o.mode) {
@@ -76,6 +120,7 @@ import { Icon } from '../shared/icon';
           </div>
         }
       </section>
+      </ng-template>
       <aside class="card start-aside" aria-labelledby="limits-title">
         <h3 id="limits-title" class="section-label">{{ i18n.t('start.limits.title') }}</h3>
         <ul class="check-list">
@@ -93,13 +138,69 @@ export class Start {
   protected readonly vault = inject(VaultService);
   protected readonly i18n = inject(I18n);
   private readonly confirm = inject(ConfirmService);
-  protected readonly mode = signal<KeyMode>('ephemeral');
+  protected readonly mode = signal<DemoKeyMode>('ephemeral');
   protected readonly error = signal<MessageKey | null>(null);
   protected readonly busy = signal(false);
-  protected readonly options: { mode: KeyMode; title: MessageKey; body: MessageKey }[] = [
+  /** Password-vault state for the overview (the card itself is ProtectedStart). */
+  protected readonly protectedState = computed<OverviewState>(() => {
+    if (!this.vault.secure) return 'unavailable';
+    if (this.vault.confirmingNewVault()) return 'creating';
+    return this.vault.protectedStored() ? 'locked' : 'none';
+  });
+  protected readonly demoState = computed<OverviewState>(() => {
+    switch (this.vault.status()) {
+      case 'locked':
+        return 'locked';
+      case 'stored':
+        return this.vault.storedNeedsLostKey() ? 'lost' : 'stored';
+      default:
+        return 'none';
+    }
+  });
+  /**
+   * An existing demo vault is shown before password-vault *creation*, so a
+   * returning demo user isn't sent through setup first. A password vault that
+   * exists (or is being created) always keeps its place at the top. Only the
+   * demo card moves: the password card keeps its component state.
+   */
+  protected readonly demoFirst = computed(
+    () => this.demoState() !== 'none' && (this.protectedState() === 'none' || this.protectedState() === 'unavailable'),
+  );
+  protected readonly rows = computed<OverviewRow[]>(() => {
+    const password: OverviewRow = {
+      id: 'protected',
+      name: 'start.overview.password',
+      note: 'start.overview.passwordNote',
+      icon: 'shield',
+      state: this.protectedState(),
+      target: 'protected-card',
+    };
+    const demo: OverviewRow = {
+      id: 'demo',
+      name: 'start.overview.demo',
+      note: 'start.overview.demoNote',
+      icon: 'layers',
+      state: this.demoState(),
+      target: 'demo-card',
+    };
+    return this.demoFirst() ? [demo, password] : [password, demo];
+  });
+  protected readonly options: { mode: DemoKeyMode; title: MessageKey; body: MessageKey }[] = [
     { mode: 'ephemeral', title: 'start.new.ephemeral', body: 'start.new.ephemeralBody' },
     { mode: 'synthetic-fixture', title: 'start.new.fixture', body: 'start.new.fixtureBody' },
   ];
+
+  protected stateKey(s: OverviewState): MessageKey {
+    return `start.overview.state.${s}`;
+  }
+
+  /** Bring a card into view and move focus to it (no URL hash change). */
+  protected go(id: string): void {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.scrollIntoView({ block: 'start' });
+    el.focus({ preventScroll: true });
+  }
 
   protected async act(p: Promise<void>): Promise<void> {
     this.error.set(null);

@@ -20,3 +20,4 @@ apps/web/src/app/core/wasm-pkg/
 apps/web/public/wasm/
 apps/web/test-results/
 apps/web/playwright-report/
+bench/kdf-wasm/pkg/
