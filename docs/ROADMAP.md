@@ -1,9 +1,9 @@
 # Keymesh roadmap
 
-**Status as of 2026-11-14.** This is a plan, not a commitment or an authorization.
-* Each item needs its own task contract and independent review before implementation.
-* Everything stays experimental and synthetic-data only until independent acceptance.
-* Priorities follow FlareX's requests from 2026-11-14 unless noted.
+**Status as of 2026-11-16.**
+* **Authorized rollout (M5):** FlareX authorized implementing the backlog below plus an installable app (PWA), in phases A, B and C (task `keymesh-product-rollout`). Each phase gets an independent review before it is deployed to the private endpoint.
+* **Boundaries:** everything stays experimental and synthetic-data only until independent acceptance. Outside this rollout, each item still needs its own task contract.
+* **Priorities** follow FlareX's requests from 2026-11-14 and 2026-11-15 unless noted.
 
 ## Where things stand
 
@@ -13,7 +13,44 @@
 | M2 browser vault (WASM) | Accepted |
 | M3 UI polish, locale and theme | Accepted |
 | Generator finish | Accepted |
-| **M4 local unlock** (password and recovery slots, backup/restore, HTTPS mechanics) | **Partial, not accepted.** Web and static-containment evidence exists at the current head; native evidence is retained from earlier runs on unchanged Rust source and is not independently re-bound. Open: visual follow-ups (reconcile task) and **gate C, trusted remote HTTPS**, which needs a human decision (`docs/DELIVERY.md` §4) |
+| **M4 local unlock** (password and recovery slots, backup/restore, HTTPS mechanics) | **Partial, not accepted.** A private HTTPS endpoint (`keymesh.cloud`, Docker, internal CA) now runs; **gate C** (a real client device trusting it) is still unverified by the human |
+| **M5 product rollout** (PWA + backlog) | **Phases A (`7079932`), B (`4e65efb`) and C (`88dee8b`) are independently accepted** for experimental, synthetic-only use. They were privately deployed to `keymesh.cloud` in that order on 2026-11-16; the deployed web image is now C. Explicit dispositions: the custom short PIN is **blocked**; real devices, Safari, phones and client trust are **not verified**; outbound website-icon fetching is **off**. See the checklist below |
+
+## M5 checklist (versioned)
+
+**v5, 2026-11-16** (A, B and C accepted and privately deployed), on branch `feature/m5-pwa-product-features` (draft PR #5, not merged). The deployed web image is source `88dee8b` (OCI revision `88dee8b`); A and B were deployed before it, and their features are part of it.
+* **States:** *implemented* · *tested* (automated, Chromium on the Pi) · *deployed* (private `keymesh.cloud` image) · *blocked*.
+* **Not covered by "tested":** real phones, Safari and Firefox; iOS install; and real camera hardware. Those need human device checks.
+
+| Phase | Feature | Implemented | Tested | Deployed | Notes |
+|---|---|---|---|---|---|
+| A | PWA: manifest, icons (incl. maskable), install button/hint | yes | yes | yes | Chromium only. The `beforeinstallprompt` flow and the iOS hint were not verified on real devices |
+| A | Offline reopen and unlock after one online visit | yes | yes | yes | Tested with the server stopped. A cold first visit offline is not supported |
+| A | Updates offered, never forced; lock before reload | yes | yes | yes | Covers v1→v2, the ephemeral-vault warning and the unrecoverable chunk state. A genuinely failed install degrades offline reopening until a bounded retry succeeds (tested). Damaged cached files: online repair (tested) |
+| A | TOTP from QR: image upload and paste | yes | yes | yes | zxing-wasm in a worker, self-hosted. Header bounds checked before decoding |
+| A | TOTP from QR: live camera | yes | Chromium fake camera | yes | Real camera hardware is untested |
+| A | Circular TOTP countdown (last 5 s warning) | yes | yes | yes | Fixed-clock unit and E2E tests; reduced motion |
+| A | Local login icons (brand, private host, category, letter) | yes | yes | yes | 81 reviewed Simple Icons: no per-icon licence (Rust, CC-BY-SA-4.0, removed); explicit domain aliases. No network. Not a security indicator |
+| B | Ed25519 Base58 public key, sign and verify | yes | yes | yes | Raw 32-byte Base58 (no prefix/checksum); pure Ed25519 over the exact shown bytes; `verify_strict`. RFC 8032 + Base58 + negative vectors natively, through WASM, and Node/OpenSSL in E2E |
+| B | DEK rotation (password + recovery slots) | yes | yes | yes | No wire-format change. Native, CLI, bridge, browser; rotation vector checked by Node/OpenSSL. Browser outcome reconciliation tested with a fake store and, in the production build, with held IndexedDB completion. If the outcome is only known after a lock, a non-secret notice stays on the locked screen (review fix). IndexedDB post-commit durability can't be observed. Accepted with B |
+| B | Passphrase wordlist and emergency kit | yes | yes | yes | EFF Long Wordlist pinned by SHA-256; core CSPRNG with rejection sampling. Kit never prints the password; code only on request. Real printers/PDF untested |
+| C | WebAuthn PRF quick unlock | yes | virtual authenticator only | yes (`88dee8b`) | ADR 0003 §4.1.1. Idle deadlines are checked on every async continuation (capability query, KDF, ceremony, before the write). Real-device capability (§5) is not recorded: no TouchID, FaceID, Windows Hello, Android or iOS proof |
+| C | Auto-lock (idle, hidden, pagehide, clock) | yes | yes | yes (`88dee8b`) | Deadline checks; visibility simulated in tests (no real OS app switch or freeze) |
+| C | Custom short PIN | no | n/a | no | **BLOCKED (disposition)**: no protected mechanism in the web app (ADR 0003 D2). The device PIN as WebAuthn UV is the supported route; it is not a Keymesh PIN |
+| C | Optional favicon route | yes | mock network plus a local TLS production-connector test | in the image, **OFF** | `KEYMESH_FAVICON` unset in Docker; outbound use is not approved.<br>• **Fixed:** address allowlist; one deadline (monotonic, including DNS); no shared cache, `no-store`; connector works with Node family autoselection.<br>• **Not hard limits:** native DNS jobs can't be cancelled; the PNG decode is synchronous and not preempted |
+
+### Rollout dispositions (v5)
+* **Delivered (experimental, synthetic only, privately deployed):** all A, B and C rows marked "yes" above.
+* **BLOCKED:** a custom short Keymesh PIN. A browser-only PIN does not resist an offline copy of the profile. The device PIN used as WebAuthn user verification is a different thing: it is the authenticator's own PIN, not a Keymesh PIN (ADR 0003 D2).
+* **NOT VERIFIED:**
+  * real hardware: TouchID, FaceID, Windows Hello, Android, iOS, security keys and cameras;
+  * Safari and Firefox;
+  * installation on phones;
+  * client-device trust of the private CA (gate C);
+  * real OS freeze and suspend;
+  * real printers and PDF output.
+* **OFF:** outbound website-icon fetching. The route is in the image but `KEYMESH_FAVICON` is unset, and activation is not approved.
+* **Not done:** merge or release, and any real data or real secrets.
 
 ### Gates shared by several items
 * **G-HTTPS (gate C).** A client-trusted HTTPS origin for LAN/VPN use, because the plain-HTTP previews are not secure contexts. It is required for non-loopback password vaults, WebAuthn, the camera and the Clipboard API. The decision is the human's; no CA or certificate is created without approval.
@@ -40,7 +77,12 @@
   * **Real devices:** at least one BE = 0 and one backup-eligible path recorded on real devices, with authenticator and transport.
   * **Copy:** never says "biometric" alone; describes BE = 0 as bound to an authenticator (not to this computer) and BE = 1 as backup-eligible (not as synced everywhere); never offers rotation before it exists.
 
-### 2. DEK rotation (re-encrypt the vault) — after item 1
+### 2. DEK rotation (re-encrypt the vault) — implemented (M5 phase B), accepted and deployed
+* **Implemented:**
+  * **Core:** `Vault::begin_rotation` / `finish_rotation` (`src/vault.rs`). A pending rotation is bound to the exact slots its authority was checked against.
+  * **Other layers:** `storage::save_protected` (native), `keymesh rotate-key` (CLI), `Session::begin_rotation` / `finish_rotation` (bridge), and `VaultService.beginRotation` / `finishRotation` (browser, with read-back reconciliation and strict durability).
+  * **Tests:** `vault::tests::v2_rotation_*`, `storage::tests::*rotation*`, `tests/cli_protected.rs`, `tests/rotation_vectors.rs` and `scripts/check-vectors.mjs`; `core/protected-vault.spec.ts` (data-key rotation) and `e2e/m5b.spec.ts`.
+  * **Still open:** the "no recovery path" acknowledgement does not arise yet, because rotation always installs both a new password and a new recovery code.
 * **Scope:**
   * A new random DEK, every item re-encrypted, and new password and recovery slots, with the new recovery code typed back.
   * Every other slot (PRF, later device) re-established with a fresh evaluation, or explicitly invalidated and listed for confirmation (ADR 0001 §3).
@@ -51,7 +93,7 @@
   * Copies an attacker already holds (old backups, a copied profile, plaintext already seen) **cannot be revoked**.
   * Delete your own old backups.
   * Change the credentials stored at sites that may have been exposed.
-* **Depends on:** ADR 0001 §3 staging; item 1's slot model, so rotation knows every slot kind.
+* **Depends on:** ADR 0001 §3 staging. Rotation is implemented first for the slots that exist today (password and recovery). It leaves an extension point so a later PRF or device slot is re-enrolled with authentication or explicitly revoked; PRF does **not** have to exist first.
 * **Acceptance:**
   * After rotation, old-credential failures are shown against the new revision.
   * **Stopped before the last cancellable point**, meaning the browser guard just before IndexedDB `put` or, natively, before the rename:
@@ -62,7 +104,8 @@
   * A rotation that would leave no recovery path is refused without an explicit acknowledgement.
   * Native and browser tests run on synthetic data.
 
-### 3. TOTP QR import
+### 3. TOTP QR import — implemented (M5 phase A)
+* **Implemented:** `apps/web/src/app/core/qr/`, `features/qr-import.ts`. Tests: `core/qr/*.spec.ts` and `e2e/totp-qr.spec.ts` (upload, paste, fake camera, denied camera, plain-HTTP, hostile files).
 * **Scope, step 1:** decode a QR **image** the user uploads or pastes, locally, with a maintained decoder and no network.
   * The decoded `otpauth://` URI goes through the existing parser.
   * The image and secret are never logged or persisted.
@@ -74,7 +117,8 @@
   * The camera is unavailable on plain HTTP, with a clear message.
   * No secret appears in logs or screenshots.
 
-### 4. TOTP countdown display
+### 4. TOTP countdown display — implemented (M5 phase A)
+* **Implemented:** `shared/totp-countdown.ts`. The next code is not shown. Tests: fixed-clock unit and E2E, reduced motion. Contrast is measured in the phase A screenshots.
 * **Scope:**
   * Replace the progress bar with a small circular countdown beside the code.
   * In the last ~5 s, the code and ring change to a warning colour **and** a non-colour cue (icon or text), with the remaining seconds available to assistive technology.
@@ -88,7 +132,12 @@
   * Reduced-motion snapshot.
   * Accessible label check.
 
-### 5. Ed25519 Base58 public key, signing and verification
+### 5. Ed25519 Base58 public key, signing and verification — implemented (M5 phase B), accepted and deployed
+* **Implemented:**
+  * **Core:** `src/ed25519.rs` (`base58`, `parse_public_key`, `parse_signature`, `message_bytes`, `Ed25519KeyPair::sign`).
+  * **Bridge and UI:** `sign_ed25519` / `verify_ed25519` in the bridge; `features/ed25519-tools.ts` in the UI.
+  * **Inputs:** keys and signatures are accepted as hex or raw Base58. Base64 is not offered.
+  * **Chain formats:** none; no chain-specific prefix or checksum was requested.
 * **Scope (local utilities only):**
   * Show the raw 32-byte public key in Base58 (Bitcoin alphabet, no prefix or checksum) beside the existing format, with a copy action.
   * Sign an explicit message (text, or hex bytes shown before signing) with an unlocked item's key.
@@ -102,7 +151,11 @@
   * Malleability and small-order rejection through strict verification.
   * The signed bytes are shown before signing.
 
-### 6. Login item icons
+### 6. Login item icons — step 1 implemented (M5 phase A); step 2 is phase C
+* **Implemented:** `core/login-icon.ts`, `core/brand-icons.ts` and `shared/item-icon.ts`.
+  * **Icon set:** 81 reviewed Simple Icons in a lazy chunk. The package is CC0, and the generator refuses any icon with its own licence (Rust, CC-BY-SA-4.0, was removed). Each icon's source and guidelines are recorded.
+  * **Matching:** explicit domain aliases only, never name guessing.
+  * **Icons are not a security or origin indicator.** Tests: `core/login-icon.spec.ts`, `e2e/login-icons.spec.ts` (no request leaves the origin).
 **Latest direction (2026-11-14). It supersedes the earlier GPT-API idea and the idea of a separate service.**
 1. **Deterministic local matching:**
    * a bundled brand-icon set (e.g. a CC0 Simple Icons subset) keyed by registrable domain;

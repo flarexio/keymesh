@@ -28,6 +28,12 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   context,
 }, testInfo) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  // This flow jumps the clock decades forward (RFC 6238 vector) with the
+  // vault open: start at the fixed early time and opt out of the idle
+  // limit through the app's own auto-lock setting (M5 C2). The clock only
+  // moves forward, so the backwards-clock rule stays active.
+  await page.clock.setFixedTime(new Date(59_000));
+  await page.addInitScript(() => localStorage.setItem('keymesh.autolock.v1', '{"idleMinutes":0,"hideSeconds":30}'));
   const errors: string[] = [];
   page.on('pageerror', (e) => errors.push(e.message));
   const requests: string[] = [];
@@ -75,7 +81,7 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await hexRow.getByRole('button', { name: 'Reveal' }).click();
   await expect(hexRow.getByTestId('secret-value')).toHaveText(/^\s*[0-9a-f]{64}\s*$/);
   await page.getByRole('button', { name: 'Generators' }).click();
-  await expect(page.getByRole('button', { name: 'Generate passphrase' })).toBeDisabled();
+  await expect(page.getByTestId('generate-passphrase')).toBeEnabled();
   await page.getByRole('button', { name: 'Generate & save key' }).click();
   await expect(page.locator('#detail-title')).toHaveText('Generated Ed25519 key');
   await expect(page.locator('.detail')).toContainText('ssh-ed25519 ');
@@ -109,7 +115,9 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   // Storage holds only the encrypted envelope.
   assertNoMarkers(await storedBytes(page), 'IndexedDB');
   const storage = await browserStorageSummary(page);
-  expect(storage).toEqual({ dbs: ['keymesh-demo'], local: 0, session: 0, cookies: '' });
+  // The only Web Storage entry is this test's non-secret auto-lock setting.
+  expect(storage).toEqual({ dbs: ['keymesh-demo'], local: 1, session: 0, cookies: '' });
+  expect(await page.evaluate(() => Object.keys(localStorage))).toEqual(['keymesh.autolock.v1']);
 
   // Screenshot of the running UI with synthetic data.
   await openItem(page, 'Synthetic TOTP');
@@ -162,7 +170,9 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await page.clock.setFixedTime(new Date(59_000));
   await openItem(page, 'Synthetic TOTP');
   await expect(page.getByTestId('totp-code')).toHaveText('94287082');
-  await expect(page.getByTestId('totp-remaining')).toHaveText('1s remaining');
+  // Last 5 s: text (not only colour) and the ring flag the coming change.
+  await expect(page.getByTestId('totp-remaining')).toHaveText('1s left — new code soon');
+  await expect(page.getByTestId('totp-ring')).toHaveAttribute('data-warn', 'true');
   await page.clock.setFixedTime(new Date(1_111_111_109_000));
   await expect(page.getByTestId('totp-code')).toHaveText('07081804', { timeout: 5000 });
 

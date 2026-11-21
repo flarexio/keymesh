@@ -101,9 +101,17 @@ fn generators() {
         .trim_end()
         .chars()
         .all(|ch| ch.is_ascii_uppercase() || ('2'..='7').contains(&ch)));
-    let o = c.run(&["gen", "passphrase"], None);
+    let p = c.ok(&["gen", "passphrase"], None);
+    assert_eq!(p.trim_end().split(' ').count(), 6);
+    let p = c.ok(
+        &["gen", "passphrase", "--words", "8", "--separator", "period"],
+        None,
+    );
+    assert_eq!(p.trim_end().split('.').count(), 8);
+    let o = c.run(&["gen", "passphrase", "--words", "3"], None);
     assert!(!o.status.success());
-    assert!(String::from_utf8_lossy(&o.stderr).contains("pending"));
+    let o = c.run(&["gen", "passphrase", "--words", "5"], None);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("too few words"));
 }
 
 #[test]

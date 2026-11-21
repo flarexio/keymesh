@@ -8,6 +8,7 @@ import { ItemForm } from './item-form';
 import { Generators } from './generators';
 import { Backup } from './backup';
 import { ImportInfo } from './import-info';
+import { ItemIcon } from '../shared/item-icon';
 import { NewItemMenu } from './new-item-menu';
 
 type Pane =
@@ -27,7 +28,7 @@ const TABS: { id: Tab; label: MessageKey; icon: IconName }[] = [
 
 @Component({
   selector: 'km-vault-shell',
-  imports: [ItemDetail, ItemForm, Generators, Backup, ImportInfo, Icon, NewItemMenu],
+  imports: [ItemDetail, ItemForm, Generators, Backup, ImportInfo, Icon, NewItemMenu, ItemIcon],
   template: `
     <div class="shell">
       <aside class="sidebar" [attr.aria-label]="i18n.t('nav.sidebar')">
@@ -119,7 +120,7 @@ const TABS: { id: Tab; label: MessageKey; icon: IconName }[] = [
                     <li>
                       <button type="button" (click)="open(i.id)" [class.selected]="selected() === i.id"
                         [attr.aria-current]="selected() === i.id ? 'true' : null">
-                        <span class="kind-tile" [attr.data-kind]="i.kind"><km-icon [name]="kindIcon(i.kind)" /></span>
+                        <km-item-icon [kind]="i.kind" [title]="i.title" [url]="i.url" />
                         <span class="item-text">
                           <span class="title">{{ i.title }}</span>
                           <span class="subtitle">{{ i18n.t(kindKey(i.kind)) }}@if (i.subtitle) { · {{ i.subtitle }} }</span>

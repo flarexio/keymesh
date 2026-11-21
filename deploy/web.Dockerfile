@@ -5,6 +5,7 @@
 FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5
 WORKDIR /app
 COPY --chown=root:root scripts/serve.mjs scripts/serve.mjs
+COPY --chown=root:root scripts/favicon.mjs scripts/favicon.mjs
 COPY --chown=root:root dist/web/browser dist/web/browser
 ARG KEYMESH_REVISION=unknown
 LABEL org.opencontainers.image.title="keymesh-web" \

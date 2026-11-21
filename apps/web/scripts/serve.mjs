@@ -15,6 +15,7 @@ import { readFile, realpath, stat } from 'node:fs/promises';
 import { readFileSync, realpathSync } from 'node:fs';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createFaviconRoute } from './favicon.mjs';
 
 // STATIC_ROOT overrides the build directory (used by scripts/serve.test.mjs).
 const root = resolve(process.env.STATIC_ROOT?.trim() || fileURLToPath(new URL('../dist/web/browser', import.meta.url)));
@@ -40,6 +41,8 @@ const types = {
   '.css': 'text/css; charset=utf-8',
   '.wasm': 'application/wasm',
   '.ico': 'image/x-icon',
+  '.png': 'image/png',
+  '.webmanifest': 'application/manifest+json',
   '.json': 'application/json',
   '.txt': 'text/plain; charset=utf-8',
 };
@@ -53,6 +56,21 @@ const security = {
   // Only over HTTPS; no includeSubDomains/preload for a private host.
   ...(tls ? { 'Strict-Transport-Security': 'max-age=31536000' } : {}),
 };
+
+// Optional favicon lookups (M5 C3): OFF unless KEYMESH_FAVICON=1. Even then
+// the app asks only after the user opts in. Host names are never logged.
+const favicon = createFaviconRoute({ enabled: process.env.KEYMESH_FAVICON === '1' });
+
+async function faviconRequest(req, res, url) {
+  if (req.method !== 'GET') return fail(res, 404);
+  const r = await favicon(url).catch(() => ({ status: 404 }));
+  if (r.status !== 200) {
+    res.writeHead(r.status, { ...security, 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end(r.status === 429 ? 'busy' : r.status === 400 ? 'bad request' : 'not found');
+  }
+  res.writeHead(200, { ...security, 'Content-Type': 'image/png' }); // security sets Cache-Control: no-store
+  res.end(r.body);
+}
 
 /** True if `p` is the root itself or strictly below it (separator-aware). */
 function inside(p) {
@@ -85,16 +103,21 @@ async function servable(p) {
  * Serves only regular files whose real path (after resolving symlinks) lies
  * inside the build root. Malformed percent-encoding, NUL and backslashes are
  * 400; anything resolving outside the root is 404 (never the SPA shell);
- * missing paths inside the root get index.html (client-side routes), which
- * passes the same check.
+ * missing extensionless paths inside the root get index.html (client-side
+ * routes), which passes the same check; missing file names are 404.
  */
 async function handler(req, res) {
   let path;
+  let url;
   try {
-    path = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname);
+    url = new URL(req.url ?? '/', 'http://x');
+    path = decodeURIComponent(url.pathname);
   } catch {
     return fail(res, 400);
   }
+  // Dynamic route: never the SPA shell, never a static file.
+  if (path === '/api/favicon') return faviconRequest(req, res, url);
+  if (path.startsWith('/api/')) return fail(res, 404);
   if (path.includes('\0') || path.includes('\\')) return fail(res, 400);
   const candidate = resolve(realRoot, '.' + path);
   if (!inside(candidate)) return fail(res, 404);
@@ -102,8 +125,13 @@ async function handler(req, res) {
     let file;
     if ((await stat(candidate).catch(() => null))?.isFile()) {
       file = await servable(candidate);
-    } else {
+    } else if (extname(path) === '') {
+      // Only extensionless paths are app routes. A missing file name is a
+      // 404, never the shell: the service worker must not cache index.html
+      // as ngsw.json, a script chunk or the WASM.
       file = await servable(join(realRoot, 'index.html'));
+    } else {
+      return fail(res, 404);
     }
     if (!file) return fail(res, 404);
     const body = await readFile(file);

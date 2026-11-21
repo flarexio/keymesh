@@ -4,20 +4,24 @@ import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { GeneratedDraft } from '../core/generated-draft';
 import { PasswordSettings, sameOptions } from '../core/password-options';
 import { VaultService } from '../core/vault.service';
+import type { PassphraseOptions } from '../core/types';
+import { Ed25519Verify } from './ed25519-tools';
 import { ToastService } from '../shared/feedback';
 import { GeneratedPassword } from '../shared/generated-password';
 import { Icon } from '../shared/icon';
 import { PasswordOptionsPanel, passwordProblem } from '../shared/password-options';
 
-type TitleField = 'pw' | 'secret' | 'key';
+type TitleField = 'pw' | 'phrase' | 'secret' | 'key';
 
 const DEFAULT_TITLES: Record<TitleField, MessageKey> = {
   pw: 'gen.pw.defaultTitle',
+  phrase: 'gen.passphrase.defaultTitle',
   secret: 'gen.secret.defaultTitle',
   key: 'gen.key.defaultTitle',
 };
 
 type SecretParams = { bytes: string; encoding: string };
+type PhraseParams = PassphraseOptions;
 
 /**
  * Generators run in the Rust core (OS CSPRNG via `crypto.getRandomValues`).
@@ -35,7 +39,7 @@ type SecretParams = { bytes: string; encoding: string };
  */
 @Component({
   selector: 'km-generators',
-  imports: [Icon, PasswordOptionsPanel, GeneratedPassword],
+  imports: [Icon, PasswordOptionsPanel, GeneratedPassword, Ed25519Verify],
   template: `
     <div class="page">
       <header class="page-head">
@@ -127,13 +131,51 @@ type SecretParams = { bytes: string; encoding: string };
           </div>
         </section>
 
-        <section class="card tool-card muted-card" aria-labelledby="gen-pass">
+        <section class="card tool-card" aria-labelledby="gen-pass" data-testid="passphrase-card">
           <h3 id="gen-pass" class="card-title"><km-icon name="note" />{{ i18n.t('gen.passphrase.title') }}</h3>
-          <p class="field-hint">{{ i18n.t('gen.passphrase.pending') }}</p>
-          <div class="tool-actions">
-            <button type="button" class="btn" disabled>{{ i18n.t('gen.passphrase.button') }}</button>
+          <div class="field-grid">
+            <div class="field">
+              <label class="field-label" for="gen-words">{{ i18n.t('gen.passphrase.words') }}</label>
+              <select id="gen-words" data-testid="passphrase-words" [value]="words()" (change)="words.set(value($event))">
+                @for (n of wordChoices; track n) {
+                  <option [value]="n">{{ n }}</option>
+                }
+              </select>
+            </div>
+            <div class="field">
+              <label class="field-label" for="gen-sep">{{ i18n.t('gen.passphrase.separator') }}</label>
+              <select id="gen-sep" data-testid="passphrase-separator" [value]="separator()" (change)="separator.set($any(value($event)))">
+                <option value="space">{{ i18n.t('gen.passphrase.sepSpace') }}</option>
+                <option value="period">{{ i18n.t('gen.passphrase.sepPeriod') }}</option>
+              </select>
+            </div>
           </div>
+          @if (phraseSummary(); as sum) {
+            <p class="field-hint" data-testid="passphrase-strength" [class.field-error]="!sum.master_ok">
+              {{ i18n.t(sum.master_ok ? 'gen.passphrase.strength' : 'gen.passphrase.weak', { bits: sum.entropy_bits.toFixed(1), n: sum.list_size }) }}
+            </p>
+          }
+          <div class="field">
+            <label class="field-label" for="gen-phrase-title">{{ i18n.t('gen.savedTitle') }}</label>
+            <input id="gen-phrase-title" [value]="title('phrase')" (input)="setTitle('phrase', $event)" />
+          </div>
+          @if (phraseDraft.current(); as v) {
+            <km-generated-password [value]="v" [label]="i18n.t('gen.passphrase.result')" />
+          } @else if (phraseDraft.outdated()) {
+            <div class="callout callout-info"><km-icon name="info" /><p>{{ i18n.t('gen.outdated') }}</p></div>
+          }
+          <div class="tool-actions">
+            <button type="button" class="btn" data-testid="generate-passphrase" [disabled]="busy()" (click)="previewPhrase()">
+              <km-icon name="dice" /><span>{{ i18n.t('gen.preview') }}</span>
+            </button>
+            <button type="button" class="btn btn-primary" data-testid="save-passphrase" [disabled]="!phraseDraft.current() || busy()" (click)="savePhrase()">
+              <km-icon name="plus" /><span>{{ i18n.t(saving() === 'passphrase' ? 'gen.saving' : 'gen.save') }}</span>
+            </button>
+          </div>
+          <p class="field-hint">{{ i18n.t('gen.passphrase.source') }}</p>
         </section>
+
+        <km-ed25519-verify class="card tool-card verify-card" />
       </div>
       @if (error(); as e) {
         <div class="callout callout-danger" role="alert"><km-icon name="alert" /><p>{{ i18n.t(e) }}</p></div>
@@ -157,8 +199,21 @@ export class Generators implements OnDestroy {
     () => ({ bytes: this.bytes(), encoding: this.encoding() }),
     (a, b) => a.bytes === b.bytes && a.encoding === b.encoding,
   );
+  protected readonly wordChoices = [4, 5, 6, 7, 8, 9, 10, 11, 12];
+  protected readonly words = signal('6');
+  protected readonly separator = signal<PhraseParams['separator']>('space');
+  private readonly phraseOptions = computed<PhraseParams>(() => ({ words: Number(this.words()), separator: this.separator() }));
+  protected readonly phraseDraft = new GeneratedDraft<PhraseParams>(this.phraseOptions, (a, b) => a.words === b.words && a.separator === b.separator);
+  protected readonly phraseSummary = computed(() => {
+    if (!this.vault.coreReady()) return null;
+    try {
+      return this.vault.passphraseSummary(this.phraseOptions());
+    } catch {
+      return null;
+    }
+  });
   /** Which save is in flight; blocks every other action until it settles. */
-  protected readonly saving = signal<'password' | 'secret' | 'key' | null>(null);
+  protected readonly saving = signal<'password' | 'passphrase' | 'secret' | 'key' | null>(null);
   /** Only an open, current vault can generate or save. */
   protected readonly busy = computed(() => this.saving() !== null || !this.vault.unlocked());
   private destroyed = false;
@@ -206,8 +261,23 @@ export class Generators implements OnDestroy {
     }
   }
 
+  protected previewPhrase(): void {
+    this.error.set(null);
+    this.phraseDraft.clear();
+    const options = this.phraseOptions();
+    try {
+      this.phraseDraft.set(this.vault.previewPassphrase(options), options);
+    } catch (e) {
+      this.error.set(errorKey(e));
+    }
+  }
+
+  protected savePhrase(): Promise<void> {
+    return this.saveDraft('passphrase', this.phraseDraft as GeneratedDraft<unknown>, 'phrase', 'gen.passphrase.saved');
+  }
+
   /** Success is reported only after the encrypted write was committed. */
-  private async save(what: 'password' | 'secret' | 'key', run: () => Promise<string>, ok: MessageKey): Promise<void> {
+  private async save(what: 'password' | 'passphrase' | 'secret' | 'key', run: () => Promise<string>, ok: MessageKey): Promise<void> {
     if (this.saving() !== null) return; // double click
     this.saving.set(what);
     this.error.set(null);
@@ -224,7 +294,7 @@ export class Generators implements OnDestroy {
     }
   }
 
-  private saveDraft(kind: 'password' | 'secret', draft: GeneratedDraft<unknown>, f: TitleField, ok: MessageKey) {
+  private saveDraft(kind: 'password' | 'passphrase' | 'secret', draft: GeneratedDraft<unknown>, f: TitleField, ok: MessageKey) {
     const shown = draft.current();
     if (shown === null) return Promise.resolve();
     return this.save(
@@ -259,6 +329,7 @@ export class Generators implements OnDestroy {
   ngOnDestroy(): void {
     this.destroyed = true;
     this.pwDraft.clear();
+    this.phraseDraft.clear();
     this.secretDraft.clear();
     this.vault.discardPreviews();
   }

@@ -18,6 +18,7 @@ pub mod import;
 pub mod kdf;
 pub mod keyslot;
 pub mod model;
+pub mod passphrase;
 pub mod recovery;
 pub mod rng;
 pub mod secret;

@@ -15,7 +15,8 @@ Single crate `keymesh` (library + `keymesh` CLI binary).
 | `keyslot` | v2 password/recovery key slots: validation, wrap/unwrap, slot-list digest, `Authority` | |
 | `recovery` | Recovery code: 256-bit secret, versioned Base32 text with check digits | |
 | `model` | Typed items + validation | |
-| `generate` | Passwords, random secrets (passphrase: pending) | |
+| `generate` | Passwords, random secrets | |
+| `passphrase` | EFF Long Wordlist passphrases (vendored, SHA-256 pinned) | M5 B |
 | `ed25519` | RFC 8032 keypair storage format, OpenSSH public-key line | |
 | `totp` | RFC 6238, Base32, `otpauth://totp` URIs, injectable clock | |
 | `vault` | In-memory vault + `keymesh.vault` v1 (demo) and v2 (password) envelopes | |
@@ -36,7 +37,7 @@ v2:         password ─Argon2id─HKDF─▶ KEK_pw  ─┐
 
 * **v1 (demo vaults):** the KEK comes from a `KeyProvider`: `EphemeralKeyProvider` (tests, browser "This session only") or `SyntheticDemoKeyProvider` (CLI, `KEYMESH_DEMO_KEY`) and the browser's public fixture key. Neither stores a key next to the vault.
 * **v2 (password vaults, M4, experimental):** exactly one password slot and one recovery slot, each wrapping the same random DEK. The full specification is in `docs/adr/0002-envelope-v2.md`: wire format, AAD, bounds, threat model, measurements and lifecycle. The design background is in `docs/adr/0001-unlock-and-recovery.md`.
-* The DEK is random. For v1, `Vault::rotate_data_key` replaces it, and the next save re-encrypts everything. For v2 it is refused: compromise rotation, which would also re-establish every slot, is deferred. Password and recovery-code changes are rewraps.
+* The DEK is random. For v1, `Vault::rotate_data_key` replaces it, and the next save re-encrypts everything. For v2, `Vault::begin_rotation` / `finish_rotation` (M5 B) create a new DEK with new password and recovery slots and return a new vault value that is saved through the usual compare-and-swap path (ADR 0002 §8). Password and recovery-code changes are rewraps.
 * Ed25519 keys stored in the vault are item data. They are never used as or derived from the KEK/DEK.
 
 ## `keymesh.vault` v1 file
@@ -98,7 +99,7 @@ Same item and manifest structure, but `kek_id`/`wrapped_dek` are replaced by `sl
 * **Previews (exact save).** `VaultSession.previewPassword(json)` and `previewSecret(bytes, encoding)` generate a value, keep it in the session as the current preview of that generator (one slot each, replaced by the next preview) and return a copy to show. `savePreview(kind, shown, title, service)` stores the preview as a Secret item with origin *generated* only if `shown` equals the held value (constant-time comparison); otherwise it fails with "generated value is no longer available". A successful insert consumes the preview, so a double click or a second tab cannot save it twice; a validation failure keeps it. `discardPreviews()` and `lock()` drop all previews. The web page therefore saves exactly what the user saw: there is no path that substitutes a freshly generated value.
 * Random secrets default to 32 bytes (256 bits), with an explicit encoding (hex, base64url or base32). They are local random values, not provider-issued credentials.
 * RNG failure returns `Error::Rng`. There is no fallback.
-* Passphrases are **pending**: no reviewed, versioned wordlist is bundled.
+* Passphrases (M5 B) come from the vendored EFF Long Wordlist (`src/wordlists/`, SHA-256 pinned). Each word is drawn independently with the same rejection sampling, so the entropy is exactly words × log2(7776).
 
 ## TOTP
 
@@ -108,7 +109,7 @@ The `otpauth://totp` parser accepts `secret, issuer, algorithm, digits, period, 
 
 ## Ed25519
 
-Implemented with `ed25519-dalek` 2. The stored format is the 32-byte RFC 8032 seed plus the 32-byte public key (hex), and validation checks that the public key matches the seed. Export is limited to the OpenSSH public-key line. OpenSSH/PKCS#8 private-key formats are **not** implemented, and the raw seed JSON is not either format. There is no general signing API. Signing appears only in tests (RFC 8032 §7.1 vectors 1–3).
+Implemented with `ed25519-dalek` 2. The stored format is the 32-byte RFC 8032 seed plus the 32-byte public key (hex), and validation checks that the public key matches the seed. Export is limited to the OpenSSH public-key line. OpenSSH/PKCS#8 private-key formats are **not** implemented, and the raw seed JSON is not either format. Since M5 B the core signs (pure Ed25519, RFC 8032 §5.1) exactly the message bytes it is given (UTF-8 as typed, or hex; at most 64 KiB), only on an explicit request for one stored key; verification is `verify_strict`. Public keys are also shown as raw Base58 (32 bytes, Bitcoin alphabet, no prefix or checksum).
 
 ## 1Password import
 
@@ -169,7 +170,7 @@ Angular (apps/web)  ── JSON views / masked slots ──▶  keymesh-wasm (wa
 * `list` returns summaries: id, kind, title, a non-secret subtitle (username, service, issuer, etc.) and tags.
 * `get` returns an item view with non-secret fields plus *slots* for secret fields: password, recovery codes, secret, wallet secrets, note body, notes, concealed custom fields, and the TOTP setup secret.
 * A slot's plaintext crosses only through `reveal(id, slot)`, used by the Reveal and Copy buttons. Revealed text is rendered as text content, never as an attribute, and is hidden again after 30 seconds or on lock.
-* Ed25519 seeds are never revealable. Only the public key, in hex and as an OpenSSH line, is exposed, and there is no signing API.
+* Ed25519 seeds are never revealable. Only the public key (hex, raw Base58, OpenSSH line) and signatures the user explicitly asks for leave the core.
 * Generated passwords, random secrets and Ed25519 keys can be created and stored entirely inside WASM. A password generated on the Generators page, or inside the Login/Secret form, is returned to the UI on purpose. It is shown masked with explicit Reveal/Copy, and it reaches a form field only when the user chooses "Use this password". Cancel discards it and leaves the field unchanged.
 * The core's error messages contain no secret values, and item-input parse errors are reported generically, because serde messages can quote input. The UI never shows raw error text anyway: `apps/web/src/app/core/errors.ts` maps known conditions to localized messages and everything else to a generic "something went wrong" (see *Language and appearance*).
 

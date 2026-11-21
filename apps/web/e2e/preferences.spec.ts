@@ -256,11 +256,13 @@ for (const locale of ['zh-TW', 'en'] as const) {
     page.on('request', (r) => requests.push(r.url()));
     await recordFirstPaintState(page);
     await page.setViewportSize({ width: 1280, height: 860 });
+    // Fixed time from the start: moving the wall clock back while the vault
+    // is open would (correctly) auto-lock it (M5 C2).
+    await page.clock.setFixedTime(new Date(59_000));
     await page.goto('/');
     await setLocale(page, locale); // explicit choice, opposite of the browser default
     await startFixtureVault(page);
     await seed(page);
-    await page.clock.setFixedTime(new Date(59_000));
     await checkAllScreens(page, locale);
 
     for (const pref of ['system', 'light', 'dark'] as const) {
@@ -308,10 +310,10 @@ for (const locale of ['zh-TW', 'en'] as const) {
 }
 
 test('switching language/theme keeps unsaved input, selection, TOTP and keys; vault bytes unchanged', async ({ page }) => {
+  await page.clock.setFixedTime(new Date(59_000)); // before opening: see above
   await page.goto('/');
   await startFixtureVault(page);
   await seed(page);
-  await page.clock.setFixedTime(new Date(59_000));
 
   // Generated Ed25519 key and a password preview.
   await page.getByTestId('nav-generators').click();
@@ -335,9 +337,10 @@ test('switching language/theme keeps unsaved input, selection, TOTP and keys; va
   await expect(page.getByTestId('totp-code')).toHaveText('94287082');
   await setLocale(page, 'en');
   await expect(page.getByTestId('totp-code')).toHaveText('94287082');
-  await expect(page.getByTestId('totp-remaining')).toHaveText('1s remaining');
+  // T=59 is inside the last-5-seconds warning, in both languages.
+  await expect(page.getByTestId('totp-remaining')).toHaveText('1s left — new code soon');
   await setLocale(page, 'zh-TW');
-  await expect(page.getByTestId('totp-remaining')).toHaveText('剩餘 1 秒');
+  await expect(page.getByTestId('totp-remaining')).toHaveText('剩 1 秒，即將換新碼');
 
   // Unsaved form input survives switches.
   await newItem(page, 'login');

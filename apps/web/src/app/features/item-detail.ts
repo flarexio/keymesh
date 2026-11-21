@@ -13,8 +13,11 @@ import { I18n, Message, MessageKey } from '../core/i18n/i18n.service';
 import { VaultService } from '../core/vault.service';
 import { ItemView, Labeled, SecretSlot } from '../core/types';
 import { ConfirmService, ToastService } from '../shared/feedback';
-import { Icon, KIND_ICONS } from '../shared/icon';
+import { Icon } from '../shared/icon';
+import { ItemIcon } from '../shared/item-icon';
 import { SecretField } from './secret-field';
+import { TotpCountdown, countdownState } from '../shared/totp-countdown';
+import { Ed25519Sign } from './ed25519-tools';
 
 /** Core slot keys → localized labels; custom fields keep the user's label. */
 const SLOT_LABELS: Record<string, MessageKey> = {
@@ -38,12 +41,12 @@ interface PlainField {
 
 @Component({
   selector: 'km-item-detail',
-  imports: [SecretField, Icon],
+  imports: [TotpCountdown, SecretField, Icon, ItemIcon, Ed25519Sign],
   template: `
     @if (view(); as v) {
       <article class="detail" aria-labelledby="detail-title">
         <header class="detail-head">
-          <span class="kind-tile kind-tile-lg" [attr.data-kind]="v.kind"><km-icon [name]="icon(v)" /></span>
+          <km-item-icon [kind]="v.kind" [title]="v.title" [url]="firstUrl(v)" [large]="true" [remote]="true" />
           <div class="detail-heading">
             <p class="eyebrow">{{ i18n.t(kindKey(v)) }}</p>
             <h2 id="detail-title">{{ v.title }}</h2>
@@ -62,14 +65,16 @@ interface PlainField {
         </header>
 
         @if (totp(); as t) {
-          <section class="totp-card" [attr.aria-label]="i18n.t('detail.totpRegion')">
+          <section class="totp-card" [class.warn]="t.warn" [attr.aria-label]="i18n.t('detail.totpRegion')">
             <div>
               <p class="section-label">{{ i18n.t('detail.oneTimeCode') }}</p>
               <span class="totp-code mono" data-testid="totp-code">{{ t.code }}</span>
             </div>
             <div class="totp-timer">
-              <span class="totp-remaining" data-testid="totp-remaining">{{ i18n.t('detail.secondsRemaining', { s: t.remaining }) }}</span>
-              <progress [value]="t.remaining" [max]="period()" aria-hidden="true"></progress>
+              <km-totp-countdown [remaining]="t.remaining" [period]="period()" />
+              <span class="totp-remaining" data-testid="totp-remaining">{{
+                i18n.t(t.warn ? 'detail.expiringSoon' : 'detail.secondsRemaining', { s: t.remaining })
+              }}</span>
             </div>
           </section>
         }
@@ -86,6 +91,10 @@ interface PlainField {
               }
             </dl>
           </section>
+        }
+
+        @if (v.kind === 'ed25519_key' && v.data['public_key_base58']) {
+          <km-ed25519-sign [itemId]="v.id" [base58]="$any(v.data['public_key_base58'])" />
         }
 
         @for (l of lists(); track l.label) {
@@ -175,9 +184,22 @@ export class ItemDetail implements OnInit, OnDestroy {
     return null;
   });
 
+  /** Period of the TOTP actually shown: the item itself, or the one a login links to. */
   protected readonly period = computed(() => {
+    this.vault.version();
     const v = this.view();
-    return v?.kind === 'totp' ? (v.data['period'] as number) : 30;
+    const id = this.totpId();
+    if (!v || !id) return 30;
+    let totp: ItemView | null = v.kind === 'totp' ? v : null;
+    if (!totp) {
+      try {
+        totp = this.vault.get(id);
+      } catch {
+        return 30;
+      }
+    }
+    const p = totp?.data['period'];
+    return typeof p === 'number' && p > 0 ? p : 30;
   });
 
   protected readonly totp = computed(() => {
@@ -185,7 +207,8 @@ export class ItemDetail implements OnInit, OnDestroy {
     const id = this.totpId();
     if (!id) return null;
     try {
-      return this.vault.totp(id);
+      const t = this.vault.totp(id);
+      return { ...t, warn: countdownState(t.remaining, this.period()).warn };
     } catch {
       return null;
     }
@@ -274,8 +297,9 @@ export class ItemDetail implements OnInit, OnDestroy {
     return `kind.${v.kind}`;
   }
 
-  protected icon(v: ItemView) {
-    return KIND_ICONS[v.kind];
+  protected firstUrl(v: ItemView): string | null {
+    const urls = v.data['urls'];
+    return Array.isArray(urls) && typeof urls[0] === 'string' ? urls[0] : null;
   }
 
   /** Localized label for a core slot, or the user's own custom-field label. */
@@ -305,11 +329,24 @@ export class ItemDetail implements OnInit, OnDestroy {
     }
   }
 
+  /**
+   * Recompute now: a frozen or backgrounded tab resumes with timers late, so
+   * the code is refreshed on return instead of showing the old one until the
+   * next tick. (Locking clears the vault, so `totp()` then yields nothing.)
+   */
+  private readonly refresh = () => this.tick.update((t) => t + 1);
+
   ngOnInit(): void {
-    this.timer = setInterval(() => this.tick.update((t) => t + 1), 1000);
+    this.timer = setInterval(this.refresh, 1000);
+    document.addEventListener('visibilitychange', this.refresh);
+    addEventListener('pageshow', this.refresh);
+    addEventListener('focus', this.refresh);
   }
 
   ngOnDestroy(): void {
     if (this.timer) clearInterval(this.timer);
+    document.removeEventListener('visibilitychange', this.refresh);
+    removeEventListener('pageshow', this.refresh);
+    removeEventListener('focus', this.refresh);
   }
 }

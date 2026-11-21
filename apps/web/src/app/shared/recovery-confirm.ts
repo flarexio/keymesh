@@ -3,6 +3,7 @@ import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { ToastService } from './feedback';
 import { Icon } from './icon';
 import { SecretInput } from './secret-input';
+import { EmergencyKit } from './emergency-kit';
 
 /**
  * Shows a new recovery code once and asks for it back. The core verifies the
@@ -10,7 +11,7 @@ import { SecretInput } from './secret-input';
  */
 @Component({
   selector: 'km-recovery-confirm',
-  imports: [Icon, SecretInput],
+  imports: [Icon, SecretInput, EmergencyKit],
   template: `
     <div class="recovery" data-testid="recovery-step">
       <p class="lead">{{ i18n.t(lead()) }}</p>
@@ -25,6 +26,7 @@ import { SecretInput } from './secret-input';
           <km-icon name="copy" /><span>{{ i18n.t('protected.recovery.copy') }}</span>
         </button>
       </div>
+      <km-emergency-kit [code]="code()" [vaultId]="vaultId()" />
       <label class="check">
         <input type="checkbox" data-testid="recovery-saved" [checked]="saved()" (change)="saved.set($any($event.target).checked)" />
         {{ i18n.t('protected.recovery.saved') }}
@@ -51,6 +53,8 @@ export class RecoveryConfirm {
   readonly lead = input<MessageKey>('protected.recovery.lead');
   readonly confirmLabel = input<MessageKey>('protected.recovery.confirm');
   readonly busy = input(false);
+  /** Shown on the printable emergency kit, when known. */
+  readonly vaultId = input<string | null>(null);
   readonly confirmed = output<string>();
   readonly cancelled = output<void>();
   protected readonly saved = signal(false);

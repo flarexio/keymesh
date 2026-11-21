@@ -31,6 +31,15 @@ use zeroize::Zeroizing;
 
 pub const KIND_PASSWORD: &str = "password";
 pub const KIND_RECOVERY: &str = "recovery";
+/// Quick unlock with a WebAuthn PRF passkey (M5 C1, ADR 0003 §4.1).
+pub const KIND_WEBAUTHN_PRF: &str = "webauthn-prf";
+pub const MAX_PRF_SLOTS: usize = 4;
+pub const PRF_LEN: usize = 32;
+pub const PRF_SALT_LEN: usize = 32;
+pub const MAX_CREDENTIAL_ID: usize = 1023;
+pub const MIN_CREDENTIAL_ID: usize = 16;
+pub const MAX_RP_ID: usize = 253;
+pub const MAX_PRF_LABEL: usize = 64;
 /// Upper bound on slots read from a file (this version writes exactly two).
 pub const MAX_SLOTS: usize = 8;
 const WRAPPED_LEN: usize = KEY_LEN + 16;
@@ -39,6 +48,7 @@ const WRAPPED_LEN: usize = KEY_LEN + 16;
 pub enum SlotKind {
     Password,
     Recovery,
+    WebauthnPrf,
 }
 
 impl SlotKind {
@@ -46,6 +56,7 @@ impl SlotKind {
         match self {
             SlotKind::Password => KIND_PASSWORD,
             SlotKind::Recovery => KIND_RECOVERY,
+            SlotKind::WebauthnPrf => KIND_WEBAUTHN_PRF,
         }
     }
 }
@@ -68,6 +79,19 @@ pub enum KdfRecord {
         #[serde(with = "b64")]
         salt: Vec<u8>,
     },
+    /// PRF output (32 bytes) → HKDF-SHA256; every field is authenticated.
+    #[serde(rename = "webauthn-prf-hkdf")]
+    WebauthnPrfHkdf {
+        // Its own bounded decoder: credential ids are up to 1023 bytes, far
+        // longer than the 64-character salt limit (review fix C-CORE-1).
+        #[serde(with = "b64_credential")]
+        credential_id: Vec<u8>,
+        rp_id: String,
+        #[serde(with = "b64")]
+        salt: Vec<u8>,
+        be: bool,
+        label: String,
+    },
 }
 
 impl KdfRecord {
@@ -89,6 +113,20 @@ impl KdfRecord {
                 salt,
             ]),
             KdfRecord::HkdfSha256 { salt } => fields(&[b"hkdf-sha256", salt]),
+            KdfRecord::WebauthnPrfHkdf {
+                credential_id,
+                rp_id,
+                salt,
+                be,
+                label,
+            } => fields(&[
+                b"webauthn-prf-hkdf",
+                credential_id,
+                rp_id.as_bytes(),
+                salt,
+                &[u8::from(*be)],
+                label.as_bytes(),
+            ]),
         }
     }
 }
@@ -138,6 +176,47 @@ impl PasswordSetup {
 
 pub(crate) fn new_slot_id(rng: &mut dyn RandomSource) -> Result<String> {
     Ok(data_encoding::HEXLOWER.encode(&random_array::<8>(rng)?))
+}
+
+/// Public parameters of a stored quick-unlock slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrfParams<'a> {
+    pub credential_id: &'a [u8],
+    pub rp_id: &'a str,
+    pub salt: &'a [u8],
+    pub be: bool,
+    pub label: &'a str,
+}
+
+/// Public parameters for a new quick-unlock slot, issued by the core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrfSetup {
+    pub slot_id: String,
+    pub salt: [u8; PRF_SALT_LEN],
+}
+
+impl PrfSetup {
+    pub fn generate(rng: &mut dyn RandomSource) -> Result<Self> {
+        Ok(Self {
+            slot_id: new_slot_id(rng)?,
+            salt: random_array::<PRF_SALT_LEN>(rng)?,
+        })
+    }
+}
+
+/// A WebAuthn RP id as stored: lowercase ASCII host, bounded.
+fn valid_rp_id(rp: &str) -> bool {
+    !rp.is_empty()
+        && rp.len() <= MAX_RP_ID
+        && rp
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-'))
+        && !rp.starts_with('.')
+        && !rp.ends_with('.')
+}
+
+fn valid_label(label: &str) -> bool {
+    label.len() <= MAX_PRF_LABEL && !label.chars().any(char::is_control)
 }
 
 fn valid_slot_id(id: &str) -> bool {
@@ -195,7 +274,26 @@ impl Slot {
                 }
                 SlotKind::Recovery
             }
-            (KIND_PASSWORD | KIND_RECOVERY, _) => {
+            (
+                KIND_WEBAUTHN_PRF,
+                KdfRecord::WebauthnPrfHkdf {
+                    credential_id,
+                    rp_id,
+                    salt,
+                    label,
+                    ..
+                },
+            ) => {
+                if !(MIN_CREDENTIAL_ID..=MAX_CREDENTIAL_ID).contains(&credential_id.len())
+                    || salt.len() != PRF_SALT_LEN
+                    || !valid_rp_id(rp_id)
+                    || !valid_label(label)
+                {
+                    return Err(bad("unsupported quick-unlock key slot"));
+                }
+                SlotKind::WebauthnPrf
+            }
+            (KIND_PASSWORD | KIND_RECOVERY | KIND_WEBAUTHN_PRF, _) => {
                 return Err(bad("key slot uses an unexpected algorithm"))
             }
             _ => return Err(bad("unknown key slot kind")),
@@ -239,17 +337,62 @@ impl Slot {
 
     fn salt(&self) -> &[u8] {
         match &self.rec.kdf {
-            KdfRecord::Argon2id { salt, .. } | KdfRecord::HkdfSha256 { salt } => salt,
+            KdfRecord::Argon2id { salt, .. }
+            | KdfRecord::HkdfSha256 { salt }
+            | KdfRecord::WebauthnPrfHkdf { salt, .. } => salt,
         }
     }
 
     fn kek(&self, vault_id: &str, ikm: &[u8]) -> Result<Key256> {
-        let salt = match self.kind {
+        match (&self.kind, &self.rec.kdf) {
             // Argon2id already consumed the slot salt.
-            SlotKind::Password => None,
-            SlotKind::Recovery => Some(self.salt()),
-        };
-        kdf::slot_kek(ikm, salt, self.kind.as_str(), vault_id, &self.rec.id)
+            (SlotKind::Password, _) => {
+                kdf::slot_kek(ikm, None, self.kind.as_str(), vault_id, &self.rec.id)
+            }
+            (SlotKind::Recovery, _) => kdf::slot_kek(
+                ikm,
+                Some(self.salt()),
+                self.kind.as_str(),
+                vault_id,
+                &self.rec.id,
+            ),
+            // The PRF salt is the authenticator's input, not an HKDF salt;
+            // the credential id is bound into `info`.
+            (SlotKind::WebauthnPrf, KdfRecord::WebauthnPrfHkdf { credential_id, .. }) => {
+                if ikm.len() != PRF_LEN {
+                    return Err(Error::Decrypt);
+                }
+                kdf::slot_kek_with(
+                    ikm,
+                    None,
+                    self.kind.as_str(),
+                    vault_id,
+                    &self.rec.id,
+                    &[credential_id],
+                )
+            }
+            _ => Err(bad("key slot uses an unexpected algorithm")),
+        }
+    }
+
+    /// Public parameters of a `webauthn-prf` slot.
+    pub fn prf_params(&self) -> Option<PrfParams<'_>> {
+        match &self.rec.kdf {
+            KdfRecord::WebauthnPrfHkdf {
+                credential_id,
+                rp_id,
+                salt,
+                be,
+                label,
+            } => Some(PrfParams {
+                credential_id,
+                rp_id,
+                salt,
+                be: *be,
+                label,
+            }),
+            _ => None,
+        }
     }
 
     /// Unwrap the DEK with key material for this slot (Argon2id output for a
@@ -322,6 +465,45 @@ impl Slot {
         )
     }
 
+    /// New quick-unlock slot: wraps `dek` under the KEK derived from the
+    /// authenticator's 32-byte PRF output for `setup.salt`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_prf(
+        vault_id: &str,
+        setup: &PrfSetup,
+        credential_id: &[u8],
+        rp_id: &str,
+        be: bool,
+        label: &str,
+        prf_output: &[u8; PRF_LEN],
+        dek: &Key256,
+        rng: &mut dyn RandomSource,
+    ) -> Result<Self> {
+        if !valid_slot_id(&setup.slot_id)
+            || !(MIN_CREDENTIAL_ID..=MAX_CREDENTIAL_ID).contains(&credential_id.len())
+            || !valid_rp_id(rp_id)
+            || !valid_label(label)
+        {
+            return Err(Error::validation("invalid quick-unlock parameters"));
+        }
+        let kdf = KdfRecord::WebauthnPrfHkdf {
+            credential_id: credential_id.to_vec(),
+            rp_id: rp_id.to_owned(),
+            salt: setup.salt.to_vec(),
+            be,
+            label: label.to_owned(),
+        };
+        Self::wrap(
+            vault_id,
+            setup.slot_id.clone(),
+            SlotKind::WebauthnPrf,
+            kdf,
+            prf_output,
+            dek,
+            rng,
+        )
+    }
+
     /// New recovery slot for `code`, with a fresh id and salt.
     pub(crate) fn new_recovery(
         vault_id: &str,
@@ -379,11 +561,56 @@ impl SlotSet {
                 "a vault needs exactly one password slot and one recovery slot",
             ));
         }
+        if count(SlotKind::WebauthnPrf) > MAX_PRF_SLOTS {
+            return Err(bad("too many quick-unlock key slots"));
+        }
+        let mut creds = BTreeSet::new();
+        for s in &slots {
+            if let Some(p) = s.prf_params() {
+                if !creds.insert(p.credential_id.to_vec()) {
+                    return Err(bad("duplicate quick-unlock credential"));
+                }
+            }
+        }
         Ok(Self(slots))
     }
 
     pub fn records(&self) -> Vec<SlotRecord> {
         self.0.iter().map(|s| s.rec.clone()).collect()
+    }
+
+    /// The quick-unlock slots, in file order.
+    pub fn prf_slots(&self) -> impl Iterator<Item = &Slot> {
+        self.0.iter().filter(|s| s.kind == SlotKind::WebauthnPrf)
+    }
+
+    /// The quick-unlock slot for exactly this credential id.
+    pub fn prf_slot(&self, credential_id: &[u8]) -> Option<&Slot> {
+        self.prf_slots().find(|s| {
+            s.prf_params()
+                .is_some_and(|p| p.credential_id == credential_id)
+        })
+    }
+
+    /// Add a quick-unlock slot (refused past the bound or for a duplicate).
+    pub(crate) fn with_prf(&self, slot: Slot) -> Result<Self> {
+        let mut v = self.0.clone();
+        v.push(slot);
+        Self::check(v)
+    }
+
+    /// Remove one quick-unlock slot by id (password/recovery can't be removed).
+    pub(crate) fn without_prf(&self, slot_id: &str) -> Result<Self> {
+        if !self.prf_slots().any(|s| s.id() == slot_id) {
+            return Err(Error::validation("no such quick-unlock key slot"));
+        }
+        Self::check(
+            self.0
+                .iter()
+                .filter(|s| s.id() != slot_id)
+                .cloned()
+                .collect(),
+        )
     }
 
     pub fn get(&self, kind: SlotKind) -> &Slot {
@@ -395,8 +622,14 @@ impl SlotSet {
     }
 
     /// Replace the slot of the same kind (rewrap: the DEK is unchanged).
+    /// Only for the single password and recovery slots.
     pub(crate) fn replace(&self, slot: Slot) -> Result<Self> {
         let kind = slot.kind;
+        if kind == SlotKind::WebauthnPrf {
+            return Err(Error::validation(
+                "quick-unlock slots are added or removed, not replaced",
+            ));
+        }
         let mut v: Vec<Slot> = self.0.iter().filter(|s| s.kind != kind).cloned().collect();
         // Keep a stable order: password first.
         if kind == SlotKind::Password {
@@ -456,6 +689,28 @@ mod b64 {
         let s = String::deserialize(d)?;
         if s.len() > 64 {
             return Err(serde::de::Error::custom("salt too long"));
+        }
+        data_encoding::BASE64URL_NOPAD
+            .decode(s.as_bytes())
+            .map_err(|_| serde::de::Error::custom("invalid base64url"))
+    }
+}
+
+/// Strict base64url (no padding, canonical trailing bits) for WebAuthn
+/// credential ids: at most the encoded length of [`MAX_CREDENTIAL_ID`]
+/// bytes, checked before decoding. The decoded length (16..=1023) is
+/// validated with the rest of the slot.
+mod b64_credential {
+    use super::MAX_CREDENTIAL_ID;
+    use serde::{Deserialize, Deserializer, Serializer};
+    const MAX_ENCODED: usize = (MAX_CREDENTIAL_ID * 4).div_ceil(3);
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&data_encoding::BASE64URL_NOPAD.encode(v))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        if s.len() > MAX_ENCODED {
+            return Err(serde::de::Error::custom("credential id too long"));
         }
         data_encoding::BASE64URL_NOPAD
             .decode(s.as_bytes())

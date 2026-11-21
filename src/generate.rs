@@ -6,8 +6,7 @@
 //!   from each required class, the remainder from the full alphabet, and the
 //!   result is shuffled with an unbiased Fisher–Yates shuffle.
 //! * Policies that cannot be satisfied or are too weak are rejected up front.
-//! * Passphrases (wordlist-based) are **pending**: no reviewed, versioned
-//!   wordlist is vendored in M1, and we do not fabricate one.
+//! * Passphrases (wordlist-based) live in [`crate::passphrase`].
 //!
 //! Random secrets produced here are local random values. They are *not*
 //! provider-issued API credentials.
@@ -365,13 +364,6 @@ pub fn generate_secret(
     Ok(SecretString::new(encoding.encode(&buf)))
 }
 
-/// Passphrase generation is intentionally not implemented in M1.
-pub fn generate_passphrase() -> Result<SecretString> {
-    Err(Error::Policy(
-        "passphrase generation pending: no reviewed, versioned wordlist is bundled".into(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,11 +651,6 @@ mod tests {
             generate_password(&ok, &mut FailingRandom),
             Err(Error::Rng)
         ));
-    }
-
-    #[test]
-    fn passphrase_is_explicitly_pending() {
-        assert!(generate_passphrase().is_err());
     }
 
     /// Exact distribution of `generate_password` for tiny policies, by

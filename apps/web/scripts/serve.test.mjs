@@ -14,6 +14,7 @@ const OUTSIDE = 'SYNTHETIC-OUTSIDE-ROOT-MARKER';
 const base = mkdtempSync(join(tmpdir(), 'keymesh-serve-'));
 const root = join(base, 'browser');
 let server;
+let serverOutput = '';
 
 function get(path) {
   return new Promise((resolve, reject) => {
@@ -34,6 +35,10 @@ before(async () => {
   writeFileSync(join(root, 'index.html'), '<!doctype html><title>synthetic index</title>');
   writeFileSync(join(root, 'main-TEST.js'), 'console.log("synthetic")');
   writeFileSync(join(root, 'wasm', 'core.wasm'), 'synthetic-wasm');
+  mkdirSync(join(root, 'icons'));
+  writeFileSync(join(root, 'icons', 'icon.png'), 'synthetic-png');
+  writeFileSync(join(root, 'manifest.webmanifest'), '{"name":"synthetic"}');
+  writeFileSync(join(root, 'ngsw.json'), '{"configVersion":1}');
   // Siblings that share the root's name prefix, and a file outside it.
   writeFileSync(join(base, 'browser-sibling.txt'), OUTSIDE);
   mkdirSync(join(base, 'browserx'));
@@ -44,9 +49,11 @@ before(async () => {
   symlinkSync(base, join(root, 'link-dir'));
   const script = fileURLToPath(new URL('./serve.mjs', import.meta.url));
   server = spawn(process.execPath, [script, String(PORT)], {
-    env: { ...process.env, HOST: '127.0.0.1', STATIC_ROOT: root, TLS_CERT: '', TLS_KEY: '' },
+    env: { ...process.env, HOST: '127.0.0.1', STATIC_ROOT: root, TLS_CERT: '', TLS_KEY: '', KEYMESH_FAVICON: '' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  server.stdout.on('data', (d) => (serverOutput += d));
+  server.stderr.on('data', (d) => (serverOutput += d));
   await new Promise((resolve, reject) => {
     server.stdout.once('data', resolve);
     server.once('exit', (c) => reject(new Error(`server exited ${c}`)));
@@ -70,6 +77,25 @@ test('normal assets and SPA fallback still work', async () => {
   const route = await get('/some/app/route');
   assert.equal(route.status, 200);
   assert.ok(route.body.includes('synthetic index'));
+});
+
+test('PWA files get their own MIME types, and missing files are never the SPA shell', async () => {
+  const manifest = await get('/manifest.webmanifest');
+  assert.equal(manifest.status, 200);
+  assert.equal(manifest.type, 'application/manifest+json');
+  const png = await get('/icons/icon.png');
+  assert.equal(png.status, 200);
+  assert.equal(png.type, 'image/png');
+  const ngsw = await get('/ngsw.json');
+  assert.equal(ngsw.status, 200);
+  assert.match(ngsw.type, /^application\/json/);
+  // A missing file name (it has an extension) is a 404, so a service worker
+  // or script can never receive index.html in place of ngsw.json or a chunk.
+  for (const path of ['/missing.js', '/ngsw-missing.json', '/wasm/missing.wasm', '/icons/missing.png', '/a/b.webmanifest']) {
+    const r = await get(path);
+    assert.equal(r.status, 404, path);
+    assert.ok(!r.body.includes('synthetic index'), path);
+  }
 });
 
 for (const path of [
@@ -141,4 +167,25 @@ test('an outward index.html symlink is never served, not even as the SPA fallbac
     srv.kill();
     rmSync(base2, { recursive: true, force: true });
   }
+});
+
+test('favicon route: off by default (404, never the SPA shell), other /api paths 404, no host names logged', async () => {
+  for (const p of ['/api/favicon?host=icons.example.com', '/api/favicon', '/api/other', '/api/']) {
+    const r = await get(p);
+    assert.equal(r.status, 404, p);
+    assert.ok(!r.body.includes('synthetic index'), p);
+  }
+  assert.ok(!serverOutput.includes('icons.example.com'));
+});
+
+test('favicon responses are never stored by the browser (no-store), even errors', async () => {
+  const r = await new Promise((resolve, reject) => {
+    const q = request({ host: '127.0.0.1', port: PORT, path: '/api/favicon?host=icons.example.com', method: 'GET' }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.headers['cache-control']));
+    });
+    q.on('error', reject);
+    q.end();
+  });
+  assert.equal(r, 'no-store');
 });

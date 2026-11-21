@@ -1,4 +1,5 @@
 # Allowlist: only the server script and the built bundle.
 *
 !scripts/serve.mjs
+!scripts/favicon.mjs
 !dist/web/browser/**

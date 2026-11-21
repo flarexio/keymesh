@@ -15,6 +15,11 @@
  * opens and again after the current record is read, right before `put`; a
  * cancelled write aborts its transaction and leaves storage unchanged. Once
  * `put` is issued the write can no longer be cancelled.
+ *
+ * Ordering: a write promise settles only after its transaction completed or
+ * aborted, or before any `put` was issued (open/read failures, a guard,
+ * a CAS mismatch, a synchronous `put` failure, which aborts at once). So a
+ * read after a rejected write sees final state, never an in-flight `put`.
  */
 
 export interface StoredVault {
@@ -44,11 +49,21 @@ function req<T>(r: IDBRequest<T>): Promise<T> {
   });
 }
 
-function done(tx: IDBTransaction): Promise<void> {
+/**
+ * Settles only when the transaction itself has finished: `complete`
+ * (committed) or `abort` (nothing committed). An `error` event comes before
+ * the abort it causes, so it is only recorded, never treated as the end:
+ * callers can rely on "rejected" meaning the transaction is over and did not
+ * commit.
+ */
+export function done(tx: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
+    let error: unknown = null;
     tx.oncomplete = () => resolve();
-    tx.onabort = () => reject(tx.error ?? new ConflictError());
-    tx.onerror = () => reject(tx.error ?? new Error('IndexedDB transaction failed'));
+    tx.onerror = () => {
+      error ??= tx.error;
+    };
+    tx.onabort = () => reject(error ?? tx.error ?? new ConflictError());
   });
 }
 
@@ -163,10 +178,20 @@ export class VaultStore {
    * Comparing exact bytes, not revision numbers, keeps this safe when a
    * restored backup reuses an older revision. On mismatch nothing is written.
    */
-  async compareAndSwap(expected: Uint8Array | null, next: StoredVault, guard: Guard = noGuard): Promise<void> {
+  async compareAndSwap(
+    expected: Uint8Array | null,
+    next: StoredVault,
+    guard: Guard = noGuard,
+    /**
+     * `strict` ASKS the browser to flush to disk before reporting success.
+     * It is a hint: browsers without the option ignore it, and none reports
+     * a durability failure after `complete`. Other writes keep the default.
+     */
+    durability: IDBTransactionDurability = 'default',
+  ): Promise<void> {
     const db = await this.open();
     guard();
-    const tx = db.transaction('vault', 'readwrite');
+    const tx = db.transaction('vault', 'readwrite', { durability });
     const finished = settled(tx);
     const os = tx.objectStore('vault');
     const cur = await req(os.get(KEY));

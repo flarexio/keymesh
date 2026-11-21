@@ -173,14 +173,29 @@ pub fn slot_kek(
     vault_id: &str,
     slot_id: &str,
 ) -> Result<crate::crypto::Key256> {
-    let info = fields(&[
+    slot_kek_with(ikm, salt, kind, vault_id, slot_id, &[])
+}
+
+/// [`slot_kek`] with extra context appended to `info` (a `webauthn-prf`
+/// slot binds its credential id: ADR 0003 §4.1).
+pub fn slot_kek_with(
+    ikm: &[u8],
+    salt: Option<&[u8]>,
+    kind: &str,
+    vault_id: &str,
+    slot_id: &str,
+    extra: &[&[u8]],
+) -> Result<crate::crypto::Key256> {
+    let mut parts: Vec<&[u8]> = vec![
         b"keymesh.vault",
         b"2",
         b"kek",
         kind.as_bytes(),
         vault_id.as_bytes(),
         slot_id.as_bytes(),
-    ]);
+    ];
+    parts.extend_from_slice(extra);
+    let info = fields(&parts);
     let mut okm = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(salt, ikm)
         .expand(&info, &mut *okm)

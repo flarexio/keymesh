@@ -5,7 +5,10 @@ import { VaultService } from '../core/vault.service';
 import { Icon } from '../shared/icon';
 import { RecoveryConfirm } from '../shared/recovery-confirm';
 import { SecretInput } from '../shared/secret-input';
+import { PassphraseSuggest } from '../shared/passphrase-suggest';
 import { ProtectedRestore } from './protected-restore';
+import { AutoLock, HIDE_CHOICES, IDLE_CHOICES } from '../core/auto-lock';
+import { FaviconPref } from '../core/favicon-pref';
 
 /**
  * Encrypted backup of the stored envelope and verified restore. A restore
@@ -16,7 +19,7 @@ import { ProtectedRestore } from './protected-restore';
  */
 @Component({
   selector: 'km-backup',
-  imports: [Icon, RecoveryConfirm, SecretInput, ProtectedRestore],
+  imports: [Icon, RecoveryConfirm, SecretInput, ProtectedRestore, PassphraseSuggest],
   template: `
     <div class="page">
       <header class="page-head">
@@ -63,6 +66,7 @@ import { ProtectedRestore } from './protected-restore';
               <km-secret-input label="protected.newPassword" name="newPassword" autocomplete="new-password" testid="change-new"
                 hint="protected.passwordHint" [(value)]="next" />
               <km-secret-input label="protected.passwordConfirm" name="newPasswordConfirm" autocomplete="new-password" testid="change-confirm" [(value)]="again" />
+              <km-passphrase-suggest (chosen)="next.set($event); again.set($event)" />
               <div class="form-actions">
                 <button type="submit" class="btn btn-primary" data-testid="change-password" [disabled]="busy()">
                   <km-icon name="key" /><span>{{ i18n.t(busy() ? 'protected.working' : 'security.change.button') }}</span>
@@ -73,7 +77,7 @@ import { ProtectedRestore } from './protected-restore';
           <section class="card tool-card" aria-labelledby="new-recovery">
             <h3 id="new-recovery" class="card-title"><km-icon name="shield" />{{ i18n.t('security.recovery.title') }}</h3>
             @if (newCode(); as code) {
-              <km-recovery-confirm [code]="code" lead="security.recovery.body" confirmLabel="security.recovery.button" [busy]="busy()"
+              <km-recovery-confirm [code]="code" [vaultId]="vault.protectedStored()?.vault_id ?? null" lead="security.recovery.body" confirmLabel="security.recovery.button" [busy]="busy()"
                 (confirmed)="finishRecovery($event)" (cancelled)="cancelRecovery()" />
             } @else {
               <p>{{ i18n.t('security.recovery.body') }}</p>
@@ -89,7 +93,107 @@ import { ProtectedRestore } from './protected-restore';
           </section>
         </div>
         <div class="callout callout-warn" role="note" data-testid="rotation-note"><km-icon name="info" /><p>{{ i18n.t('security.rotation') }}</p></div>
+        <section class="card tool-card" aria-labelledby="qu-title" data-testid="quick-unlock-section">
+          <h3 id="qu-title" class="card-title"><km-icon name="key" />{{ i18n.t('qu.title') }}</h3>
+          <p>{{ i18n.t('qu.lead') }}</p>
+          @if (passkeys(); as list) {
+            @if (list.length === 0) {
+              <p class="field-hint" data-testid="qu-none">{{ i18n.t('qu.none') }}</p>
+            }
+            <ul class="value-list" data-testid="qu-list">
+              @for (k of list; track k.slot_id) {
+                <li data-testid="qu-item" [attr.data-be]="k.be">
+                  <span class="value-label">{{ k.label || 'Keymesh' }}</span>
+                  <span class="value-text field-hint">{{ i18n.t(k.be ? 'qu.be1' : 'qu.be0') }}</span>
+                  <button type="button" class="btn btn-sm btn-danger-ghost" data-testid="qu-remove" [disabled]="busy() || !quCurrent()" (click)="removePasskey(k.slot_id)">{{ i18n.t('qu.remove') }}</button>
+                </li>
+              }
+            </ul>
+          }
+          <form class="form-stack" (submit)="addPasskey($event)">
+            <km-secret-input label="security.current" name="quCurrent" autocomplete="current-password" testid="qu-current" [(value)]="quCurrent" />
+            <div class="field">
+              <label class="field-label" for="qu-label">{{ i18n.t('qu.label') }}</label>
+              <input id="qu-label" data-testid="qu-label" maxlength="64" [value]="quLabel()" (input)="quLabel.set($any($event.target).value)" />
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary" data-testid="qu-add" [disabled]="busy() || !vault.quickUnlockSupported()">
+                <km-icon name="plus" /><span>{{ i18n.t(busy() ? 'qu.adding' : 'qu.add') }}</span>
+              </button>
+            </div>
+          </form>
+          <p class="field-hint">{{ i18n.t('qu.removeHint') }}</p>
+          <p class="field-hint" data-testid="qu-pin-blocked">{{ i18n.t('qu.pinBlocked') }}</p>
+          <p class="hint experimental"><km-icon name="shieldAlert" /> {{ i18n.t('qu.experimental') }}</p>
+        </section>
+        <section class="card tool-card" aria-labelledby="rotate-title" data-testid="rotate-section">
+          <h3 id="rotate-title" class="card-title"><km-icon name="refresh" />{{ i18n.t('security.rotate.title') }}</h3>
+          @if (rotateCode(); as code) {
+            <km-recovery-confirm [code]="code" [vaultId]="vault.protectedStored()?.vault_id ?? null" lead="security.rotate.codeLead" confirmLabel="security.rotate.finish" [busy]="busy()"
+              (confirmed)="finishRotation($event)" (cancelled)="cancelRotation()" />
+          } @else {
+            <p>{{ i18n.t('security.rotate.body') }}</p>
+            <ul class="hint-list">
+              <li>{{ i18n.t('security.rotate.backups') }}</li>
+              <li>{{ i18n.t('security.rotate.copies') }}</li>
+              <li>{{ i18n.t('security.rotate.services') }}</li>
+            </ul>
+            <form class="form-stack" (submit)="beginRotation($event)">
+              <km-secret-input label="security.current" name="rotateCurrent" autocomplete="current-password" testid="rotate-current" [(value)]="rotCurrent" />
+              <km-secret-input label="protected.newPassword" name="rotateNew" autocomplete="new-password" testid="rotate-new"
+                hint="security.rotate.newHint" [(value)]="rotNext" />
+              <km-secret-input label="protected.passwordConfirm" name="rotateConfirm" autocomplete="new-password" testid="rotate-confirm" [(value)]="rotAgain" />
+              <km-passphrase-suggest (chosen)="rotNext.set($event); rotAgain.set($event)" />
+              @if (passkeys().length) {
+                <label class="check">
+                  <input type="checkbox" data-testid="rotate-revoke-quick-unlock" [checked]="rotRevoke()" (change)="rotRevoke.set($any($event.target).checked)" />
+                  {{ i18n.t('qu.revokeLabel', { names: passkeyNames() }) }}
+                </label>
+              }
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary" data-testid="begin-rotation" [disabled]="busy()">
+                  <km-icon name="refresh" /><span>{{ i18n.t(busy() ? 'protected.working' : 'security.rotate.button') }}</span>
+                </button>
+              </div>
+            </form>
+          }
+        </section>
       }
+      <section class="card tool-card autolock-card" aria-labelledby="autolock-title" data-testid="autolock-section">
+        <h3 id="autolock-title" class="card-title"><km-icon name="lock" />{{ i18n.t('autolock.title') }}</h3>
+        <p class="field-hint">{{ i18n.t('autolock.lead') }}</p>
+        <div class="field-grid">
+          <div class="field">
+            <label class="field-label" for="autolock-idle">{{ i18n.t('autolock.idle') }}</label>
+            <select id="autolock-idle" data-testid="autolock-idle" (change)="setIdle($event)">
+              @for (m of idleChoices; track m) {
+                <option [value]="m" [selected]="m === autoLock.settings().idleMinutes">{{ m === 0 ? i18n.t('autolock.never') : i18n.t('autolock.minutes', { n: m }) }}</option>
+              }
+            </select>
+          </div>
+          <div class="field">
+            <label class="field-label" for="autolock-hide">{{ i18n.t('autolock.hidden') }}</label>
+            <select id="autolock-hide" data-testid="autolock-hide" (change)="setHide($event)">
+              @for (sec of hideChoices; track sec) {
+                <option [value]="sec" [selected]="sec === autoLock.settings().hideSeconds">{{ sec === 0 ? i18n.t('autolock.immediately') : sec < 60 ? i18n.t('autolock.seconds', { n: sec }) : i18n.t('autolock.minutes', { n: sec / 60 }) }}</option>
+              }
+            </select>
+          </div>
+        </div>
+        @if (autoLock.settings().idleMinutes === 0) {
+          <p class="field-hint field-error" role="note" data-testid="autolock-never-warning">{{ i18n.t('autolock.neverWarning') }}</p>
+        }
+        <p class="field-hint">{{ i18n.t('autolock.limits') }}</p>
+      </section>
+      <section class="card tool-card autolock-card" aria-labelledby="favicon-title" data-testid="favicon-section">
+        <h3 id="favicon-title" class="card-title"><km-icon name="login" />{{ i18n.t('favicon.title') }}</h3>
+        <p class="field-hint">{{ i18n.t('favicon.lead') }}</p>
+        <label class="check">
+          <input type="checkbox" data-testid="favicon-optin" [checked]="favicon.enabled()" (change)="favicon.set($any($event.target).checked)" />
+          {{ i18n.t('favicon.optin') }}
+        </label>
+        <p class="field-hint">{{ i18n.t('favicon.limits') }}</p>
+      </section>
       @if (message(); as m) {
         <div class="callout callout-success" role="status" data-testid="backup-status"><km-icon name="check" /><p>{{ i18n.t(m) }}</p></div>
       }
@@ -104,6 +208,16 @@ export class Backup implements OnDestroy {
   protected readonly i18n = inject(I18n);
   protected readonly message = signal<MessageKey | null>(null);
   protected readonly error = signal<MessageKey | null>(null);
+  protected readonly autoLock = inject(AutoLock);
+  protected readonly favicon = inject(FaviconPref);
+  protected readonly idleChoices = IDLE_CHOICES;
+  protected readonly hideChoices = HIDE_CHOICES;
+  protected setIdle(ev: Event): void {
+    this.autoLock.update({ ...this.autoLock.settings(), idleMinutes: Number((ev.target as HTMLSelectElement).value) });
+  }
+  protected setHide(ev: Event): void {
+    this.autoLock.update({ ...this.autoLock.settings(), hideSeconds: Number((ev.target as HTMLSelectElement).value) });
+  }
   protected readonly maxMiB = computed(() => Math.floor(this.vault.maxBytes() / (1024 * 1024)));
   protected readonly keyLabel = computed(() =>
     this.i18n.t(this.vault.keyMode() === 'synthetic-fixture' ? 'backup.keyFixture' : 'backup.keyEphemeral'),
@@ -151,6 +265,42 @@ export class Backup implements OnDestroy {
   protected readonly again = signal('');
   protected readonly recoveryCurrent = signal('');
   protected readonly newCode = signal<string | null>(null);
+  protected readonly rotCurrent = signal('');
+  protected readonly rotNext = signal('');
+  protected readonly rotAgain = signal('');
+  protected readonly rotateCode = signal<string | null>(null);
+  protected readonly rotRevoke = signal(false);
+  protected readonly quCurrent = signal('');
+  protected readonly quLabel = signal('');
+  /** Passkeys of the open vault; re-read whenever the vault changes. */
+  protected readonly passkeys = computed(() => {
+    this.vault.version();
+    this.vault.revision();
+    try {
+      return this.vault.quickUnlockSlots();
+    } catch {
+      return [];
+    }
+  });
+  protected readonly passkeyNames = computed(() => this.passkeys().map((k) => k.label || 'Keymesh').join(', '));
+
+  protected addPasskey(ev: Event): void {
+    ev.preventDefault();
+    void this.act(async () => {
+      await this.vault.enrollQuickUnlock(this.quCurrent(), this.quLabel().trim());
+      this.quCurrent.set('');
+      this.quLabel.set('');
+      this.message.set('qu.added');
+    });
+  }
+
+  protected removePasskey(slotId: string): void {
+    void this.act(async () => {
+      await this.vault.removeQuickUnlock(this.quCurrent(), slotId);
+      this.quCurrent.set('');
+      this.message.set('qu.removed');
+    });
+  }
   private readonly working = signal(false);
   protected readonly busy = computed(() => this.working() || this.vault.credentialBusy());
 
@@ -210,7 +360,48 @@ export class Backup implements OnDestroy {
     this.newCode.set(null);
   }
 
+  protected beginRotation(ev: Event): void {
+    ev.preventDefault();
+    try {
+      this.vault.checkNewPassword(this.rotNext());
+    } catch (e) {
+      this.error.set(errorKey(e));
+      return;
+    }
+    if (this.rotNext() !== this.rotAgain()) {
+      this.error.set('protected.mismatch');
+      return;
+    }
+    void this.act(async () => {
+      const code = await this.vault.beginRotation(this.rotCurrent(), this.rotNext(), this.rotRevoke());
+      this.rotCurrent.set('');
+      this.rotNext.set('');
+      this.rotAgain.set('');
+      this.rotateCode.set(code);
+    });
+  }
+
+  protected finishRotation(code: string): void {
+    void this.act(async () => {
+      try {
+        await this.vault.finishRotation(code);
+      } catch (e) {
+        // A mistyped code keeps the rotation pending; anything else ends it.
+        if (errorKey(e) !== 'errors.recoveryMismatch' && errorKey(e) !== 'errors.recoveryInvalid') this.rotateCode.set(null);
+        throw e;
+      }
+      this.rotateCode.set(null);
+      this.message.set('security.rotate.done');
+    });
+  }
+
+  protected cancelRotation(): void {
+    this.vault.cancelRotation();
+    this.rotateCode.set(null);
+  }
+
   ngOnDestroy(): void {
     if (this.newCode()) this.vault.cancelRecoveryChange();
+    if (this.rotateCode()) this.vault.cancelRotation();
   }
 }

@@ -12,7 +12,14 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import { en } from '../src/app/core/i18n/en';
-import { M, assertNoMarkers, createAllKinds, openItem, storedBytes, titles } from './helpers';
+import { M, assertNoMarkers, createAllKinds, openItem, storedBytes, titles, insecureOrigin } from './helpers';
+
+// These tests hold the KDF worker *script* with page.route to make races
+// deterministic. Requests answered by a service worker bypass page.route
+// (Playwright), so the installed-app worker is blocked here. The service
+// worker with password vaults (create, offline reload, unlock) is covered in
+// pwa.spec.ts.
+test.use({ serviceWorkers: 'block' });
 
 const PW = 'synthetic e2e passphrase one';
 const PW2 = 'synthetic e2e passphrase two';
@@ -445,7 +452,7 @@ test('plain-HTTP non-loopback origin: password vaults refused, demo still usable
   const browser = await chromium.launch({ args: ['--host-resolver-rules=MAP keymesh-http.test 127.0.0.1'] });
   try {
     const page = await browser.newPage();
-    await page.goto('http://keymesh-http.test:4310/');
+    await page.goto(insecureOrigin(test.info().project.use.baseURL));
     expect(await page.evaluate(() => isSecureContext)).toBe(false);
     await expect(page.getByTestId('insecure-notice')).toContainText(en['protected.insecure.body']);
     await expect(page.getByTestId('create-password')).toHaveCount(0);

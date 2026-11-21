@@ -739,6 +739,87 @@ mod tests {
         assert_eq!(leftovers, 0, "no temp files left");
     }
 
+    const PW3: &str = "synthetic storage rotated passphrase";
+
+    /// Open `path` with PW and rotate in memory to PW3 and a new code.
+    fn rotated(path: &Path) -> (Vault, Vault, crate::recovery::RecoveryCode) {
+        let bytes = read_envelope(path).unwrap();
+        let v = Vault::open_with_password(&bytes, PW).unwrap();
+        let cur = v.password_setup().unwrap().derive(PW).unwrap();
+        let setup = PasswordSetup::generate(&mut OsRandom).unwrap();
+        let new = setup.derive(PW3).unwrap();
+        let p = v
+            .begin_rotation(Authority::PasswordKey(&cur), &setup, &new, &mut OsRandom)
+            .unwrap();
+        let code = crate::recovery::RecoveryCode::parse(&p.code().to_text()).unwrap();
+        let r = v.finish_rotation(&p, &code).unwrap();
+        (v, r, code)
+    }
+
+    #[test]
+    fn rotation_save_is_check_then_replace_with_old_file_kept_on_failure() {
+        let (d, path, _p) = setup();
+        let original = protected_file(&path);
+        // Concurrent change on disk: refused, nothing replaced.
+        let (_old, mut r, _code) = rotated(&path);
+        let mut other = Vault::open_with_password(&original, PW).unwrap();
+        other.insert(note("other writer")).unwrap();
+        save_protected(&path, &mut other, &mut OsRandom).unwrap();
+        let after_other = fs::read(&path).unwrap();
+        assert!(matches!(
+            save_protected(&path, &mut r, &mut OsRandom),
+            Err(Error::Integrity(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), after_other);
+        // Pre-rename failure (unopenable directory): old file and old
+        // credentials kept; the rotated vault did not advance.
+        #[cfg(unix)]
+        if !is_root() {
+            let (_old, mut r, code) = rotated(&path);
+            let res = {
+                let _mode = DirMode::set(d.path(), 0o300);
+                save_protected(&path, &mut r, &mut OsRandom)
+            };
+            assert!(matches!(res, Err(Error::Io(_))), "{res:?}");
+            assert_eq!(fs::read(&path).unwrap(), after_other);
+            assert_eq!(r.revision(), 2);
+            assert!(Vault::open_with_password(&after_other, PW).is_ok());
+            assert!(Vault::open_with_recovery(&after_other, &code).is_err());
+        }
+        // Success: only the new credentials open the file.
+        let (_old, mut r, code) = rotated(&path);
+        save_protected(&path, &mut r, &mut OsRandom).unwrap();
+        let now = fs::read(&path).unwrap();
+        assert!(Vault::open_with_password(&now, PW3).is_ok());
+        assert!(Vault::open_with_recovery(&now, &code).is_ok());
+        assert!(Vault::open_with_password(&now, PW).is_err());
+        assert_eq!(r.snapshot_digest(), Some(digest(&path)));
+    }
+
+    #[test]
+    fn dir_sync_failure_after_a_rotation_save_is_reported_as_committed() {
+        let (_d, path, _p) = setup();
+        let original = protected_file(&path);
+        let (old, mut r, code) = rotated(&path);
+        let res = {
+            let _f = DirSyncFault::on();
+            save_protected(&path, &mut r, &mut OsRandom)
+        };
+        assert!(matches!(res, Err(Error::DurabilityUncertain(_))), "{res:?}");
+        let now = fs::read(&path).unwrap();
+        assert_ne!(now, original);
+        assert!(Vault::open_with_password(&now, PW3).is_ok());
+        assert!(Vault::open_with_recovery(&now, &code).is_ok());
+        assert!(Vault::open_with_password(&now, PW).is_err());
+        // The rotated vault is reconciled to the file; the old value is stale.
+        assert_eq!(r.snapshot_digest(), Some(digest(&path)));
+        let mut old = old;
+        old.insert(note("stale")).unwrap();
+        assert!(save_protected(&path, &mut old, &mut OsRandom).is_err());
+        r.insert(note("after")).unwrap();
+        save_protected(&path, &mut r, &mut OsRandom).unwrap();
+    }
+
     #[test]
     fn dir_sync_failure_after_a_credential_save_is_reported_as_committed() {
         let (_d, path, _p) = setup();

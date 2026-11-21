@@ -151,3 +151,28 @@ describe('VaultStore (encrypted envelope only, exact-snapshot compare-and-swap)'
     });
   });
 });
+
+describe('transaction settling (rotation outcome ordering)', () => {
+  it('an error event alone does not settle; only abort or complete does', async () => {
+    const { done } = await import('./vault-store');
+    type Fake = { error: Error | null; onerror?: () => void; onabort?: () => void; oncomplete?: () => void };
+    const tx: Fake = { error: null };
+    let state = 'pending';
+    const p = done(tx as unknown as IDBTransaction).then(
+      () => (state = 'complete'),
+      (e: unknown) => (state = `aborted:${(e as Error).message}`),
+    );
+    tx.error = new Error('synthetic request error');
+    tx.onerror!();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(state).toBe('pending'); // still in flight: a read now would race it
+    tx.onabort!();
+    await p;
+    expect(state).toBe('aborted:synthetic request error');
+
+    const tx2: Fake = { error: null };
+    const p2 = done(tx2 as unknown as IDBTransaction);
+    tx2.oncomplete!();
+    await expect(p2).resolves.toBeUndefined();
+  });
+});

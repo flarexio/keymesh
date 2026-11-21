@@ -97,3 +97,59 @@ tmux new-session -d -s keymesh-vpn-https \
 * Until independent acceptance:
   * no real secrets in any vault;
   * the banner "Preview version. Do not store real passwords." stays.
+
+## 6. Installed app (PWA) and offline use (M5 phase A)
+
+**What it is:**
+* The production build registers Angular's service worker (`ngsw-worker.js`, scope `/`) and serves a web app manifest with installable icons.
+* Chromium browsers can offer **Install app**. Safari on iPhone/iPad gets a short "Add to Home Screen" hint.
+* A PWA is **not** native OS autofill or an app-store app, and it does not move vaults between browsers or devices. Each browser profile keeps its own IndexedDB vault.
+
+**Where it works:**
+* Service workers run only in secure contexts: `https://keymesh.cloud` (with VPN DNS and the FlareX root trusted) and loopback.
+* The plain-HTTP LAN previews get no service worker, no offline use and no install, the same as for password vaults.
+
+**Offline:**
+* After **one successful online visit**, the browser keeps a complete, version-consistent copy of the app: the shell, scripts, styles, both workers, both WebAssembly binaries (vault core, QR decoder), icons and the manifest.
+* The app then reopens offline and unlocks the vault already stored in that browser.
+* A first visit while offline does not work.
+* The cache holds only these build files (`ngsw-config.json`; no data groups). It never holds decrypted items, generated passwords, TOTP seeds or codes, recovery codes, exports, or API responses. The E2E test scans CacheStorage for secret markers.
+
+**Updates:**
+* A new version is downloaded in the background and offered with **Reload**. Nothing reloads or activates on its own.
+* If the vault is open, or a new vault's recovery code is not yet confirmed, Reload asks first and locks before reloading.
+* An **ephemeral** demo vault is warned about explicitly: its key exists only in the page, so a reload makes it unreadable.
+
+**A failed update degrades offline reopening.** This is Angular's documented behaviour; see angular.dev, *Service worker in production*, degraded state.
+* If a new version cannot be installed (for example a damaged deployment whose files do not match their hashes), the open tab keeps working.
+* Angular's worker then serves new loads (reload, reopen) from the network only, so **reopening while offline fails (HTTP 504) even though the old files are still cached.**
+* The app shows a warning with **Try again**, and asks before an avoidable reload while offline.
+* It retries at most 3 times per page: on that button, or once when the browser comes back online.
+* A successful retry installs the fixed version and restores normal offline reopening. A full browser restart also restarts the worker.
+* Vault data is never affected.
+
+**Damaged cached app files:**
+* The worker does not re-check the bytes of a cached file. A damaged cached file (for example the core WASM) can therefore stop the app from starting, and a plain reload serves the same damaged copy.
+* The "could not start" screen offers **Repair app files**, after a confirmation. It:
+  * first checks the server is reachable, with a service-worker bypass;
+  * unregisters only this app's root-scope worker;
+  * deletes only its `ngsw:/:` caches;
+  * then reloads.
+* IndexedDB (vaults), localStorage (settings) and other sites' data are never touched.
+* Offline it changes nothing and says so, because missing files can only come from the server.
+
+**Server requirements (`scripts/serve.mjs`):**
+* The SPA fallback answers only extensionless paths. A missing `ngsw.json`, script, WASM or icon gets 404, never `index.html`.
+* The manifest is served as `application/manifest+json`. Security headers and CSP are unchanged.
+
+**Deployment:** rebuilding the `keymesh-web` image (`deploy/README.md`) publishes a new version. Installed copies pick it up on their next online visit.
+
+## 7. Quick unlock, auto-lock and website icons (M5 phase C; experimental, accepted `88dee8b`, privately deployed 2026-11-16)
+
+* **Passkeys need a domain origin.** WebAuthn RP ids are domain names, so quick unlock works on `https://keymesh.cloud` (or `http://localhost` for development), never on an IP address or plain-HTTP preview. A passkey is bound to the RP id it was made on: one made on `localhost` does not unlock the vault on `keymesh.cloud`.
+* **What was tested:** only Chromium's DevTools virtual authenticator (CTAP 2.1, internal, UV, PRF). No TouchID, FaceID, Windows Hello, Android, iOS or security-key result is recorded (ADR 0003 §5 is still open). Real devices need a human with the device.
+* **Auto-lock** runs in every origin, including demo vaults on the previews.
+* **Website icons:** the server route `/api/favicon` is compiled into the image but **off** unless the server runs with `KEYMESH_FAVICON=1`. The Docker deployment does not set it, and live outbound use is not approved. When it is off, the route answers 404 and the app keeps its local icons.
+  * **When on:** the server keeps no host cache, so it gives no cross-client lookup oracle, and answers with `no-store`.
+  * **Limits that are not hard:** `dns.lookup` can't be cancelled, so a late answer is ignored but the resolver job may still be running. The bounded PNG decode is synchronous: it is not preempted, but a late result is discarded. A hard CPU bound would need a terminable worker.
+* **Auto-lock deadlines are checked on every step**, not only by a timer: after a capability query, a KDF, a passkey ceremony or a storage read, and right before a write. A page whose timers were paused still locks before it uses secrets or writes.

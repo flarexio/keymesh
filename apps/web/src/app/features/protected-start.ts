@@ -6,6 +6,7 @@ import { ConfirmService } from '../shared/feedback';
 import { Icon } from '../shared/icon';
 import { RecoveryConfirm } from '../shared/recovery-confirm';
 import { SecretInput } from '../shared/secret-input';
+import { PassphraseSuggest } from '../shared/passphrase-suggest';
 import { ProtectedRestore } from './protected-restore';
 
 type View = 'create' | 'unlock' | 'reset';
@@ -17,7 +18,7 @@ type View = 'create' | 'unlock' | 'reset';
  */
 @Component({
   selector: 'km-protected-start',
-  imports: [Icon, RecoveryConfirm, SecretInput, ProtectedRestore],
+  imports: [Icon, RecoveryConfirm, SecretInput, ProtectedRestore, PassphraseSuggest],
   template: `
     <section class="card start-card" id="protected-card" tabindex="-1" aria-labelledby="protected-title" data-testid="protected-section">
       @if (!vault.secure) {
@@ -27,7 +28,7 @@ type View = 'create' | 'unlock' | 'reset';
       } @else if (vault.confirmingNewVault()) {
         <span class="state-icon"><km-icon name="key" /></span>
         <h2 id="protected-title">{{ i18n.t('protected.recovery.title') }}</h2>
-        <km-recovery-confirm [code]="newCode()" [busy]="busy()" (confirmed)="confirmNew($event)" (cancelled)="cancelNew()" />
+        <km-recovery-confirm [code]="newCode()" [vaultId]="vault.newVaultId()" [busy]="busy()" (confirmed)="confirmNew($event)" (cancelled)="cancelNew()" />
       } @else if (vault.protectedStored()) {
         @if (view() === 'reset') {
           <span class="state-icon"><km-icon name="key" /></span>
@@ -38,6 +39,7 @@ type View = 'create' | 'unlock' | 'reset';
             <km-secret-input label="protected.newPassword" name="newPassword" autocomplete="new-password" testid="reset-password"
               hint="protected.passwordHint" [(value)]="password" />
             <km-secret-input label="protected.passwordConfirm" name="newPasswordConfirm" autocomplete="new-password" testid="reset-password-confirm" [(value)]="confirm" />
+            <km-passphrase-suggest (chosen)="password.set($event); confirm.set($event)" />
             <div class="form-actions">
               <button type="submit" class="btn btn-primary" data-testid="reset-submit" [disabled]="busy()">
                 <km-icon name="key" /><span>{{ i18n.t(busy() ? 'protected.working' : 'protected.reset.button') }}</span>
@@ -54,6 +56,15 @@ type View = 'create' | 'unlock' | 'reset';
               <km-icon name="info" />
               <p>{{ i18n.t('protected.reloaded') }}</p>
             </div>
+          }
+          @if (passkeyHere()) {
+            <div class="passkey-unlock">
+              <button type="button" class="btn btn-primary btn-lg" data-testid="unlock-passkey" [disabled]="busy()" (click)="unlockPasskey()">
+                <km-icon name="key" /><span>{{ i18n.t('qu.unlock') }}</span>
+              </button>
+              <p class="hint">{{ i18n.t('qu.unlockHint') }}</p>
+            </div>
+            <div class="divider"><span>{{ i18n.t('common.or') }}</span></div>
           }
           <form class="form-stack" (submit)="unlock($event)">
             <km-secret-input label="protected.password" name="password" autocomplete="current-password" testid="unlock-password" [(value)]="password" />
@@ -79,6 +90,7 @@ type View = 'create' | 'unlock' | 'reset';
           <km-secret-input label="protected.password" name="newPassword" autocomplete="new-password" testid="create-password"
             hint="protected.passwordHint" [(value)]="password" />
           <km-secret-input label="protected.passwordConfirm" name="newPasswordConfirm" autocomplete="new-password" testid="create-password-confirm" [(value)]="confirm" />
+          <km-passphrase-suggest (chosen)="password.set($event); confirm.set($event)" />
           <div class="form-actions">
             <button type="submit" class="btn btn-primary btn-lg" data-testid="create-protected" [disabled]="busy()" [attr.aria-busy]="busy()">
               <km-icon name="plus" /><span>{{ i18n.t(busy() ? 'protected.working' : 'protected.create.button') }}</span>
@@ -106,6 +118,13 @@ export class ProtectedStart {
   protected readonly vault = inject(VaultService);
   protected readonly i18n = inject(I18n);
   private readonly confirmDialog = inject(ConfirmService);
+  protected readonly passkeyHere = computed(
+    () => this.vault.quickUnlockSupported() && this.vault.storedQuickUnlock().some((x) => x.rp_id === location.hostname),
+  );
+
+  protected unlockPasskey(): void {
+    void this.act(() => this.vault.unlockWithQuickUnlock());
+  }
   protected readonly view = signal<View>('unlock');
   protected readonly password = signal('');
   protected readonly confirm = signal('');
