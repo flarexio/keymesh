@@ -1,0 +1,42 @@
+#!/bin/sh
+# FAKE `op` executable for tests. SYNTHETIC ONLY: it never contacts 1Password.
+#
+# Records its argv (one argument per line, verbatim) to $FAKE_OP_ARGS_FILE and
+# behaves according to $FAKE_OP_MODE. It never evaluates its arguments.
+if [ -n "$FAKE_OP_ARGS_FILE" ]; then
+  for a in "$@"; do printf '%s\n' "$a"; done > "$FAKE_OP_ARGS_FILE"
+fi
+case "$FAKE_OP_MODE" in
+  ok)
+    cat "$FAKE_OP_FIXTURE"
+    ;;
+  value)
+    printf '%s' "$FAKE_OP_VALUE"
+    ;;
+  unauth)
+    echo "[ERROR] 2026/01/01 00:00:00 You are not currently signed in. SYNTH-STDERR-SECRET" >&2
+    exit 1
+    ;;
+  notfound)
+    echo "[ERROR] 2026/01/01 00:00:00 \"x\" isn't an item. SYNTH-STDERR-SECRET" >&2
+    exit 1
+    ;;
+  nonzero)
+    echo "SYNTH-STDERR-SECRET unexpected" >&2
+    exit 3
+    ;;
+  sleep)
+    exec sleep 30
+    ;;
+  orphan)
+    # A background descendant inherits stdout/stderr and keeps them open
+    # after this process exits successfully. Bounded: it ends by itself.
+    sleep 30 &
+    echo "$!" > "$FAKE_OP_PID_FILE"
+    exit 0
+    ;;
+  *)
+    echo "fake-op: unknown mode" >&2
+    exit 64
+    ;;
+esac

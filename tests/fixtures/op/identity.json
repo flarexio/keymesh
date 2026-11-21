@@ -1,0 +1,19 @@
+{
+  "id": "synthidentityitem0000000a2",
+  "title": "Synthetic Person",
+  "vault": { "id": "synthvault0000000000000001" },
+  "category": "IDENTITY",
+  "fields": [
+    { "id": "firstname", "type": "STRING", "label": "first name", "value": "Ada" },
+    { "id": "lastname", "type": "STRING", "label": "last name", "value": "Synthetic" },
+    { "id": "company", "type": "STRING", "label": "company", "value": "Example Org" },
+    { "id": "email", "type": "EMAIL", "label": "email", "value": "ada@example.test" },
+    { "id": "email2", "type": "EMAIL", "label": "work email", "value": "ada.work@example.test" },
+    { "id": "badmail", "type": "EMAIL", "label": "legacy email", "value": "not-an-email" },
+    { "id": "cellphone", "type": "PHONE", "label": "mobile", "value": "+1 555 0100" },
+    { "id": "busphone", "type": "PHONE", "label": "business", "value": "+1 555 0199" },
+    { "id": "address", "type": "ADDRESS", "label": "address", "value": { "street": "1 Synthetic Way", "city": "Testville", "country": "zz" } },
+    { "id": "website", "type": "URL", "label": "homepage", "value": "https://ada.example.test" },
+    { "id": "birthdate", "type": "DATE", "label": "birth date", "value": "946684800" }
+  ]
+}

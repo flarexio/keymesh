@@ -1,0 +1,11 @@
+{
+  "id": "synthsshitem000000000000a5",
+  "title": "Synthetic SSH Key",
+  "vault": { "id": "synthvault0000000000000001" },
+  "category": "SSH_KEY",
+  "fields": [
+    { "id": "private_key", "type": "SSHKEY", "label": "private key", "value": "-----BEGIN PRIVATE KEY-----\nSYNTH-NOT-A-REAL-KEY\n-----END PRIVATE KEY-----\n" },
+    { "id": "public_key", "type": "STRING", "label": "public key", "value": "ssh-ed25519 AAAASYNTHETIC synthetic" },
+    { "id": "fingerprint", "type": "STRING", "label": "fingerprint", "value": "SHA256:synthetic" }
+  ]
+}

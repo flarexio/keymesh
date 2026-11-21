@@ -1,0 +1,12 @@
+{
+  "id": "synthwalletitem000000000a3",
+  "title": "Synthetic Wallet",
+  "vault": { "id": "synthvault0000000000000001" },
+  "category": "CRYPTO_WALLET",
+  "fields": [
+    { "id": "recoveryPhrase", "type": "CONCEALED", "label": "recovery phrase", "value": "SYNTH-WORDS alpha beta gamma delta" },
+    { "id": "password", "type": "CONCEALED", "label": "password", "value": "SYNTH-WALLET-PASS" },
+    { "id": "walletAddress", "type": "STRING", "label": "wallet address", "value": "synthetic-address-0001" },
+    { "id": "network", "type": "STRING", "label": "network", "value": "synthetic-testnet" }
+  ]
+}

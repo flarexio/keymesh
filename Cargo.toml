@@ -1,0 +1,50 @@
+[package]
+name = "keymesh"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Local-first encrypted vault core (M1 foundation, not production ready)"
+license = "UNLICENSED"
+publish = false
+
+[features]
+default = ["native"]
+# Filesystem persistence, the `op` subprocess runner and the CLI. Everything
+# outside this feature is intended to stay WASM-compatible.
+native = ["dep:tempfile", "dep:clap"]
+
+[dependencies]
+chacha20poly1305 = "0.10"
+ed25519-dalek = "2"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+getrandom = "0.2"
+zeroize = { version = "1", features = ["derive", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+data-encoding = "2"
+percent-encoding = "2"
+thiserror = "2"
+subtle = "2"
+tempfile = { version = "3", optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# kill(2) on the importer's child process group (timeout cleanup).
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "keymesh"
+path = "src/bin/keymesh.rs"
+required-features = ["native"]
+
+[profile.dev.package."*"]
+opt-level = 1
+
+# Browser WASM: the OS CSPRNG is reached through `crypto.getRandomValues`.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
