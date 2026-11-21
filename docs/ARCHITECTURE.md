@@ -1,6 +1,6 @@
 # Keymesh architecture and format decisions
 
-Status: **M1–M4; not production ready.** Password vaults (M4) are experimental and synthetic-data only until independent acceptance.
+Status: **M1–M4; not production ready.** Password vaults (M4) are experimental and synthetic-data only until FlareX decides otherwise.
 
 ## Crate layout
 
@@ -151,7 +151,7 @@ Implemented with `ed25519-dalek` 2. The stored format is the 32-byte RFC 8032 se
 
 ## Browser app (M2 demo, UI refined in M3, password vaults in M4)
 
-Status: **demo vaults use development-only keys; password vaults are experimental and synthetic-data only until independent acceptance. Not production.**
+Status: **demo vaults use development-only keys; password vaults are experimental and synthetic-data only until FlareX decides otherwise. Not production.**
 
 ### Layers
 

@@ -4,7 +4,7 @@ Status (M4): HTTPS serving and secure-context gating are implemented and tested 
 * There is no certificate that the client devices trust.
 * Choosing one is a human decision (§4).
 
-Until then, the private-network previews stay plain HTTP and demo-only. Every flow, including password vaults, stays experimental and synthetic-only until independent acceptance.
+Until then, the private-network previews stay plain HTTP and demo-only. Every flow, including password vaults, stays experimental and synthetic-only until FlareX decides otherwise.
 
 **Update (2026-11-15): private HTTPS deployment (option 1, using an existing CA).** The human chose `keymesh.cloud` and the existing FlareX step-ca at `ca.cloud`, which is resolved through the VPN DNS 10.8.0.1.
 * **What runs:** `deploy/` runs only the web container, on `127.0.0.1:4320`. Since 2026-11-21, TLS for `keymesh.cloud` is terminated by the host's shared Traefik (outside this repository), which gets its certificate from that CA by ACME and proxies to the web container. The route it needs is in `deploy/README.md`.
@@ -94,7 +94,7 @@ tmux new-session -d -s keymesh-vpn-https \
 
 * Whoever serves the app's code on each load is trusted. HTTPS only authenticates that server.
 * Subresource Integrity, an installed app shell and signed native builds are later options (ADR 0001 §5).
-* Until independent acceptance:
+* Until FlareX decides otherwise:
   * no real secrets in any vault;
   * the banner "Preview version. Do not store real passwords." stays.
 
