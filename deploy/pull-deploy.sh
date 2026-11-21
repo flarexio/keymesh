@@ -148,6 +148,7 @@ fi
 # --- 4. bundle hashes ------------------------------------------------------------
 tmp=$(mktemp -d)
 bundle_cid=
+# shellcheck disable=SC2329 # invoked indirectly by `trap cleanup EXIT` below
 cleanup() {
   if [ -n "$bundle_cid" ]; then d rm -f "$bundle_cid" >/dev/null 2>&1 || true; fi
   rm -rf "$tmp"

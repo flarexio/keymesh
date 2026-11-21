@@ -65,6 +65,39 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Lints every tracked shell script and the workflows (actionlint also runs
+  # shellcheck on each run: block). Any finding fails the job, and the image
+  # jobs need it, so nothing is built or published unless lint passes.
+  lint:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      # sha256 of actionlint_1.7.12_linux_amd64.tar.gz (release checksums file).
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck (runner's preinstalled version)
+        run: |
+          shellcheck --version
+          git ls-files -z '*.sh' | xargs -0 shellcheck -x
+      - name: Install actionlint (pinned release, sha256-verified)
+        run: |
+          f=actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz
+          curl -fsSL --proto '=https' -o "$RUNNER_TEMP/$f" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$f"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/actionlint" actionlint
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+      - name: actionlint (with shellcheck)
+        run: |
+          actionlint -version
+          actionlint -color -shellcheck "$(command -v shellcheck)"
+
   # Multi-arch keymesh-web image, built from the bundle E2E tested. Each platform
   # builds on its own native runner (COPY-only Dockerfile); `manifest` joins them
   # into one index. Pushing and attesting happen only on push to main or
@@ -73,7 +106,8 @@ jobs:
   # secrets are set. Otherwise (pull requests, forks, missing settings) both legs
   # build without logging in or pushing, and `manifest` is skipped.
   image:
-    needs: [rust, web]
+    name: image (${{ matrix.platform }})
+    needs: [rust, web, lint]
     strategy:
       fail-fast: false
       matrix:
@@ -265,7 +299,9 @@ jobs:
             echo "| Index digest | \`$IMAGE@$DIGEST\` |"
             echo "| linux/amd64 | \`$AMD64\` |"
             echo "| linux/arm64 | \`$ARM64\` |"
-            printf '%s\n' "$TAGS" | sed -n 's/.\{1,\}/| Tag | `&` |/p'
+            printf '%s\n' "$TAGS" | while IFS= read -r tag; do
+              if [ -n "$tag" ]; then echo "| Tag | \`$tag\` |"; fi
+            done
             echo
             echo "| Bundle file (same in both platforms) | sha256 | bytes |"
             echo "|---|---|---|"
