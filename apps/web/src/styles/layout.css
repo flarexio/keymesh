@@ -724,3 +724,63 @@ html:lang(en) .eyebrow {
   justify-content: center;
   gap: var(--space-2);
 }
+
+/* ---- Start: locked password vault (unlock only, the rest under "More options") ---- */
+
+.start-wrap.lock-only {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 34rem;
+}
+
+.lock-more {
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+
+.lock-more > summary {
+  display: grid;
+  box-sizing: border-box;
+  width: 100%;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  cursor: pointer;
+  list-style: none;
+}
+.lock-more > summary::-webkit-details-marker {
+  display: none;
+}
+.lock-more > summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.lock-more > summary .more-title {
+  font-weight: 600;
+}
+.lock-more > summary .more-hint {
+  grid-column: 1;
+  font-weight: 400;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.lock-more > summary .icon {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  transition: transform 0.15s;
+}
+.lock-more[open] > summary .icon {
+  transform: rotate(180deg);
+}
+.lock-more .more-body {
+  display: grid;
+  gap: var(--space-6);
+  margin-top: var(--space-6);
+}
+.more-delete > .btn {
+  justify-self: start;
+}

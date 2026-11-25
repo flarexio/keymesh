@@ -100,6 +100,12 @@ test('enrol, lock, reload, unlock with the passkey; ciphertext only; remove; mas
   await page.getByTestId('lock').click();
   await page.reload();
   await expect(page.getByTestId('unlock-passkey')).toBeVisible();
+  // Lock screen: the passkey button is focused, but nothing starts without the
+  // user's click (this virtual authenticator would answer a ceremony at once).
+  await expect(page.getByTestId('unlock-passkey')).toBeFocused();
+  await page.waitForTimeout(1_000);
+  await expect(page.getByTestId('key-mode')).toHaveCount(0);
+  await expect(page.getByTestId('delete-protected')).toBeHidden();
   await page.screenshot({ path: shot(testInfo, 'm5c-locked-passkey-button-en.png'), fullPage: true });
   await page.getByTestId('unlock-passkey').click();
   await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected', { timeout: 30_000 });

@@ -21,8 +21,44 @@ interface OverviewRow {
   selector: 'km-start',
   imports: [Icon, ProtectedStart, NgTemplateOutlet],
   template: `
-    <div class="start-wrap">
+    <div class="start-wrap" [class.lock-only]="lockScreen()">
       <div class="start-main">
+      @if (!lockScreen()) {
+        <ng-container *ngTemplateOutlet="overview" />
+      }
+      @if (demoFirst()) {
+        <ng-container *ngTemplateOutlet="demoCard" />
+      }
+      <km-protected-start #ps [inlineDelete]="!lockScreen()" />
+      @if (lockScreen()) {
+        <!-- Daily use: unlock only. Everything else stays reachable here. -->
+        <details class="lock-more" data-testid="more-options">
+          <summary data-testid="more-options-toggle">
+            <span class="more-title">{{ i18n.t('start.more.title') }}</span>
+            <span class="more-hint">{{ i18n.t('start.more.hint') }}</span>
+            <km-icon name="chevronDown" />
+          </summary>
+          <div class="more-body">
+            <section class="card start-card more-delete" aria-labelledby="more-delete-title" data-testid="more-delete">
+              <h3 id="more-delete-title" class="section-label">{{ i18n.t('start.more.delete') }}</h3>
+              <p class="hint">{{ i18n.t('protected.delete.hint') }}</p>
+              <button type="button" data-testid="delete-protected" class="btn btn-danger-ghost" [disabled]="ps.busy()" (click)="ps.remove()">
+                <km-icon name="trash" /><span>{{ i18n.t('protected.delete.button') }}</span>
+              </button>
+            </section>
+            <ng-container *ngTemplateOutlet="demoCard" />
+            <ng-container *ngTemplateOutlet="overview" />
+            <ng-container *ngTemplateOutlet="limits" />
+          </div>
+        </details>
+      } @else if (!demoFirst()) {
+        <ng-container *ngTemplateOutlet="demoCard" />
+      }
+      </div>
+      @if (!lockScreen()) {
+        <ng-container *ngTemplateOutlet="limits" />
+      }
+      <ng-template #overview>
       <!-- Which vaults exist here, in the same order as the cards below. -->
       <section class="card vault-overview" aria-labelledby="overview-title" data-testid="vault-overview">
         <h2 id="overview-title" class="section-label">{{ i18n.t('start.overview.title') }}</h2>
@@ -45,14 +81,7 @@ interface OverviewRow {
           }
         </ul>
       </section>
-      @if (demoFirst()) {
-        <ng-container *ngTemplateOutlet="demoCard" />
-      }
-      <km-protected-start />
-      @if (!demoFirst()) {
-        <ng-container *ngTemplateOutlet="demoCard" />
-      }
-      </div>
+      </ng-template>
       <ng-template #demoCard>
       <section class="card start-card" id="demo-card" tabindex="-1" aria-labelledby="start-title" data-testid="demo-section">
         <p class="eyebrow">{{ i18n.t('demo.section.title') }}</p>
@@ -121,7 +150,8 @@ interface OverviewRow {
         }
       </section>
       </ng-template>
-      <aside class="card start-aside" aria-labelledby="limits-title">
+      <ng-template #limits>
+      <aside class="card start-aside" aria-labelledby="limits-title" data-testid="start-limits">
         <h3 id="limits-title" class="section-label">{{ i18n.t('start.limits.title') }}</h3>
         <ul class="check-list">
           <li><km-icon name="check" /><span>{{ i18n.t('start.limits.local') }}</span></li>
@@ -131,6 +161,7 @@ interface OverviewRow {
           <li class="no"><km-icon name="x" /><span>{{ i18n.t('start.limits.noReal') }}</span></li>
         </ul>
       </aside>
+      </ng-template>
     </div>
   `,
 })
@@ -147,6 +178,15 @@ export class Start {
     if (this.vault.confirmingNewVault()) return 'creating';
     return this.vault.protectedStored() ? 'locked' : 'none';
   });
+  /**
+   * A password vault is stored and locked (unlock or reset view): show only
+   * the unlock card; delete, the demo, restore, the overview and the limits go
+   * under a collapsed "More options". First run, the insecure-origin notice and
+   * the new-vault recovery confirmation keep the full layout.
+   */
+  protected readonly lockScreen = computed(
+    () => this.vault.secure && !!this.vault.protectedStored() && !this.vault.confirmingNewVault(),
+  );
   protected readonly demoState = computed<OverviewState>(() => {
     switch (this.vault.status()) {
       case 'locked':
