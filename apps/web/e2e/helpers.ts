@@ -169,3 +169,13 @@ export async function createAllKinds(page: Page) {
 export function insecureOrigin(baseURL: string | undefined): string {
   return `http://keymesh-http.test:${new URL(baseURL ?? 'http://127.0.0.1:4310').port}/`;
 }
+
+/**
+ * Expand "More options" on the locked password-vault screen, where delete, the
+ * demo vault, restore, the overview and the limits are collapsed by default.
+ */
+export async function openMore(page: Page): Promise<void> {
+  const more = page.getByTestId('more-options');
+  if ((await more.getAttribute('open')) === null) await page.getByTestId('more-options-toggle').click();
+  await expect(more).toHaveAttribute('open', '');
+}

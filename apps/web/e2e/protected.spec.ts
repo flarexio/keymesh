@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import { en } from '../src/app/core/i18n/en';
-import { M, assertNoMarkers, createAllKinds, openItem, storedBytes, titles, insecureOrigin } from './helpers';
+import { M, assertNoMarkers, createAllKinds, openItem, openMore, storedBytes, titles, insecureOrigin } from './helpers';
 
 // These tests hold the KDF worker *script* with page.route to make races
 // deterministic. Requests answered by a service worker bypass page.route
@@ -497,6 +497,7 @@ test('a demo vault stays a demo vault next to a password vault (no conversion)',
   expect((await storedBytes(page)).equals(demoBefore)).toBe(true);
   // The demo key survived the password session: the demo still unlocks.
   await page.getByTestId('lock').click();
+  await openMore(page);
   await page.getByTestId('unlock').click();
   await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'ephemeral');
 });
@@ -553,6 +554,7 @@ for (const withDemo of [true, false]) {
     if (withDemo) {
       // The demo is still there and still a demo, opened only on request.
       await a.getByTestId('lock').click();
+      await openMore(a);
       await a.locator('[data-testid=unlock], [data-testid=open-fixture]').click();
       await expect(a.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'synthetic-fixture');
     }

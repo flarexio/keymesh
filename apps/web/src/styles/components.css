@@ -1641,3 +1641,15 @@ km-secret-field .field-error {
   margin: var(--space-4) auto 0;
   padding-inline: var(--space-4);
 }
+
+/* Text-style action (e.g. "Forgot your password?"): small, underlined, no box. */
+.btn-link {
+  border-color: transparent;
+  background: transparent;
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.btn-link:hover:not(:disabled) {
+  text-decoration-thickness: 2px;
+}

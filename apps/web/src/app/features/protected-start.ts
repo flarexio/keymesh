@@ -1,4 +1,4 @@
-import { Component, computed, inject, signal } from '@angular/core';
+import { Component, ElementRef, computed, effect, inject, input, signal } from '@angular/core';
 import { errorKey } from '../core/errors';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { VaultService } from '../core/vault.service';
@@ -72,15 +72,17 @@ type View = 'create' | 'unlock' | 'reset';
               <button type="submit" class="btn btn-primary btn-lg" data-testid="unlock-protected" [disabled]="busy() || !password()" [attr.aria-busy]="busy()">
                 <km-icon name="unlock" /><span>{{ i18n.t(busy() ? 'protected.unlocking' : 'protected.unlock.button') }}</span>
               </button>
-              <button type="button" class="btn btn-ghost" data-testid="forgot-password" [disabled]="busy()" (click)="show('reset')">{{ i18n.t('protected.forgot') }}</button>
+              <button type="button" class="btn btn-link btn-sm" data-testid="forgot-password" [disabled]="busy()" (click)="show('reset')">{{ i18n.t('protected.forgot') }}</button>
             </div>
           </form>
-          <div class="danger-zone">
-            <p class="hint">{{ i18n.t('protected.delete.hint') }}</p>
-            <button type="button" data-testid="delete-protected" class="btn btn-danger-ghost" [disabled]="busy()" (click)="remove()">
-              <km-icon name="trash" /><span>{{ i18n.t('protected.delete.button') }}</span>
-            </button>
-          </div>
+          @if (inlineDelete()) {
+            <div class="danger-zone">
+              <p class="hint">{{ i18n.t('protected.delete.hint') }}</p>
+              <button type="button" data-testid="delete-protected" class="btn btn-danger-ghost" [disabled]="busy()" (click)="remove()">
+                <km-icon name="trash" /><span>{{ i18n.t('protected.delete.button') }}</span>
+              </button>
+            </div>
+          }
         }
       } @else {
         <span class="state-icon"><km-icon name="shield" /></span>
@@ -118,6 +120,37 @@ export class ProtectedStart {
   protected readonly vault = inject(VaultService);
   protected readonly i18n = inject(I18n);
   private readonly confirmDialog = inject(ConfirmService);
+  private readonly host: ElementRef<HTMLElement> = inject(ElementRef);
+  /** false: the start screen offers delete under "More options" instead. */
+  readonly inlineDelete = input(true);
+  /** The element this component focused itself (so it never takes focus the user moved). */
+  private autoFocused: HTMLElement | null = null;
+
+  constructor() {
+    // Lock screen: focus the passkey button if there is one, else the password
+    // field. Focus only; WebAuthn starts only from the user's click.
+    effect(() => {
+      const onLockScreen =
+        this.vault.secure && !!this.vault.protectedStored() && !this.vault.confirmingNewVault() && this.view() === 'unlock';
+      const passkey = this.passkeyHere();
+      if (!onLockScreen) {
+        this.autoFocused = null;
+        return;
+      }
+      setTimeout(() => this.focusUnlock(passkey), 0);
+    });
+  }
+
+  private focusUnlock(passkey: boolean): void {
+    const target = this.host.nativeElement.querySelector<HTMLElement>(
+      passkey ? '[data-testid=unlock-passkey]' : '[data-testid=unlock-password]',
+    );
+    const active = document.activeElement;
+    const free = !active || active === document.body || (active === this.autoFocused && !this.password());
+    if (!target || !free || active === target) return;
+    target.focus();
+    this.autoFocused = target;
+  }
   protected readonly passkeyHere = computed(
     () => this.vault.quickUnlockSupported() && this.vault.storedQuickUnlock().some((x) => x.rp_id === location.hostname),
   );
@@ -131,7 +164,7 @@ export class ProtectedStart {
   protected readonly code = signal('');
   protected readonly error = signal<MessageKey | null>(null);
   protected readonly working = signal(false);
-  protected readonly busy = computed(() => this.working() || this.vault.credentialBusy());
+  readonly busy = computed(() => this.working() || this.vault.credentialBusy());
 
   protected newCode(): string {
     try {
@@ -211,7 +244,8 @@ export class ProtectedStart {
     void this.act(() => this.vault.resetPassword(this.code(), this.password()));
   }
 
-  protected async remove(): Promise<void> {
+  /** Delete the stored password vault, after the confirm dialog. */
+  async remove(): Promise<void> {
     const ok = await this.confirmDialog.ask({
       title: 'protected.delete.title',
       body: 'protected.delete.body',

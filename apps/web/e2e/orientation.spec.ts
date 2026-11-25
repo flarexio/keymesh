@@ -7,9 +7,10 @@
  * full accessibility audit.
  */
 import { Browser, Page, TestInfo, expect, test } from '@playwright/test';
+import { writeFile } from 'node:fs/promises';
 import { en } from '../src/app/core/i18n/en';
 import { zhTW } from '../src/app/core/i18n/zh-tw';
-import { field, newItem, start } from './helpers';
+import { field, newItem, openMore, start } from './helpers';
 
 const PW = 'synthetic orientation passphrase';
 
@@ -104,6 +105,9 @@ test('password vault present: it is listed and shown first, through reload and l
       await page.reload();
       await expect(page.getByTestId('unlock-password')).toBeVisible();
     }
+    // Locked: the demo waits, collapsed, under "More options" below the unlock card.
+    await expect(page.getByTestId('demo-section'), step).toBeHidden();
+    await openMore(page);
     await expect(page.getByTestId('overview-protected'), step).toContainText(zhTW['start.overview.state.locked']);
     expect(await top(page, 'protected-section'), step).toBeLessThan(await top(page, 'demo-section'));
     await expect(page.getByTestId('key-mode')).toHaveCount(0);
@@ -226,4 +230,91 @@ async function ratios(page: Page, selectors: string[]): Promise<Record<string, n
     }
     return out;
   }, selectors);
+}
+
+test('locked password vault: unlock only; delete, demo and restore wait under More options and still work', async ({ page }, info) => {
+  await page.setViewportSize({ width: 1280, height: 860 });
+  await page.goto('/');
+  await createPasswordVault(page);
+  await page.getByTestId('lock').click();
+  await expect(page.getByTestId('unlock-password')).toBeVisible();
+  // Daily use: password, unlock, forgot, the experimental hint and the global preview banner.
+  for (const id of ['unlock-password', 'unlock-protected', 'forgot-password', 'protected-experimental', 'more-options-toggle']) {
+    await expect(page.getByTestId(id), id).toBeVisible();
+  }
+  await expect(page.getByTestId('unlock-password')).toBeFocused();
+  await expect(page.getByTestId('more-options')).not.toHaveAttribute('open');
+  await expect(page.getByTestId('more-options-toggle')).toContainText(en['start.more.title']);
+  for (const id of ['delete-protected', 'demo-section', 'start-vault', 'initial-restore-input', 'vault-overview', 'start-limits']) {
+    await expect(page.getByTestId(id), `${id} hidden until expanded`).toBeHidden();
+  }
+
+  await openMore(page);
+  for (const id of ['delete-protected', 'demo-section', 'start-vault', 'vault-overview', 'start-limits']) {
+    await expect(page.getByTestId(id), id).toBeVisible();
+  }
+  await expect(page.getByTestId('overview-protected')).toContainText(en['start.overview.state.locked']);
+
+  // Restore (demo): a broken file is refused with the usual error.
+  const bad = info.outputPath('broken.keymesh');
+  await writeFile(bad, '{"not":"a vault"}');
+  await page.getByTestId('initial-restore-input').setInputFiles(bad);
+  await expect(page.getByTestId('start-error')).toBeVisible({ timeout: 30_000 });
+
+  // Delete asks first; cancelling keeps the vault.
+  await page.getByTestId('delete-protected').click();
+  await expect(page.getByRole('dialog')).toContainText(en['protected.delete.title']);
+  await page.getByRole('dialog').getByRole('button', { name: en['common.cancel'] }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.getByTestId('unlock-password')).toBeVisible();
+
+  // The demo still starts next to the locked password vault, and stays a demo.
+  await page.locator('input[name=mode][value=ephemeral]').check();
+  await page.getByTestId('start-vault').click();
+  await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'ephemeral');
+  await page.getByTestId('lock').click();
+  await expect(page.getByTestId('unlock-password')).toBeVisible();
+  await expect(page.getByTestId('unlock')).toBeHidden();
+  await openMore(page);
+  await page.getByTestId('unlock').click();
+  await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'ephemeral');
+  await page.getByTestId('lock').click();
+
+  // The password still unlocks.
+  await page.getByTestId('unlock-password').fill(PW);
+  await page.getByTestId('unlock-protected').click();
+  await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected', { timeout: 30_000 });
+  await page.getByTestId('lock').click();
+
+  // Confirmed delete: back to the first-run screen, no More options.
+  await openMore(page);
+  await page.getByTestId('delete-protected').click();
+  await page.getByTestId('confirm-accept').click();
+  await expect(page.getByTestId('create-password')).toBeVisible();
+  await expect(page.getByTestId('more-options')).toHaveCount(0);
+  await expect(page.getByTestId('vault-overview')).toBeVisible();
+});
+
+for (const scheme of ['light', 'dark'] as const) {
+  test(`${scheme}: locked-screen screenshots, desktop and phone, collapsed and expanded`, async ({ browser }, info) => {
+    for (const [label, opts] of [
+      ['desktop', { viewport: { width: 1280, height: 860 } }],
+      ['phone', { viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true }],
+    ] as const) {
+      for (const locale of ['en-US', 'zh-TW']) {
+        const ctx = await browser.newContext({ ...opts, locale, colorScheme: scheme });
+        const page = await ctx.newPage();
+        await page.goto('/');
+        await createPasswordVault(page);
+        await page.getByTestId('lock').click();
+        await expect(page.getByTestId('unlock-password')).toBeFocused();
+        // Unfocus so the screenshot shows the resting state.
+        await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+        await shot(page, info, `lock-${label}-${locale}-${scheme}-collapsed.png`);
+        await openMore(page);
+        await shot(page, info, `lock-${label}-${locale}-${scheme}-expanded.png`);
+        await ctx.close();
+      }
+    }
+  });
 }

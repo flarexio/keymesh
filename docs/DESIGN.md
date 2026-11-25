@@ -51,6 +51,11 @@ No remote fonts, images or icon fonts are loaded. Icons are a small local stroke
   - Each row shows its state: not created, locked, saved, can't be opened, being created, or needs HTTPS. A button moves focus to that card without changing the URL.
   - The cards follow the overview's order. An **existing** vault comes before creating a new one: a locked or saved demo vault comes before password-vault *creation*, while an existing or in-progress password vault always stays first.
   - The demo card is the one that moves, in DOM order, so keyboard and screen-reader order match what is shown. The password card keeps its state.
+- **Locked password vault (daily use):** when a password vault is stored and locked (unlock or reset view), the start screen is one column:
+  - It shows only the unlock card: "Unlock with passkey" as the primary button when a passkey for this site exists, the master password and Unlock, a small "Forgot your password?" link, the experimental note and any error.
+  - Everything else sits below, under one native `<details>` "More options", collapsed by default: delete from this browser (for someone who lost both password and recovery code; the confirm dialog is unchanged), the demo vault card (create, open, discard, restore), the overview and the limits.
+  - Focus moves to the passkey button, or else the password field. Focus only: WebAuthn starts only from a click.
+  - First run, the plain-HTTP notice and recovery-code confirmation keep the full layout. The global preview strip always stays.
 - **Demo-mode notice:** inside an open demo vault, a warning callout at the top of the workspace says what the mode means. It is shown on desktop and mobile, below the global preview strip, which stays.
   - **Test key:** "uses a public test key, so anyone with the stored data can read it".
   - **Session only:** "not protected by a password, and can't be opened after a reload".
@@ -61,7 +66,7 @@ No remote fonts, images or icon fonts are loaded. Icons are a small local stroke
   - unlock (password with Show/Hide, "Forgot your password?");
   - reset with the recovery code;
   - restore a backup (choose "With its password" or "With the recovery code");
-  - delete from this browser (danger zone);
+  - delete from this browser (danger zone; on the locked screen, under "More options");
   - "Password vaults need a secure connection" on plain HTTP.
 
   Buttons show progress text ("Securing your vault…", "Unlocking…") and stay disabled while the key derivation runs. The Backup page adds "Password and recovery" (change password, new recovery code) and a plain note that these changes don't affect older backups.
