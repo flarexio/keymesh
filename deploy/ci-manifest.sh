@@ -1,10 +1,13 @@
 #!/bin/sh
 # CI helper for the `manifest` job (.github/workflows/ci.yml): joins the
-# per-platform keymesh-web digests into one tagged index, then checks it.
+# per-platform keymesh-web digests of a release into one tagged index, then
+# checks it.
 #
 # Inputs (environment): IMAGE (e.g. docker.io/<ns>/keymesh-web), AMD64 and ARM64
-# (the per-platform manifest digests the image legs pushed), GITHUB_SHA,
-# GITHUB_REF, GITHUB_OUTPUT. Needs docker buildx, jq and sha256sum or shasum.
+# (the per-platform manifest digests the image legs pushed), VERSION (e.g. 0.6.0;
+# GITHUB_REF must be refs/tags/v$VERSION), LATEST (true to also move :latest),
+# GITHUB_SHA, GITHUB_REF, GITHUB_OUTPUT. Needs docker buildx, jq and sha256sum
+# or shasum. Tags: <version>, sha-<sha> and, when LATEST=true, latest.
 # Writes `digest` (the index digest) and `tags` to GITHUB_OUTPUT.
 set -eu
 
@@ -16,10 +19,15 @@ for v in "$AMD64" "$ARM64"; do
 done
 printf '%s' "$GITHUB_SHA" | grep -Eqx '[0-9a-f]{40}' || fail "GITHUB_SHA is not a full commit sha"
 
-tags=$IMAGE:sha-$GITHUB_SHA
-if [ "$GITHUB_REF" = refs/heads/main ]; then
+printf '%s' "$VERSION" | grep -Eqx '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)' || fail "VERSION is not MAJOR.MINOR.PATCH: '$VERSION'"
+[ "$GITHUB_REF" = "refs/tags/v$VERSION" ] || fail "GITHUB_REF $GITHUB_REF is not refs/tags/v$VERSION"
+case $LATEST in true | false) ;; *) fail "LATEST must be true or false: '$LATEST'" ;; esac
+
+tags="$IMAGE:$VERSION
+$IMAGE:sha-$GITHUB_SHA"
+if [ "$LATEST" = true ]; then
   tags="$tags
-$IMAGE:main"
+$IMAGE:latest"
 fi
 
 raw=$(mktemp)

@@ -2,14 +2,20 @@
 # Deploy a CI-built keymesh-web image on the Pi (see deploy/README.md).
 #
 #   KEYMESH_IMAGE_REPO=<namespace>/keymesh-web \
-#     deploy/pull-deploy.sh <full 40-hex commit sha> [<namespace>/keymesh-web]
+#     deploy/pull-deploy.sh <release version | full 40-hex commit sha> [<namespace>/keymesh-web]
 #
-# 1. Pulls docker.io/<repo>:sha-<sha> (a linux/amd64 + linux/arm64 index) for this
-#    host's platform and pins it by the INDEX digest.
-# 2. Refuses unless the revision label is <sha> and the pulled image's platform is
-#    this host's (the Docker daemon's os/arch, or KEYMESH_PLATFORM).
+# Images are published only by release tags (vMAJOR.MINOR.PATCH), so the first
+# argument is a release version (0.6.0 or v0.6.0) or the full commit sha of one.
+#
+# 1. Pulls docker.io/<repo>:<version> or :sha-<sha> (a linux/amd64 + linux/arm64
+#    index) for this host's platform and pins it by the INDEX digest. A version is
+#    resolved to its tag's commit with `git ls-remote` on the GitHub repository.
+# 2. Refuses unless the revision label is that commit and the pulled image's
+#    platform is this host's (the Docker daemon's os/arch, or KEYMESH_PLATFORM).
 # 3. Verifies the index's build provenance with `gh attestation verify` when gh is
-#    installed.
+#    installed: signed by ci.yml of flarexio/keymesh running for a refs/tags/v*
+#    release tag (that exact tag when a version is given), built from the commit,
+#    on a GitHub-hosted runner.
 # 4. Copies the bundle out of the image and prints sha256 of the key files
 #    (and compares every file with a CI asset ledger when KEYMESH_LEDGER is set).
 # 5. Tags the current web image keymesh-web:rollback-<old revision>.
@@ -29,10 +35,15 @@
 #   KEYMESH_HEALTH_TIMEOUT      seconds to wait for healthy (default 150)
 #   SUDO                        command prefix for docker (default "sudo"; empty if root)
 #   KEYMESH_IMAGE_REGISTRY      registry host (default docker.io; override only for local testing)
+#   KEYMESH_GIT_REMOTE          git URL the release tags are read from (default
+#                               https://github.com/flarexio/keymesh; override only for local testing)
 set -eu
 
 REGISTRY=${KEYMESH_IMAGE_REGISTRY:-docker.io}
 ATTEST_REPO=flarexio/keymesh
+GIT_REMOTE=${KEYMESH_GIT_REMOTE:-https://github.com/$ATTEST_REPO}
+# The signer: ci.yml of this repository running for a release tag.
+SIGNER_RE='^https://github\.com/flarexio/keymesh/\.github/workflows/ci\.yml@refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 PLATFORM=${KEYMESH_PLATFORM:-}
 SUDO=${SUDO-sudo}
 VERIFY=${KEYMESH_VERIFY_ATTESTATION:-auto}
@@ -104,16 +115,30 @@ recreate_web() {
 }
 
 # --- arguments ---------------------------------------------------------------
-[ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: $0 <full 40-hex commit sha> [<namespace>/<name>]"
-SHA=$1
+[ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: $0 <release version (0.6.0) | full 40-hex commit sha> [<namespace>/<name>]"
 NAME=${2:-${KEYMESH_IMAGE_REPO:-}}
 printf '%s' "$NAME" | grep -Eqx '[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*' ||
   die "set KEYMESH_IMAGE_REPO (or pass it as the 2nd argument) to <namespace>/<name>: '$NAME'"
 REPO=$REGISTRY/$NAME
-case $SHA in *[!0-9a-f]* | '') die "commit sha must be lowercase hex: $SHA" ;; esac
-[ ${#SHA} -eq 40 ] || die "commit sha must be the full 40 characters: $SHA"
 case $VERIFY in auto | 0 | 1) ;; *) die "KEYMESH_VERIFY_ATTESTATION must be auto, 0 or 1" ;; esac
-REF=$REPO:sha-$SHA
+VERSION=
+if printf '%s' "$1" | grep -Eqx 'v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'; then
+  VERSION=${1#v}
+  TAG=v$VERSION
+  # The commit the release tag points to (peeled, for an annotated tag).
+  refs=$(git ls-remote "$GIT_REMOTE" "refs/tags/$TAG" "refs/tags/$TAG^{}") ||
+    die "could not read release tags from $GIT_REMOTE"
+  SHA=$(printf '%s\n' "$refs" | awk -v p="refs/tags/$TAG^{}" '$2 == p { print $1 }')
+  [ -n "$SHA" ] || SHA=$(printf '%s\n' "$refs" | awk -v t="refs/tags/$TAG" '$2 == t { print $1 }')
+  [ -n "$SHA" ] || die "release tag $TAG does not exist in $GIT_REMOTE"
+  REF=$REPO:$VERSION
+  log "release $TAG is commit $SHA"
+else
+  SHA=$1
+  case $SHA in *[!0-9a-f]* | '') die "expected a release version (0.6.0) or a lowercase hex commit sha: $SHA" ;; esac
+  REF=$REPO:sha-$SHA
+fi
+printf '%s' "$SHA" | grep -Eqx '[0-9a-f]{40}' || die "commit sha must be the full 40 lowercase hex characters: $SHA"
 [ -n "$PLATFORM" ] || PLATFORM=$(d version --format '{{ .Server.Os }}/{{ .Server.Arch }}')
 case $PLATFORM in linux/amd64 | linux/arm64) ;; *) die "unsupported platform '$PLATFORM' (the image has linux/amd64 and linux/arm64)" ;; esac
 
@@ -139,7 +164,11 @@ log "verified $PINNED (revision $rev, $plat)"
 # --- 3. provenance -------------------------------------------------------------
 if [ "$VERIFY" = 1 ] || { [ "$VERIFY" = auto ] && command -v gh >/dev/null 2>&1; }; then
   log "verifying build provenance with gh"
-  gh attestation verify "oci://$PINNED" --repo "$ATTEST_REPO" ||
+  # Signed by ci.yml for a v* release tag (exactly $TAG for a version), built
+  # from $SHA on a GitHub-hosted runner.
+  set -- --repo "$ATTEST_REPO" --cert-identity-regex "$SIGNER_RE" --source-digest "$SHA" --deny-self-hosted-runners
+  if [ -n "$VERSION" ]; then set -- "$@" --source-ref "refs/tags/$TAG"; fi
+  gh attestation verify "oci://$PINNED" "$@" ||
     die "attestation verification failed (needs 'gh auth login'; a private repository also needs 'docker login' as this user). KEYMESH_VERIFY_ATTESTATION=0 skips it."
 else
   log "gh not installed or KEYMESH_VERIFY_ATTESTATION=0: provenance NOT verified"
@@ -190,7 +219,7 @@ fi
 log "recreating web from $PINNED"
 if recreate_web "$PINNED"; then
   runs_new "$(web_container)" || die "web is healthy but not running $PINNED for $PLATFORM"
-  log "deployed $PINNED (revision $SHA); web is healthy"
+  log "deployed $PINNED (${VERSION:+release $VERSION, }revision $SHA); web is healthy"
   log "for later manual compose commands use: KEYMESH_WEB_IMAGE=$PINNED"
   exit 0
 fi
