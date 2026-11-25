@@ -2,7 +2,7 @@
 
 **Status as of 2026-11-16.**
 * **Authorized rollout (M5):** FlareX authorized implementing the backlog below plus an installable app (PWA), in phases A, B and C (task `keymesh-product-rollout`). Each phase gets an independent review before it is deployed to the private endpoint.
-* **Boundaries:** everything stays experimental and synthetic-data only until independent acceptance. Outside this rollout, each item still needs its own task contract.
+* **Boundaries:** everything stays experimental and synthetic-data only until FlareX decides otherwise. Outside this rollout, each item still needs its own task from FlareX.
 * **Priorities** follow FlareX's requests from 2026-11-14 and 2026-11-15 unless noted.
 
 ## Where things stand
