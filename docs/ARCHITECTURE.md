@@ -251,8 +251,9 @@ The key is never exported to JavaScript and never appears in the URL, storage, c
 
 ### Limitations
 
-* JavaScript and WASM cannot guarantee zeroization. Strings passed to the UI (revealed values, form inputs, previews) and the clipboard are outside the core's control. WASM linear memory is not reliably cleared on lock.
-* Offline startup is deferred: there is no service worker, so loading the app needs its origin.
+* JavaScript and WASM cannot guarantee zeroization. Strings passed to the UI (revealed values, form inputs, previews) are outside the core's control. WASM linear memory is not reliably cleared on lock.
+* Clipboard (`core/clipboard.ts`): copied secrets are cleared after 30 s and when the vault locks, only if the clipboard still holds what Keymesh copied (compared by SHA-256 when the browser allows reading without a prompt; otherwise a best-effort overwrite, retried when the page is focused again). Copies that other apps, clipboard history or sync made meanwhile are out of reach, so copying the recovery code asks first.
+* Offline startup: the production build registers a service worker (secure contexts only), so after one online visit the app reopens offline; a failed update degrades this to network-only loads (`docs/DELIVERY.md` §6). Plain-HTTP previews have no service worker.
 * QR or camera TOTP import is not implemented.
 * No passphrase generator yet.
 * The browser and CLI vault files are separate stores; a v2 backup from one can be restored in the other (same format), but there is no sync.

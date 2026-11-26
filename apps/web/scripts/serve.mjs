@@ -46,12 +46,29 @@ const types = {
   '.json': 'application/json',
   '.txt': 'text/plain; charset=utf-8',
 };
+// Browser features: the QR scanner's camera, the clipboard (copy, and the
+// optional no-prompt read used to clear only what Keymesh copied) and
+// passkeys (WebAuthn) for this origin only; everything else is off.
+const PERMISSIONS_POLICY = [
+  'camera=(self)',
+  'clipboard-read=(self)',
+  'clipboard-write=(self)',
+  'publickey-credentials-create=(self)',
+  'publickey-credentials-get=(self)',
+  ...['accelerometer', 'autoplay', 'display-capture', 'encrypted-media', 'fullscreen', 'geolocation', 'gyroscope', 'hid',
+    'idle-detection', 'magnetometer', 'microphone', 'midi', 'payment', 'picture-in-picture', 'screen-wake-lock', 'serial',
+    'usb', 'web-share', 'xr-spatial-tracking'].map((f) => `${f}=()`),
+].join(', ');
+
 const security = {
   'Content-Security-Policy':
     "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'",
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'no-referrer',
   'Cross-Origin-Opener-Policy': 'same-origin',
+  // Every resource is for this origin only (no other site may embed or load it).
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  'Permissions-Policy': PERMISSIONS_POLICY,
   'Cache-Control': 'no-store',
   // Only over HTTPS; no includeSubDomains/preload for a private host.
   ...(tls ? { 'Strict-Transport-Security': 'max-age=31536000' } : {}),

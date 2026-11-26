@@ -113,7 +113,74 @@ const BLOCKLIST: &[&str] = &[
     "iloveyouiloveyou",
     "correcthorsebatterystaple",
     "correct horse battery staple",
+    // Common long passwords (review L-9; still small: length does most of
+    // the work, and repeats and straight runs are refused by pattern below).
+    "password1234567890",
+    "passwordpasswordpassword",
+    "password!password!",
+    "p@ssw0rdp@ssw0rd",
+    "p@ssw0rd12345678",
+    "p@ssword12345678",
+    "mypasswordismypassword",
+    "thisismypassword",
+    "thisismypassword1",
+    "mymasterpassword",
+    "masterpassword123",
+    "masterpassword1234",
+    "supersecretpassword",
+    "verysecurepassword",
+    "securepassword123",
+    "mysecurepassword",
+    "administrator123",
+    "administrator1234",
+    "adminadminadmin1",
+    "welcome123456789",
+    "welcomewelcome123",
+    "changemechangeme",
+    "changeme12345678",
+    "letmeinletmein123",
+    "iloveyou12345678",
+    "iloveyou123456789",
+    "trustno1trustno1",
+    "qwertyuiopasdfghjklzxcvbnm",
+    "qwertyuiop123456",
+    "qwerty1234567890",
+    "qwertyqwertyqwerty",
+    "qazwsxedcrfvtgbyhn",
+    "1qaz2wsx3edc4rfv",
+    "1q2w3e4r5t6y7u8i9o0p",
+    "zaq12wsxcde34rfv",
+    "asdfghjklasdfghjkl",
+    "zxcvbnmasdfghjkl",
+    "12345678901234567890",
+    "abcdefghijklmnopqrstuvwxyz",
+    "keymeshkeymeshkeymesh",
 ];
+
+/// A whole password that is one unit of 1–4 characters repeated
+/// ("aaaa…", "abcabc…", "1234 1234…" without spaces).
+fn repeats_short_unit(chars: &[char]) -> bool {
+    (1..=4)
+        .any(|p| chars.len() >= 2 * p && chars.iter().enumerate().all(|(i, c)| *c == chars[i % p]))
+}
+
+/// A whole password that is a straight run: every character one step up, or
+/// every one step down, from the previous ("abcd…", "zyx…", "1234567890…";
+/// digits wrap 9→0 and 0→9).
+fn straight_run(chars: &[char]) -> bool {
+    let step = |a: char, b: char| -> i32 {
+        if a.is_ascii_digit() && b.is_ascii_digit() {
+            let d = (b as i32 - a as i32).rem_euclid(10);
+            return if d == 9 { -1 } else { d };
+        }
+        b as i32 - a as i32
+    };
+    if chars.len() < 3 {
+        return false;
+    }
+    let first = step(chars[0], chars[1]);
+    (first == 1 || first == -1) && chars.windows(2).all(|w| step(w[0], w[1]) == first)
+}
 
 /// Checks a NEW master password (NIST SP 800-63B-4 §3.1.1.2).
 pub fn check_new_password(password: &str) -> Result<()> {
@@ -122,9 +189,8 @@ pub fn check_new_password(password: &str) -> Result<()> {
         return Err(Error::validation("password is too short"));
     }
     let lower = Zeroizing::new(n.to_lowercase());
-    let mut chars = lower.chars();
-    let first = chars.next();
-    if chars.all(|c| Some(c) == first) || BLOCKLIST.contains(&lower.as_str()) {
+    let chars: Zeroizing<Vec<char>> = Zeroizing::new(lower.chars().collect());
+    if repeats_short_unit(&chars) || straight_run(&chars) || BLOCKLIST.contains(&lower.as_str()) {
         return Err(Error::validation("password is too common"));
     }
     Ok(())
@@ -311,6 +377,50 @@ mod tests {
         assert!(check_new_password("合成密碼測試用的十五個字元長度").is_ok());
         assert!(check_new_password(&"x".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
         assert!(normalize_password("").is_err());
+    }
+
+    #[test]
+    fn blocklist_covers_common_long_passwords_and_patterns() {
+        // Listed (case-insensitive, after NFC).
+        for pw in [
+            "Password12345678",
+            "qwertyuiopasdfghjklzxcvbnm",
+            "iloveyou12345678",
+            "P@ssw0rdP@ssw0rd",
+            "administrator123",
+            "MyMasterPassword",
+            "changemechangeme",
+        ] {
+            assert!(check_new_password(pw).is_err(), "{pw}");
+        }
+        // Short repeated units, any length.
+        for pw in [
+            "abcabcabcabcabc",
+            "abababababababab",
+            "1234123412341234",
+            "xyz!xyz!xyz!xyz!",
+        ] {
+            assert!(check_new_password(pw).is_err(), "{pw}");
+        }
+        // Straight runs (ascending or descending; digits wrap 9→0).
+        for pw in [
+            "abcdefghijklmnopq",
+            "zyxwvutsrqponmlk",
+            "123456789012345678",
+            "9876543210987654",
+            "ABCDEFGHIJKLMNOP",
+        ] {
+            assert!(check_new_password(pw).is_err(), "{pw}");
+        }
+        // Ordinary long passphrases still pass; a longer repeated unit is not a pattern.
+        for pw in [
+            "synthetic river lamp ferry",
+            "abcde-fghij-klmno",
+            "abcdeabcdeabcdeabcde",
+            "合成密碼測試用的十五個字元長度",
+        ] {
+            assert!(check_new_password(pw).is_ok(), "{pw}");
+        }
     }
 
     #[test]

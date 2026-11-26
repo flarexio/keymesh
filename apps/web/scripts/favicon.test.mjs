@@ -394,16 +394,26 @@ function bigPng() {
   return Buffer.concat([SIG, chunk('IHDR', hdr), chunk('IDAT', deflateSync(rows)), chunk('IEND', Buffer.alloc(0))]);
 }
 
+// Deterministic (review I-11): the fetch starts just before the deadline and
+// then keeps the event loop busy until just past it, as a slow synchronous
+// decode would, so the deadline timer cannot fire first and the result is
+// late by construction. (It used to race a few ms of real decode time.)
 test('F2: a valid image that becomes available just before the DEFAULT deadline is not returned late', async () => {
   const body = bigPng();
   assert.ok(sanitizePng(body)); // the image itself is fine
+  let started = 0;
   const net = {
     async resolve() {
-      await new Promise((r) => setTimeout(r, LIMITS.totalMs - 5));
+      started = performance.now();
+      await new Promise((r) => setTimeout(r, LIMITS.totalMs - 50));
       return [{ address: '93.184.216.34', family: 4 }];
     },
-    async get() {
-      return { status: 200, location: null, body };
+    get() {
+      // Synchronous work that crosses the deadline before anything else can run.
+      while (performance.now() - started < LIMITS.totalMs + 20) {
+        /* busy */
+      }
+      return Promise.resolve({ status: 200, location: null, body });
     },
   };
   const t0 = performance.now();

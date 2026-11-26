@@ -81,18 +81,42 @@ test('pagehide locks; wall clock moved backwards locks', async ({ page }) => {
   await expect(page.getByTestId('autolock-reason')).toHaveAttribute('data-reason', 'clock');
 });
 
-test('settings: "immediately" locks on hide; "never" idle shows a warning and persists', async ({ page }) => {
+test('settings: "immediately" locks on hide; idle choices top out at 1 hour (no "never")', async ({ page }) => {
   await openDemo(page);
   await page.getByTestId('nav-backup').click();
-  await page.getByTestId('autolock-idle').selectOption('0');
-  await expect(page.getByTestId('autolock-never-warning')).toBeVisible();
+  const idle = page.getByTestId('autolock-idle');
+  await expect(idle.locator('option')).toHaveCount(7);
+  expect(await idle.locator('option').evaluateAll((os) => os.map((o) => (o as HTMLOptionElement).value))).toEqual(['1', '2', '5', '10', '15', '30', '60']);
+  await expect(idle.locator('option[value="60"]')).toHaveText(en['autolock.hour']);
+  await idle.selectOption('60');
   await page.getByTestId('autolock-hide').selectOption('0');
-  expect(await page.evaluate(() => localStorage.getItem('keymesh.autolock.v1'))).toBe('{"idleMinutes":0,"hideSeconds":0}');
-  await page.clock.setSystemTime(new Date(Date.parse(await page.evaluate(() => new Date().toISOString())) + 2 * 3600_000)); // hours idle: "never"
-  await page.getByTestId('autolock-idle').click();
-  await expect(page.getByTestId('lock')).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem('keymesh.autolock.v1'))).toBe('{"idleMinutes":60,"hideSeconds":0}');
   await setVisibility(page, 'hidden');
   await locked(page); // synchronously in the handler
+});
+
+test('a stored "never" becomes 1 hour once, with a notice, and is enforced', async ({ page }) => {
+  await page.addInitScript(() => {
+    if (!sessionStorage.getItem('seeded')) {
+      localStorage.setItem('keymesh.autolock.v1', '{"idleMinutes":0,"hideSeconds":300}');
+      sessionStorage.setItem('seeded', '1');
+    }
+  });
+  await openDemo(page);
+  await expect(page.getByTestId('toasts')).toContainText(en['autolock.neverMigrated']);
+  expect(await page.evaluate(() => localStorage.getItem('keymesh.autolock.v1'))).toBe('{"idleMinutes":60,"hideSeconds":300}');
+  await page.getByTestId('nav-backup').click();
+  await expect(page.getByTestId('autolock-idle')).toHaveValue('60');
+  await expect(page.getByTestId('autolock-never-migrated')).toBeVisible();
+  // Over an hour without input: locked (it used to stay open forever).
+  await page.clock.setSystemTime(new Date(Date.parse(await page.evaluate(() => new Date().toISOString())) + 61 * 60_000));
+  await page.getByTestId('autolock-idle').click();
+  await locked(page);
+  await expect(page.getByTestId('autolock-reason')).toHaveAttribute('data-reason', 'idle');
+  // Reload: still 1 hour, and no second notice.
+  await page.reload();
+  await expect(page.getByTestId('toasts')).not.toContainText(en['autolock.neverMigrated']);
+  expect(await page.evaluate(() => localStorage.getItem('keymesh.autolock.v1'))).toBe('{"idleMinutes":60,"hideSeconds":300}');
 });
 
 // Regression (review): the hide select once SHOWED "immediately" while the

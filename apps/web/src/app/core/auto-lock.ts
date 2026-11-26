@@ -19,14 +19,18 @@
  */
 import { Injectable, InjectionToken, inject, signal } from '@angular/core';
 import { VaultService } from './vault.service';
+import { ToastService } from '../shared/feedback';
 
 export const AUTOLOCK_KEY = 'keymesh.autolock.v1';
-export const IDLE_CHOICES = [0, 1, 2, 5, 10, 15, 30, 60] as const; // minutes; 0 = never
+// Minutes. There is no "never" (review decision): the longest is 1 hour.
+export const IDLE_CHOICES = [1, 2, 5, 10, 15, 30, 60] as const;
+/** What a stored "never" (0, from before v0.6.3) becomes. */
+export const IDLE_NEVER_REPLACEMENT = 60;
 export const HIDE_CHOICES = [0, 30, 60, 300] as const; // seconds; 0 = immediately
 const BACKWARD_TOLERANCE_MS = 2_000;
 
 export interface AutoLockSettings {
-  /** Minutes without input; 0 = never. */
+  /** Minutes without input (1–60; there is no "never"). */
   idleMinutes: number;
   /** Seconds hidden; 0 = immediately. */
   hideSeconds: number;
@@ -79,7 +83,12 @@ export function parseAutoLock(raw: string | null, coarse: boolean): AutoLockSett
   } catch {
     return d;
   }
-  const idle = (IDLE_CHOICES as readonly number[]).includes(o['idleMinutes'] as number) ? (o['idleMinutes'] as number) : d.idleMinutes;
+  const stored = o['idleMinutes'];
+  const idle = (IDLE_CHOICES as readonly number[]).includes(stored as number)
+    ? (stored as number)
+    : stored === 0
+      ? IDLE_NEVER_REPLACEMENT // a former "never" becomes the longest choice, not the default
+      : d.idleMinutes;
   const hide = (HIDE_CHOICES as readonly number[]).includes(o['hideSeconds'] as number) ? (o['hideSeconds'] as number) : d.hideSeconds;
   return { idleMinutes: idle, hideSeconds: hide };
 }
@@ -91,6 +100,8 @@ export class AutoLock {
   private readonly storage = inject(AUTOLOCK_STORAGE);
   private readonly coarse = inject(COARSE_POINTER);
 
+  /** True for this page when a stored "never" was just replaced with 1 hour (one-time notice). */
+  readonly neverMigrated = signal(false);
   readonly settings = signal<AutoLockSettings>(this.read());
   /** Why the vault was last locked by this service (non-secret, for the UI). */
   readonly lastReason = signal<LockReason | null>(null);
@@ -106,6 +117,8 @@ export class AutoLock {
       () => this.unlockedNow(),
     );
     this.unlockedNow();
+    // One-time notice (the stored value was rewritten in read()).
+    if (this.neverMigrated()) inject(ToastService).show('autolock.neverMigrated', 'info');
   }
 
   /** Attach the lifecycle listeners (once). The periodic check is best effort. */
@@ -208,7 +221,8 @@ export class AutoLock {
     const past = (since: { mono: number; wall: number }, limitMs: number) =>
       now.mono - since.mono > limitMs || now.wall - since.wall > limitMs;
     if (this.hiddenAt && past(this.hiddenAt, s.hideSeconds * 1000)) return 'hidden';
-    if (s.idleMinutes > 0 && past(this.lastInput, s.idleMinutes * 60_000)) return 'idle';
+    // No "never": settings only come from parseAutoLock (1–60 min).
+    if (past(this.lastInput, s.idleMinutes * 60_000)) return 'idle';
     return null;
   }
 
@@ -223,10 +237,31 @@ export class AutoLock {
   }
 
   private read(): AutoLockSettings {
+    let raw: string | null = null;
     try {
-      return parseAutoLock(this.storage?.getItem(AUTOLOCK_KEY) ?? null, this.coarse);
+      raw = this.storage?.getItem(AUTOLOCK_KEY) ?? null;
     } catch {
       return defaultAutoLock(this.coarse);
     }
+    const settings = parseAutoLock(raw, this.coarse);
+    if (storedNever(raw)) {
+      // Rewrite at once, so a stored "never" can't come back (and the notice shows once).
+      this.neverMigrated.set(true);
+      try {
+        this.storage?.setItem(AUTOLOCK_KEY, JSON.stringify(settings));
+      } catch {
+        // storage blocked: still 1 hour for this page
+      }
+    }
+    return settings;
+  }
+}
+
+function storedNever(raw: string | null): boolean {
+  try {
+    const v = raw ? (JSON.parse(raw) as unknown) : null;
+    return typeof v === 'object' && v !== null && (v as Record<string, unknown>)['idleMinutes'] === 0;
+  } catch {
+    return false;
   }
 }

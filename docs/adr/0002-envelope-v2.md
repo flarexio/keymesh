@@ -178,7 +178,7 @@ Choice: **m = 64 MiB, t = 3, p = 1, 16-byte salt, 32-byte output.**
 **New master passwords** (NIST SP 800-63B-4 §3.1.1.2):
 * NFC normalization; at least 15 code points; at most 1024 UTF-8 bytes.
 * No composition rules.
-* Refused if the whole password is one repeated character or appears on a small built-in blocklist (not a breach corpus).
+* Refused if the whole password is a repeated unit of 1–4 characters, a straight ascending or descending run (`abcd…`, `9876…`), or appears on a small built-in blocklist of common long passwords (not a breach corpus).
 * Paste and password managers are allowed. Existing passwords are only NFC-normalized and bounded.
 
 **Lifecycle:**

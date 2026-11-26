@@ -5,8 +5,9 @@
  */
 import { TestBed } from '@angular/core/testing';
 import { signal } from '@angular/core';
-import { AUTOLOCK_STORAGE, AutoLock, LOCK_CLOCK, AUTOLOCK_KEY, COARSE_POINTER, parseAutoLock } from './auto-lock';
+import { AUTOLOCK_STORAGE, AutoLock, LOCK_CLOCK, AUTOLOCK_KEY, COARSE_POINTER, IDLE_CHOICES, parseAutoLock } from './auto-lock';
 import { VaultService } from './vault.service';
+import { ToastService } from '../shared/feedback';
 
 function setup(opts: { stored?: string; coarse?: boolean } = {}) {
   let mono = 1000;
@@ -158,20 +159,51 @@ describe('auto-lock (deadline based)', () => {
     expect(t.freshness()).toBe(true);
   });
 
-  it('"never" idle keeps the hidden deadline; settings persist under their own key, tolerant parse', () => {
+  it('there is no "never": the choices top out at 1 hour; settings persist under their own key, tolerant parse', () => {
+    expect(IDLE_CHOICES).not.toContain(0);
+    expect(Math.max(...IDLE_CHOICES)).toBe(60);
+    expect(Math.min(...IDLE_CHOICES)).toBeGreaterThan(0);
     const t = setup();
-    t.a.update({ idleMinutes: 0, hideSeconds: 60 });
-    t.advance(3 * 60 * 60_000);
+    t.a.update({ idleMinutes: 60, hideSeconds: 60 });
+    expect(JSON.parse(t.store[AUTOLOCK_KEY])).toEqual({ idleMinutes: 60, hideSeconds: 60 });
+    t.advance(59 * 60_000);
     expect(t.freshness()).toBe(true);
-    t.a.onHidden();
-    t.advance(61_000);
-    t.a.onVisible();
-    expect(t.vault.lock).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(t.store[AUTOLOCK_KEY])).toEqual({ idleMinutes: 0, hideSeconds: 60 });
+    t.advance(60_001);
+    expect(t.freshness()).toBe(false);
+    expect(t.a.lastReason()).toBe('idle');
     expect(setup({ stored: '{"idleMinutes":15,"hideSeconds":0}' }).a.settings()).toEqual({ idleMinutes: 15, hideSeconds: 0 });
     // Out-of-range or corrupt values fall back to the defaults, field by field.
     expect(parseAutoLock('{"idleMinutes":999,"hideSeconds":30}', false)).toEqual({ idleMinutes: 5, hideSeconds: 30 });
     expect(parseAutoLock('not json', true)).toEqual({ idleMinutes: 5, hideSeconds: 0 });
     expect(parseAutoLock('{"idleMinutes":"5","hideSeconds":-1}', false)).toEqual({ idleMinutes: 5, hideSeconds: 30 });
+  });
+
+  it('a stored "never" (0) becomes 1 hour, is rewritten at once, and is announced once', () => {
+    const t = setup({ stored: '{"idleMinutes":0,"hideSeconds":60}' });
+    expect(t.a.settings()).toEqual({ idleMinutes: 60, hideSeconds: 60 });
+    expect(JSON.parse(t.store[AUTOLOCK_KEY])).toEqual({ idleMinutes: 60, hideSeconds: 60 });
+    expect(t.a.neverMigrated()).toBe(true);
+    expect(TestBed.inject(ToastService).toasts().map((x) => x.key)).toEqual(['autolock.neverMigrated']);
+    // It is enforced: hours without input lock.
+    t.advance(60 * 60_000 + 1);
+    expect(t.freshness()).toBe(false);
+    // The next start reads 60 and says nothing.
+    const u = setup({ stored: t.store[AUTOLOCK_KEY] });
+    expect(u.a.settings().idleMinutes).toBe(60);
+    expect(u.a.neverMigrated()).toBe(false);
+    expect(TestBed.inject(ToastService).toasts()).toEqual([]);
+    expect(parseAutoLock('{"idleMinutes":0,"hideSeconds":30}', false)).toEqual({ idleMinutes: 60, hideSeconds: 30 });
+  });
+
+  it('"never" cannot come back: update() with 0 is stored as 1 hour, and nothing ever writes 0', () => {
+    const t = setup();
+    t.a.update({ idleMinutes: 0, hideSeconds: 30 });
+    expect(t.a.settings().idleMinutes).toBe(60);
+    expect(JSON.parse(t.store[AUTOLOCK_KEY]).idleMinutes).toBe(60);
+    t.advance(3 * 60 * 60_000);
+    expect(t.freshness()).toBe(false);
+    for (const v of [0, -1, null, '0', 0.5]) {
+      expect(parseAutoLock(JSON.stringify({ idleMinutes: v, hideSeconds: 30 }), false).idleMinutes, String(v)).toBeGreaterThan(0);
+    }
   });
 });
