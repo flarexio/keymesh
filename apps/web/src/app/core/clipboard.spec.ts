@@ -42,10 +42,18 @@ function setup(opts: { read?: PermissionState | 'unsupported'; writeFails?: bool
   return { c, port, board, status, setWritesFail: (v: boolean) => (failWrites = v) };
 }
 
-/** Let promise chains (digest, clipboard calls) settle under fake timers. */
-async function settle() {
-  for (let i = 0; i < 10; i++) await Promise.resolve();
-  await vi.advanceTimersByTimeAsync(0);
+/**
+ * Wait until `done()` holds. Hashing (crypto.subtle) and the clipboard calls
+ * are really asynchronous, so a fixed number of microtask turns is not enough
+ * on every machine (it once passed locally and failed in CI).
+ */
+async function settle(done: () => boolean) {
+  await vi.waitFor(
+    () => {
+      if (!done()) throw new Error('not settled yet');
+    },
+    { timeout: 5_000, interval: 5 },
+  );
 }
 
 beforeEach(() => vi.useFakeTimers());
@@ -64,7 +72,7 @@ describe('SecretClipboard', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(c.countdown()).toBe(20);
     await vi.advanceTimersByTimeAsync(20_000);
-    await settle();
+    await settle(() => c.lastOutcome() !== null);
     expect(port.reads).toBe(1);
     expect(board.text).toBe('');
     expect(c.countdown()).toBeNull();
@@ -76,7 +84,7 @@ describe('SecretClipboard', () => {
     await c.copySecret('SYNTH-secret-2');
     board.text = 'something the user copied later';
     await vi.advanceTimersByTimeAsync(30_000);
-    await settle();
+    await settle(() => c.lastOutcome() !== null);
     expect(board.text).toBe('something the user copied later');
     expect(c.lastOutcome()).toBe('changed');
   });
@@ -86,7 +94,7 @@ describe('SecretClipboard', () => {
       const { c, port, board } = setup({ read });
       await c.copySecret('SYNTH-secret-3');
       await vi.advanceTimersByTimeAsync(30_000);
-      await settle();
+      await settle(() => c.lastOutcome() !== null);
       expect(port.reads, read).toBe(0);
       expect(board.text, read).toBe('');
       expect(c.lastOutcome(), read).toBe('cleared');
@@ -98,12 +106,12 @@ describe('SecretClipboard', () => {
     await c.copySecret('SYNTH-secret-4');
     setWritesFail(true);
     await vi.advanceTimersByTimeAsync(30_000);
-    await settle();
+    await settle(() => c.lastOutcome() === 'pending');
     expect(board.text).toBe('SYNTH-secret-4');
     expect(c.lastOutcome()).toBe('pending');
     setWritesFail(false);
     window.dispatchEvent(new Event('focus'));
-    await settle();
+    await settle(() => c.lastOutcome() === 'cleared');
     expect(board.text).toBe('');
     expect(c.lastOutcome()).toBe('cleared');
   });
@@ -113,7 +121,7 @@ describe('SecretClipboard', () => {
     await c.copySecret('SYNTH-secret-5');
     status.set('locked');
     TestBed.tick();
-    await settle();
+    await settle(() => c.lastOutcome() !== null);
     expect(board.text).toBe('');
     expect(c.countdown()).toBeNull();
   });
@@ -125,7 +133,8 @@ describe('SecretClipboard', () => {
     await c.copySecret('SYNTH-recovery-code');
     status.set('unlocked');
     TestBed.tick();
-    await settle();
+    // clear() resets the countdown synchronously, so a wrong clear shows at once.
+    await vi.advanceTimersByTimeAsync(0);
     expect(board.text).toBe('SYNTH-recovery-code');
     expect(c.countdown()).toBe(30);
   });
@@ -139,7 +148,7 @@ describe('SecretClipboard', () => {
     await vi.advanceTimersByTimeAsync(15_000);
     expect(board.text).toBe('SYNTH-b');
     await c.clearNow();
-    await settle();
+    await settle(() => c.lastOutcome() !== null);
     expect(board.text).toBe('');
     expect(c.countdown()).toBeNull();
   });
