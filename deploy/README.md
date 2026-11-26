@@ -13,8 +13,9 @@
 
 ## Design rules
 - **Host networking:** Docker publishes no ports and adds no NAT or iptables rules. `web` binds `127.0.0.1:4320` only, so nothing off the host reaches it except through the host proxy.
-- **Hardening:** read-only root filesystem, `no-new-privileges`, `cap_drop: ALL`, uid 1000 and `restart: unless-stopped`. It mounts no Docker socket, home or repo. The health check is the image's `HEALTHCHECK` (`deploy/web.Dockerfile`).
-- **What the image holds:** only `serve.mjs`, `favicon.mjs` and the built bundle, enforced by the allowlist in `web.Dockerfile.dockerignore`.
+- **Hardening:** read-only root filesystem, `no-new-privileges`, `cap_drop: ALL`, uid 1000, `mem_limit`/`memswap_limit: 256m`, `pids_limit: 64` and `restart: unless-stopped`. It mounts no Docker socket, home or repo. The health check is the image's `HEALTHCHECK` (`deploy/web.Dockerfile`).
+- **What the image holds:** plain Alpine (the release the official node image is built on, pinned by digest) plus only the `node` binary and its two C++ runtime libraries from the pinned node image: no npm, npx, corepack, yarn or global `node_modules`. On top: only `serve.mjs`, `favicon.mjs` and the built bundle, enforced by the allowlist in `web.Dockerfile.dockerignore`.
+- **Smoke test:** every CI image leg builds the image locally and runs `deploy/image-smoke.sh` before anything is pushed: the same hardening as compose, the `HEALTHCHECK` must report healthy, the app shell must be served with its CSP and `nosniff`, and the runtime must hold no package manager and run as uid 1000.
 - **Unchanged security behaviour:** `serve.mjs` sets CSP, COOP, nosniff and no-referrer and keeps its SPA containment. The website-icon route stays off: `KEYMESH_FAVICON` is not set.
 
 ## Route the host proxy needs
@@ -68,6 +69,8 @@ The preferred way to update `web`: a **release tag** (`vMAJOR.MINOR.PATCH`, e.g.
 - **A `v*` tag that is not `vMAJOR.MINOR.PATCH`** (e.g. `v1.0.0-rc.1`) fails the image legs and publishes nothing.
 - **Concurrency:** a newer push to a pull request cancels its older run. Tag, `main`, branch and dispatch runs are never cancelled.
 - **Caches:** `Swatinem/rust-cache` in `rust` and in `web`'s WASM build, saved only by pushes to branches. On a tag, `web` (which builds the released bundle) restores no Rust or npm cache, and the image and `manifest` jobs never use caches.
+- **Dependency audits:** `rust` runs `cargo audit` (cargo-audit 0.23.0, `cargo install --locked`) on `Cargo.lock` and `web` runs `npm audit --omit=dev --audit-level=high`. Either fails the run on a vulnerability; there is no ignore list.
+- **Checkouts** never persist the job token (`persist-credentials: false` on every `actions/checkout`).
 
 **Release flow.**
 0. **Lint.** Job `lint` runs shellcheck on every tracked `*.sh` and actionlint (pinned, checksum-verified, with shellcheck) on the workflows. Any finding fails it, and nothing is built or published without it.
@@ -102,7 +105,9 @@ KEYMESH_IMAGE_REPO=<namespace>/keymesh-web deploy/pull-deploy.sh <full 40-hex sh
 The script, using `sudo docker`:
 1. With a version, reads the commit of tag `v<version>` (peeled) with `git ls-remote https://github.com/flarexio/keymesh`, then pulls `docker.io/<repo>:<version>`; with a SHA, pulls `docker.io/<repo>:sha-<sha>`. Either way it pulls for this host's platform and pins the image by the **index** digest.
 2. **Refuses** unless the revision label is exactly that commit and the pulled image's os/arch is this host's: the Docker daemon's `{{.Server.Os}}/{{.Server.Arch}}` (arm64 on the Pi, amd64 on an amd64 host), or `KEYMESH_PLATFORM` if set (`linux/amd64` or `linux/arm64` only).
-3. Runs `gh attestation verify oci://docker.io/<repo>@sha256:<index digest> --repo flarexio/keymesh` when `gh` is installed, requiring the signer `https://github.com/flarexio/keymesh/.github/workflows/ci.yml@refs/tags/vMAJOR.MINOR.PATCH` (`--cert-identity-regex`), the source commit (`--source-digest <sha>`), a GitHub-hosted runner, and with a version exactly `--source-ref refs/tags/v<version>`. Set `KEYMESH_VERIFY_ATTESTATION=1` to require it, or `0` to skip it.
+3. **Always** runs `gh attestation verify oci://docker.io/<repo>@sha256:<index digest> --repo flarexio/keymesh`, requiring the signer `https://github.com/flarexio/keymesh/.github/workflows/ci.yml@refs/tags/vMAJOR.MINOR.PATCH` (`--cert-identity-regex`), the source commit (`--source-digest <sha>`), a GitHub-hosted runner, and with a version exactly `--source-ref refs/tags/v<version>`.
+   - **`gh` is required.** Install the GitHub CLI on the Pi and run `gh auth login` once. Without `gh` the script refuses before pulling anything. If verification fails, nothing is deployed.
+   - The only way to skip it is an explicit `KEYMESH_VERIFY_ATTESTATION=0`, which prints a loud warning: the image is then trusted on its digest and revision label alone, and anyone who can push to the image repository controls both. The former `auto` mode (verify only if `gh` happened to be installed) failed open and is refused now. `deploy/pull-deploy.test.sh` checks this policy in CI.
 4. Copies the bundle out of the image and prints the sha256 of the key files. With `KEYMESH_LEDGER=asset-ledger.json` (the CI artifact; needs node), it compares every file.
 5. Tags the running web image `keymesh-web:rollback-<old revision>`.
 6. Recreates **only** `web` (`--no-deps --no-build --pull never`) with `KEYMESH_WEB_IMAGE=docker.io/<repo>@sha256:…`.

@@ -46,6 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-15
         with:
           toolchain: stable
@@ -61,6 +63,14 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: cargo clippy -p keymesh --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
       - run: cargo clippy -p keymesh-wasm --target wasm32-unknown-unknown -- -D warnings
+      # RustSec advisories for Cargo.lock. Pinned, --locked install (cached in
+      # ~/.cargo/bin by rust-cache). Fails on any vulnerability; there is no
+      # ignore list (add one here only with a comment naming the advisory, why
+      # it does not apply and when it is revisited).
+      - name: Install cargo-audit (pinned)
+        run: cargo install cargo-audit --version 0.23.0 --locked
+      - name: cargo audit
+        run: cargo audit
 
   # This job builds the bundle a release publishes, so on a tag it starts from
   # clean: no Rust cache and no npm cache are restored.
@@ -73,6 +83,8 @@ jobs:
         working-directory: apps/web
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-15
         with:
           toolchain: stable
@@ -91,6 +103,8 @@ jobs:
           package-manager-cache: ${{ github.ref_type != 'tag' }}
           cache-dependency-path: apps/web/package-lock.json
       - run: npm ci
+      # Shipped (runtime) dependencies only; fails on high or critical.
+      - run: npm audit --omit=dev --audit-level=high
       - run: npm run build:wasm
       - run: npm run typecheck
       - run: npm run build
@@ -148,6 +162,8 @@ jobs:
         run: |
           actionlint -version
           actionlint -color -shellcheck "$(command -v shellcheck)"
+      - name: pull-deploy provenance policy (fake docker and gh)
+        run: sh deploy/pull-deploy.test.sh
 
   # Multi-arch keymesh-web image, built from the bundle E2E tested. Each platform
   # builds on its own native runner (COPY-only Dockerfile); `manifest` joins them
@@ -236,6 +252,26 @@ jobs:
         with:
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
+      # Smoke test on every build, before anything is pushed: the image runs
+      # with the compose hardening, reports healthy, serves the app, and holds
+      # no package manager (deploy/image-smoke.sh). A local, unpushed build of
+      # the same context; the push below reuses its layers.
+      - name: Build the image for the smoke test (local, not pushed)
+        if: env.BUILD == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: apps/web
+          file: deploy/web.Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: keymesh-web:smoke
+          provenance: false
+          sbom: false
+          build-args: KEYMESH_REVISION=${{ github.sha }}
+      - name: Smoke-test the image (hardened run, healthy, minimal runtime)
+        if: env.BUILD == 'true'
+        run: sh deploy/image-smoke.sh keymesh-web:smoke
       - id: build
         if: env.BUILD == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
