@@ -23,6 +23,11 @@ services:
     network_mode: host
     user: "1000:1000"
     cap_drop: [ALL]
+    # A static file server: bounded memory and processes (it needs well under
+    # 128 MiB and one process; the limits only stop a runaway, never normal use).
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
     environment:
       HOST: 127.0.0.1
       PORT: "4320"

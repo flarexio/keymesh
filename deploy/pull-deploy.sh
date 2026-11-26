@@ -12,10 +12,11 @@
 #    resolved to its tag's commit with `git ls-remote` on the GitHub repository.
 # 2. Refuses unless the revision label is that commit and the pulled image's
 #    platform is this host's (the Docker daemon's os/arch, or KEYMESH_PLATFORM).
-# 3. Verifies the index's build provenance with `gh attestation verify` when gh is
-#    installed: signed by ci.yml of flarexio/keymesh running for a refs/tags/v*
-#    release tag (that exact tag when a version is given), built from the commit,
-#    on a GitHub-hosted runner.
+# 3. Verifies the index's build provenance with `gh attestation verify` (always;
+#    gh is required): signed by ci.yml of flarexio/keymesh running for a
+#    refs/tags/v* release tag (that exact tag when a version is given), built from
+#    the commit, on a GitHub-hosted runner. Without gh, or if verification fails,
+#    nothing is deployed. Only KEYMESH_VERIFY_ATTESTATION=0 skips it (loudly).
 # 4. Copies the bundle out of the image and prints sha256 of the key files
 #    (and compares every file with a CI asset ledger when KEYMESH_LEDGER is set).
 # 5. Tags the current web image keymesh-web:rollback-<old revision>.
@@ -29,7 +30,10 @@
 # Environment:
 #   KEYMESH_IMAGE_REPO          Docker Hub repository <namespace>/<name>, the value of the
 #                               DOCKERHUB_REPOSITORY variable in CI (or the 2nd argument)
-#   KEYMESH_VERIFY_ATTESTATION  auto (default: verify when gh exists) | 1 (require) | 0 (skip)
+#   KEYMESH_VERIFY_ATTESTATION  1 (default: verify; refuse without gh) | 0 (skip, with a
+#                               loud warning: an image is then trusted on its digest and
+#                               revision label alone, which anyone who can push to the
+#                               repository controls). "auto" was removed (it failed open).
 #   KEYMESH_LEDGER              optional path to the CI asset-ledger.json (needs node)
 #   KEYMESH_PLATFORM            expected os/arch (default: the Docker daemon's, e.g. linux/arm64)
 #   KEYMESH_HEALTH_TIMEOUT      seconds to wait for healthy (default 150)
@@ -46,13 +50,22 @@ GIT_REMOTE=${KEYMESH_GIT_REMOTE:-https://github.com/$ATTEST_REPO}
 SIGNER_RE='^https://github\.com/flarexio/keymesh/\.github/workflows/ci\.yml@refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 PLATFORM=${KEYMESH_PLATFORM:-}
 SUDO=${SUDO-sudo}
-VERIFY=${KEYMESH_VERIFY_ATTESTATION:-auto}
+VERIFY=${KEYMESH_VERIFY_ATTESTATION:-1}
 TIMEOUT=${KEYMESH_HEALTH_TIMEOUT:-150}
 HERE=$(cd "$(dirname "$0")" && pwd)
 COMPOSE_FILE=$HERE/compose.yaml
 
 log() { printf 'pull-deploy: %s\n' "$*"; }
 die() { printf 'pull-deploy: ERROR: %s\n' "$*" >&2; exit 1; }
+skip_warning() {
+  {
+    echo '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+    echo 'pull-deploy: WARNING: KEYMESH_VERIFY_ATTESTATION=0: build provenance is NOT verified.'
+    echo 'pull-deploy: WARNING: the image is trusted on its digest and revision label only;'
+    echo 'pull-deploy: WARNING: anyone who can push to the image repository controls both.'
+    echo '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+  } >&2
+}
 
 # $SUDO is intentionally unquoted: empty means "no prefix".
 # shellcheck disable=SC2086
@@ -120,7 +133,13 @@ NAME=${2:-${KEYMESH_IMAGE_REPO:-}}
 printf '%s' "$NAME" | grep -Eqx '[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*' ||
   die "set KEYMESH_IMAGE_REPO (or pass it as the 2nd argument) to <namespace>/<name>: '$NAME'"
 REPO=$REGISTRY/$NAME
-case $VERIFY in auto | 0 | 1) ;; *) die "KEYMESH_VERIFY_ATTESTATION must be auto, 0 or 1" ;; esac
+case $VERIFY in
+  1) command -v gh >/dev/null 2>&1 ||
+    die "gh is required to verify build provenance (install the GitHub CLI and run 'gh auth login'); nothing was pulled or deployed. KEYMESH_VERIFY_ATTESTATION=0 skips verification (not recommended)." ;;
+  0) skip_warning ;;
+  auto) die "KEYMESH_VERIFY_ATTESTATION=auto was removed: verification is always required (1, the default). Only an explicit 0 skips it." ;;
+  *) die "KEYMESH_VERIFY_ATTESTATION must be 1 (default) or 0" ;;
+esac
 VERSION=
 if printf '%s' "$1" | grep -Eqx 'v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'; then
   VERSION=${1#v}
@@ -162,7 +181,7 @@ NEW_ID=$(d image inspect --format '{{ .Id }}' "$PINNED")
 log "verified $PINNED (revision $rev, $plat)"
 
 # --- 3. provenance -------------------------------------------------------------
-if [ "$VERIFY" = 1 ] || { [ "$VERIFY" = auto ] && command -v gh >/dev/null 2>&1; }; then
+if [ "$VERIFY" = 1 ]; then
   log "verifying build provenance with gh"
   # Signed by ci.yml for a v* release tag (exactly $TAG for a version), built
   # from $SHA on a GitHub-hosted runner.
@@ -171,7 +190,7 @@ if [ "$VERIFY" = 1 ] || { [ "$VERIFY" = auto ] && command -v gh >/dev/null 2>&1;
   gh attestation verify "oci://$PINNED" "$@" ||
     die "attestation verification failed (needs 'gh auth login'; a private repository also needs 'docker login' as this user). KEYMESH_VERIFY_ATTESTATION=0 skips it."
 else
-  log "gh not installed or KEYMESH_VERIFY_ATTESTATION=0: provenance NOT verified"
+  skip_warning
 fi
 
 # --- 4. bundle hashes ------------------------------------------------------------
