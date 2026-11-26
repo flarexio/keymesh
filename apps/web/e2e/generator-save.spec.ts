@@ -11,7 +11,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { en } from '../src/app/core/i18n/en';
 import { zhTW } from '../src/app/core/i18n/zh-tw';
-import { storedBytes, titles } from './helpers';
+import { storedBytes, titles, pwMore } from './helpers';
 
 type Locale = 'zh-TW' | 'en';
 type Catalog = Record<keyof typeof en, string>;
@@ -113,6 +113,7 @@ for (const locale of ['zh-TW', 'en'] as const) {
     const { context, page, errors } = await openVault(browser, locale);
     await page.getByTestId('nav-generators').click();
     const card = pwCard(page);
+    await pwMore(card);
     const generate = page.getByTestId('generate-password');
     const save = page.getByTestId('save-password');
 
@@ -124,7 +125,6 @@ for (const locale of ['zh-TW', 'en'] as const) {
     // Custom settings, then a preview.
     await card.locator('[name=pwLength]').fill('36');
     await card.locator('[name=pwSymbolSet]').fill('-_');
-    await card.locator('details.more-options summary').click();
     await card.locator('[name=pw-excludeAmbiguous]').check();
     const title = `Synthetic exact ${locale}`;
     await page.locator('#gen-pw-title').fill(title);
@@ -199,6 +199,7 @@ for (const locale of ['zh-TW', 'en'] as const) {
     const { context, page, errors } = await openVault(browser, locale);
     await page.getByTestId('nav-generators').click();
     const card = pwCard(page);
+    await pwMore(card);
     await card.locator('[name=pwPreset]').selectOption('strong');
     await card.locator('[name=pw-symbols]').uncheck();
     await page.getByTestId('generate-password').click();
@@ -223,8 +224,9 @@ for (const locale of ['zh-TW', 'en'] as const) {
     await page.reload();
     await page.getByRole('button', { name: t['start.stored.open'] }).click();
     await page.getByTestId('nav-generators').click();
+    await pwMore(card);
     await expect(card.locator('[name=pwPreset]')).toHaveValue('custom');
-    await expect(card.locator('[name=pwLength]')).toHaveValue('32');
+    await expect(card.locator('[name=pwLength]')).toHaveValue('64');
     await expect(card.locator('[name=pw-symbols]')).not.toBeChecked();
 
     // Corrupt or tampered settings: defaults, no errors.
@@ -234,7 +236,7 @@ for (const locale of ['zh-TW', 'en'] as const) {
       await page.getByRole('button', { name: t['start.stored.open'] }).click();
       await page.getByTestId('nav-generators').click();
       await expect(card.locator('[name=pwPreset]')).toHaveValue('default');
-      await expect(card.locator('[name=pwLength]')).toHaveValue('24');
+      await expect(card.locator('[name=pwLength]')).toHaveValue('32');
     }
     expect(errors).toEqual([]);
     await context.close();
@@ -277,22 +279,24 @@ for (const locale of ['zh-TW', 'en'] as const) {
     const { context, page, errors } = await openVault(browser, locale);
     await page.getByTestId('nav-generators').click();
     const card = pwCard(page);
+    await pwMore(card);
     const reopen = async () => {
       await page.reload();
       await page.getByRole('button', { name: t['start.stored.open'] }).click();
       await page.getByTestId('nav-generators').click();
+      await pwMore(card);
     };
     const stored = async () => JSON.parse((await localEntries(page))[SETTINGS_KEY] ?? 'null');
 
-    // Digits only, 24 characters: accepted by the core and saved.
+    // Digits only, 32 characters (the default length): accepted by the core and saved.
     for (const f of ['lowercase', 'uppercase', 'symbols']) await card.locator(`[name=pw-${f}]`).uncheck();
     await expect(card.getByTestId('password-options-error')).toHaveCount(0);
-    expect((await stored()).options).toMatchObject({ length: 24, digits: true, lowercase: false, symbols: false });
+    expect((await stored()).options).toMatchObject({ length: 32, digits: true, lowercase: false, symbols: false });
 
     // Weak (digits only, 8): shown with the core's message, kept on screen, not saved.
     await card.locator('[name=pwLength]').fill('8');
     await expect(card.getByTestId('password-options-error')).toHaveText(t['errors.pwWeak']);
-    expect((await stored()).options.length).toBe(24);
+    expect((await stored()).options.length).toBe(32);
     // Symbols on (default set) is accepted and saved; emptying the set is not.
     await card.locator('[name=pwLength]').fill('24');
     await card.locator('[name=pw-symbols]').check();
@@ -327,7 +331,7 @@ for (const locale of ['zh-TW', 'en'] as const) {
       await page.evaluate(([k, v]) => localStorage.setItem(k, v), [SETTINGS_KEY, JSON.stringify({ preset: 'custom', options })]);
       await reopen();
       await expect(card.locator('[name=pwPreset]')).toHaveValue('default');
-      await expect(card.locator('[name=pwLength]')).toHaveValue('24');
+      await expect(card.locator('[name=pwLength]')).toHaveValue('32');
       await expect(card.getByTestId('password-options-error')).toHaveCount(0);
     }
     expect(errors).toEqual([]);
@@ -341,10 +345,12 @@ for (const locale of ['zh-TW', 'en'] as const) {
     const { context, page, errors } = await openVault(browser, locale);
     await page.getByTestId('nav-generators').click();
     const card = pwCard(page);
+    await pwMore(card);
     const reopen = async () => {
       await page.reload();
       await page.getByRole('button', { name: t['start.stored.open'] }).click();
       await page.getByTestId('nav-generators').click();
+      await pwMore(card);
     };
     // The fresh page shows the default symbols; Reset must bring back exactly these.
     await card.locator('[name=pw-symbols]').check();
@@ -461,6 +467,7 @@ for (const locale of ['zh-TW', 'en'] as const) {
     const fits = await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth);
     expect(fits, 'no horizontal overflow').toBe(true);
     await page.screenshot({ path: shotPath(testInfo, `keymesh-generator-preview-${locale}-mobile.png`), fullPage: true });
+    await pwMore(pwCard(page));
     await pwCard(page).locator('[name=pw-digits]').uncheck();
     await expect(pwCard(page).getByTestId('generated-outdated')).toBeVisible();
     await pwCard(page).getByTestId('generated-outdated').scrollIntoViewIfNeeded();

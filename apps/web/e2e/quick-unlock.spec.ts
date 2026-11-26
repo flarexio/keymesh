@@ -86,6 +86,9 @@ test('enrol, lock, reload, unlock with the passkey; ciphertext only; remove; mas
   await expect(page.getByTestId('backup-status')).toContainText(en['qu.added'], { timeout: 30_000 });
   await expect(page.getByTestId('qu-item')).toHaveCount(1);
   await expect(page.getByTestId('qu-item')).toHaveAttribute('data-be', 'false');
+  // The sync status is stated per passkey: a badge and a note (this virtual one is device-bound).
+  await expect(page.getByTestId('qu-sync')).toHaveText(en['qu.badge.be0']);
+  await expect(page.getByTestId('qu-sync-note')).toHaveText(en['qu.be0']);
   await page.getByTestId('quick-unlock-section').scrollIntoViewIfNeeded();
   await page.screenshot({ path: shot(testInfo, 'm5c-quick-unlock-card-en.png'), fullPage: true });
   const stored = Buffer.from(await storedBytes(page, 'keymesh-vault'));
@@ -106,7 +109,25 @@ test('enrol, lock, reload, unlock with the passkey; ciphertext only; remove; mas
   await page.waitForTimeout(1_000);
   await expect(page.getByTestId('key-mode')).toHaveCount(0);
   await expect(page.getByTestId('delete-protected')).toBeHidden();
+  // Passkey first: the master password waits behind "Use master password".
+  await expect(page.getByTestId('passkey-hero')).toBeVisible();
+  const toggle = page.getByTestId('use-password');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.getByTestId('unlock-password')).toBeHidden();
+  await expect(page.getByTestId('forgot-password')).toBeHidden();
   await page.screenshot({ path: shot(testInfo, 'm5c-locked-passkey-button-en.png'), fullPage: true });
+  // Keyboard: Tab reaches the toggle, Enter expands it and focus lands in the field.
+  await page.keyboard.press('Tab');
+  await expect(toggle).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.getByTestId('unlock-password')).toBeFocused();
+  await expect(page.getByTestId('forgot-password')).toBeVisible();
+  await page.screenshot({ path: shot(testInfo, 'm5c-locked-passkey-expanded-en.png'), fullPage: true });
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.getByTestId('unlock-password')).toBeHidden();
+  await expect(page.getByTestId('key-mode')).toHaveCount(0);
   await page.getByTestId('unlock-passkey').click();
   await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected', { timeout: 30_000 });
   await expect(page.locator('.item-list')).toContainText('Synthetic passkey note');
@@ -345,8 +366,10 @@ for (const boundary of ['preput-deadline', 'postput-pagehide'] as const) {
     await q.getByTestId('qu-label').fill('Synthetic ' + boundary);
     await q.getByTestId('qu-add').click();
     await expect.poll(() => page.evaluate(() => (window as unknown as Record<string, unknown>)['__hit']), { timeout: 30_000 }).toBe(true);
-    await expect(page.getByTestId('unlock-password')).toBeVisible();
     const pre = boundary === 'preput-deadline';
+    // Saved while locked: the passkey is offered first (password behind the toggle); not saved: password only.
+    if (pre) await expect(page.getByTestId('unlock-password')).toBeVisible();
+    else await expect(page.getByTestId('use-password')).toBeVisible();
     await expect(page.getByTestId('credential-notice')).toHaveAttribute('data-code', pre ? 'quickUnlockOrphan' : 'quickUnlockSavedWhileLocked', { timeout: 30_000 });
     const after = Buffer.from(await storedBytes(page, 'keymesh-vault'));
     expect(after.equals(before)).toBe(pre);
@@ -360,3 +383,77 @@ test('idle deadline passes while getClientCapabilities() is pending: locks, no c
   test.setTimeout(150_000);
   await expiredDuringEnrolment(page, baseURL, 'capability');
 });
+
+test('passkey gone from the authenticator: the error shows and the master password opens by itself', async ({ page, baseURL }, testInfo) => {
+  test.setTimeout(150_000);
+  const origin = localhost(baseURL);
+  const { cdp, id } = await authenticator(page);
+  await createVault(page, origin);
+  await enrol(page, 'Synthetic removed key');
+  await expect(page.getByTestId('backup-status')).toContainText(en['qu.added'], { timeout: 30_000 });
+  await page.getByTestId('lock').click();
+  // The user deleted the passkey on the device; the vault still lists its slot.
+  await cdp.send('WebAuthn.clearCredentials', { authenticatorId: id });
+  await expect(page.getByTestId('use-password')).toHaveAttribute('aria-expanded', 'false');
+  await page.getByTestId('unlock-passkey').click();
+  await expect(page.getByTestId('protected-error')).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId('use-password')).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.getByTestId('use-password')).toHaveClass(/attention/);
+  await expect(page.getByTestId('unlock-password')).toBeFocused();
+  await expect(page.getByTestId('key-mode')).toHaveCount(0);
+  await page.screenshot({ path: shot(testInfo, 'passkey-failed-password-offered-en.png'), fullPage: true });
+  await page.getByTestId('unlock-password').fill(PW);
+  await page.getByTestId('unlock-protected').click();
+  await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', 'protected', { timeout: 30_000 });
+});
+
+test('reduced motion: the passkey screen does not animate', async ({ page, baseURL }) => {
+  test.setTimeout(120_000);
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  const origin = localhost(baseURL);
+  await authenticator(page);
+  await createVault(page, origin);
+  await enrol(page, 'Synthetic calm key');
+  await expect(page.getByTestId('backup-status')).toContainText(en['qu.added'], { timeout: 30_000 });
+  await page.getByTestId('lock').click();
+  const btn = page.getByTestId('unlock-passkey');
+  await expect(btn).toBeVisible();
+  expect(await btn.evaluate((el) => getComputedStyle(el).animationName)).toBe('none');
+  await btn.hover();
+  expect(await btn.evaluate((el) => getComputedStyle(el).transform)).toBe('none');
+  const panel = page.getByTestId('password-panel');
+  expect(await panel.evaluate((el) => getComputedStyle(el).transitionProperty)).toBe('none');
+  await page.getByTestId('use-password').click();
+  await expect(page.getByTestId('unlock-password')).toBeFocused();
+});
+
+for (const v of [
+  { name: 'desktop-en-light', locale: 'en-US', colorScheme: 'light' as const, viewport: { width: 1280, height: 900 }, mobile: false },
+  { name: 'phone-zh-TW-dark', locale: 'zh-TW', colorScheme: 'dark' as const, viewport: { width: 390, height: 844 }, mobile: true },
+]) {
+  test(`passkey-first lock screen screenshots: ${v.name}, collapsed and expanded`, async ({ browser, baseURL }, testInfo) => {
+    test.setTimeout(150_000);
+    const ctx = await browser.newContext({ locale: v.locale, colorScheme: v.colorScheme, viewport: v.viewport, isMobile: v.mobile, hasTouch: v.mobile, serviceWorkers: 'block' });
+    const page = await ctx.newPage();
+    await authenticator(page);
+    await createVault(page, localhost(baseURL));
+    await page.getByTestId(v.mobile ? 'bnav-backup' : 'nav-backup').click();
+    const q = page.getByTestId('quick-unlock-section');
+    await q.getByTestId('qu-current').fill(PW);
+    await q.getByTestId('qu-label').fill('Synthetic key');
+    await q.getByTestId('qu-add').click();
+    await expect(page.getByTestId('qu-item')).toHaveCount(1, { timeout: 30_000 });
+    await q.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: shot(testInfo, `backup-passkey-sync-${v.name}.png`), fullPage: true });
+    await page.getByTestId('lock').click();
+    await expect(page.getByTestId('passkey-hero')).toBeVisible();
+    await page.waitForTimeout(600); // entrance animation done
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: shot(testInfo, `lock-passkey-${v.name}-collapsed.png`), fullPage: true });
+    await page.getByTestId('use-password').click();
+    await expect(page.getByTestId('unlock-password')).toBeFocused();
+    await page.waitForTimeout(400); // expand transition done
+    await page.screenshot({ path: shot(testInfo, `lock-passkey-${v.name}-expanded.png`), fullPage: true });
+    await ctx.close();
+  });
+}

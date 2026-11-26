@@ -1,7 +1,7 @@
 /**
  * Shared E2E helpers. SYNTHETIC DATA ONLY; the real build and real WASM core.
  */
-import { expect, Page } from '@playwright/test';
+import { expect, Locator, Page } from '@playwright/test';
 import { en } from '../src/app/core/i18n/en';
 
 /** Planted markers: must never appear in storage or exported bytes. */
@@ -74,8 +74,20 @@ export async function start(page: Page, mode: 'ephemeral' | 'synthetic-fixture')
   await expect(page.getByTestId('key-mode')).toHaveAttribute('data-key-mode', mode);
 }
 
+/**
+ * Create an item of `kind`. On the all-items view "New item" opens the kind
+ * menu; inside a category it creates that category's kind directly (another
+ * category's kind first goes back to all items).
+ */
 export async function newItem(page: Page, kind: string) {
-  await page.getByTestId('new-item').click();
+  const button = page.getByTestId('new-item');
+  const direct = await button.getAttribute('data-kind');
+  if (direct === kind) {
+    await button.click();
+    return;
+  }
+  if (direct) await category(page, '');
+  await button.click();
   await page.locator(`[role=menuitem][data-kind=${kind}]`).click();
 }
 
@@ -178,4 +190,10 @@ export async function openMore(page: Page): Promise<void> {
   const more = page.getByTestId('more-options');
   if ((await more.getAttribute('open')) === null) await page.getByTestId('more-options-toggle').click();
   await expect(more).toHaveAttribute('open', '');
+}
+
+/** Open the password settings' "More options" (types, symbols, fine options) if it is closed. */
+export async function pwMore(scope: Locator): Promise<void> {
+  const d = scope.locator('details[data-testid=pw-more]').first();
+  if (!(await d.evaluate((e) => (e as HTMLDetailsElement).open))) await d.locator('summary').click();
 }

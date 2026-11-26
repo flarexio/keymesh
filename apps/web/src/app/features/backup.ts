@@ -103,8 +103,13 @@ import { FaviconPref } from '../core/favicon-pref';
             <ul class="value-list" data-testid="qu-list">
               @for (k of list; track k.slot_id) {
                 <li data-testid="qu-item" [attr.data-be]="k.be">
-                  <span class="value-label">{{ k.label || 'Keymesh' }}</span>
-                  <span class="value-text field-hint">{{ i18n.t(k.be ? 'qu.be1' : 'qu.be0') }}</span>
+                  <span class="value-label">
+                    {{ k.label || 'Keymesh' }}
+                    <span class="badge" [class.badge-warn]="k.be" data-testid="qu-sync">{{ i18n.t(k.be ? 'qu.badge.be1' : 'qu.badge.be0') }}</span>
+                  </span>
+                  <div class="callout qu-sync-note" [class.callout-warn]="k.be" role="note" data-testid="qu-sync-note">
+                    <km-icon [name]="k.be ? 'shieldAlert' : 'info'" /><p>{{ i18n.t(k.be ? 'qu.be1' : 'qu.be0') }}</p>
+                  </div>
                   <button type="button" class="btn btn-sm btn-danger-ghost" data-testid="qu-remove" [disabled]="busy() || !quCurrent()" (click)="removePasskey(k.slot_id)">{{ i18n.t('qu.remove') }}</button>
                 </li>
               }

@@ -784,3 +784,169 @@ html:lang(en) .eyebrow {
 .more-delete > .btn {
   justify-self: start;
 }
+
+/* ---- Passkey-first lock screen (km-protected-start) ----
+ * The passkey is the hero; "Use master password" expands the password form
+ * (grid-rows 0fr → 1fr, so no height is measured in script). The collapsed
+ * panel is `inert` and `visibility: hidden`, so nothing in it can be focused
+ * or read. Motion is CSS only; base.css turns it off under
+ * prefers-reduced-motion. No transform stays on an ancestor afterwards. */
+.passkey-hero {
+  display: grid;
+  justify-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 var(--space-4);
+  text-align: center;
+}
+
+.passkey-hero-btn {
+  width: min(100%, 22rem);
+  min-height: 3.5rem;
+  gap: var(--space-3);
+  font-size: var(--text-lg, 1.125rem);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  animation: passkey-in 420ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+  transition:
+    transform 160ms ease,
+    box-shadow 160ms ease,
+    background-color 160ms ease;
+}
+
+.passkey-hero-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-lg);
+}
+
+.passkey-hero-btn:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+  box-shadow: var(--shadow-sm);
+}
+
+.passkey-hero-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent-fg) 18%, transparent);
+  font-size: 1.25rem;
+}
+
+.passkey-hero .hint {
+  max-width: 28rem;
+  margin: 0;
+}
+
+@keyframes passkey-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.use-password {
+  display: grid;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.use-password-toggle {
+  justify-self: center;
+}
+
+.use-password-toggle .chevron {
+  transition: transform 220ms ease;
+}
+
+.use-password-toggle[aria-expanded='true'] .chevron {
+  transform: rotate(180deg);
+}
+
+/* After a failed or cancelled passkey: point at the way out. */
+.use-password-toggle.attention {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-soft-fg);
+  animation: attention-nudge 600ms ease 1;
+}
+
+@keyframes attention-nudge {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+  40% {
+    box-shadow: 0 0 0 6px var(--accent-soft);
+  }
+}
+
+.collapse-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    grid-template-rows 260ms ease,
+    opacity 180ms ease,
+    visibility 0s linear 260ms;
+}
+
+.collapse-panel.open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  visibility: visible;
+  /* visibility is NOT transitioned on open: it must be visible at once so
+   * focus can move into the field in the same frame (also under the global
+   * reduced-motion rule, which would otherwise give it a 0.01 ms transition). */
+  transition:
+    grid-template-rows 260ms ease,
+    opacity 220ms ease 60ms;
+}
+
+.collapse-inner {
+  min-height: 0;
+  overflow: hidden;
+  /* Room for focus rings inside the clipped area. */
+  padding: 4px;
+  margin: -4px;
+}
+
+/* Short success transition when the vault opens (opacity only, so fixed popups keep the viewport as their box). */
+.shell {
+  animation: shell-in 260ms ease-out;
+}
+
+@keyframes shell-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* base.css gives EVERY element a 0.01 ms duration under reduced motion, and
+   * the default transition-property is `all`, so descendants would briefly
+   * transition the inherited `visibility` from hidden and could not take focus
+   * in the frame the panel opens. No transitions in or on the panel. */
+  .collapse-panel,
+  .collapse-panel.open,
+  .collapse-panel * {
+    transition: none !important;
+  }
+  .passkey-hero-btn,
+  .use-password-toggle.attention,
+  .shell {
+    animation: none;
+  }
+  .passkey-hero-btn:hover:not(:disabled),
+  .passkey-hero-btn:active:not(:disabled) {
+    transform: none;
+  }
+}

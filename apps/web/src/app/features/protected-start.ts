@@ -1,4 +1,5 @@
-import { Component, ElementRef, computed, effect, inject, input, signal } from '@angular/core';
+import { NgTemplateOutlet } from '@angular/common';
+import { Component, ElementRef, Injector, afterNextRender, computed, effect, inject, input, signal } from '@angular/core';
 import { errorKey } from '../core/errors';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { VaultService } from '../core/vault.service';
@@ -18,7 +19,7 @@ type View = 'create' | 'unlock' | 'reset';
  */
 @Component({
   selector: 'km-protected-start',
-  imports: [Icon, RecoveryConfirm, SecretInput, ProtectedRestore, PassphraseSuggest],
+  imports: [Icon, RecoveryConfirm, SecretInput, ProtectedRestore, PassphraseSuggest, NgTemplateOutlet],
   template: `
     <section class="card start-card" id="protected-card" tabindex="-1" aria-labelledby="protected-title" data-testid="protected-section">
       @if (!vault.secure) {
@@ -50,31 +51,48 @@ type View = 'create' | 'unlock' | 'reset';
         } @else {
           <span class="state-icon"><km-icon name="lock" /></span>
           <h2 id="protected-title">{{ i18n.t('protected.unlock.title') }}</h2>
-          <p class="lead">{{ i18n.t('protected.unlock.lead') }}</p>
+          <p class="lead" data-testid="unlock-lead">{{ i18n.t(passkeyHere() ? 'protected.unlock.leadPasskey' : 'protected.unlock.lead') }}</p>
           @if (vault.protectedReloaded()) {
             <div class="callout callout-warn" role="status" data-testid="protected-reloaded">
               <km-icon name="info" />
               <p>{{ i18n.t('protected.reloaded') }}</p>
             </div>
           }
+          <ng-template #unlockForm>
+            <form class="form-stack" (submit)="unlock($event)">
+              <km-secret-input label="protected.password" name="password" autocomplete="current-password" testid="unlock-password" [(value)]="password" />
+              <div class="form-actions">
+                <button type="submit" class="btn btn-lg" [class.btn-primary]="!passkeyHere()" data-testid="unlock-protected" [disabled]="busy() || !password()" [attr.aria-busy]="busy()">
+                  <km-icon name="unlock" /><span>{{ i18n.t(busy() ? 'protected.unlocking' : 'protected.unlock.button') }}</span>
+                </button>
+                <button type="button" class="btn btn-link btn-sm" data-testid="forgot-password" [disabled]="busy()" (click)="show('reset')">{{ i18n.t('protected.forgot') }}</button>
+              </div>
+            </form>
+          </ng-template>
           @if (passkeyHere()) {
-            <div class="passkey-unlock">
-              <button type="button" class="btn btn-primary btn-lg" data-testid="unlock-passkey" [disabled]="busy()" (click)="unlockPasskey()">
-                <km-icon name="key" /><span>{{ i18n.t('qu.unlock') }}</span>
+            <!-- Passkey first: the master password is one click away (and opens by itself if the passkey fails). -->
+            <div class="passkey-hero" data-testid="passkey-hero">
+              <button type="button" class="btn btn-primary btn-lg passkey-hero-btn" data-testid="unlock-passkey" [disabled]="busy()"
+                [attr.aria-busy]="busy()" aria-describedby="passkey-hero-hint" (click)="unlockPasskey()">
+                <span class="passkey-hero-icon" aria-hidden="true"><km-icon name="fingerprint" /></span>
+                <span>{{ i18n.t(passkeyRunning() ? 'protected.unlocking' : 'qu.unlock') }}</span>
               </button>
-              <p class="hint">{{ i18n.t('qu.unlockHint') }}</p>
+              <p class="hint" id="passkey-hero-hint">{{ i18n.t('qu.unlockHint') }}</p>
             </div>
-            <div class="divider"><span>{{ i18n.t('common.or') }}</span></div>
+            <div class="use-password">
+              <button type="button" class="btn use-password-toggle" data-testid="use-password" [class.attention]="pwAttention()"
+                [attr.aria-expanded]="pwOpen()" aria-controls="unlock-password-panel" (click)="togglePassword()">
+                <km-icon name="lock" /><span>{{ i18n.t('protected.usePassword') }}</span><km-icon name="chevronDown" class="chevron" />
+              </button>
+              <div id="unlock-password-panel" class="collapse-panel" data-testid="password-panel" [class.open]="pwOpen()" [attr.inert]="pwOpen() ? null : ''">
+                <div class="collapse-inner">
+                  <ng-container [ngTemplateOutlet]="unlockForm" />
+                </div>
+              </div>
+            </div>
+          } @else {
+            <ng-container [ngTemplateOutlet]="unlockForm" />
           }
-          <form class="form-stack" (submit)="unlock($event)">
-            <km-secret-input label="protected.password" name="password" autocomplete="current-password" testid="unlock-password" [(value)]="password" />
-            <div class="form-actions">
-              <button type="submit" class="btn btn-primary btn-lg" data-testid="unlock-protected" [disabled]="busy() || !password()" [attr.aria-busy]="busy()">
-                <km-icon name="unlock" /><span>{{ i18n.t(busy() ? 'protected.unlocking' : 'protected.unlock.button') }}</span>
-              </button>
-              <button type="button" class="btn btn-link btn-sm" data-testid="forgot-password" [disabled]="busy()" (click)="show('reset')">{{ i18n.t('protected.forgot') }}</button>
-            </div>
-          </form>
           @if (inlineDelete()) {
             <div class="danger-zone">
               <p class="hint">{{ i18n.t('protected.delete.hint') }}</p>
@@ -121,6 +139,7 @@ export class ProtectedStart {
   protected readonly i18n = inject(I18n);
   private readonly confirmDialog = inject(ConfirmService);
   private readonly host: ElementRef<HTMLElement> = inject(ElementRef);
+  private readonly injector = inject(Injector);
   /** false: the start screen offers delete under "More options" instead. */
   readonly inlineDelete = input(true);
   /** The element this component focused itself (so it never takes focus the user moved). */
@@ -155,8 +174,48 @@ export class ProtectedStart {
     () => this.vault.quickUnlockSupported() && this.vault.storedQuickUnlock().some((x) => x.rp_id === location.hostname),
   );
 
-  protected unlockPasskey(): void {
-    void this.act(() => this.vault.unlockWithQuickUnlock());
+  /** Passkey-first lock screen: the master-password section is open. */
+  protected readonly pwOpen = signal(false);
+  /** Set after a failed or cancelled passkey: the password option is highlighted. */
+  protected readonly pwAttention = signal(false);
+
+  protected readonly passkeyRunning = signal(false);
+
+  protected async unlockPasskey(): Promise<void> {
+    if (this.busy()) return;
+    this.pwAttention.set(false);
+    this.passkeyRunning.set(true);
+    try {
+      await this.act(() => this.vault.unlockWithQuickUnlock());
+    } finally {
+      this.passkeyRunning.set(false);
+    }
+    // Never stuck: after a failure or cancel, offer the master password.
+    if (this.error() && this.view() === 'unlock' && this.passkeyHere()) {
+      this.pwAttention.set(true);
+      this.openPassword();
+    }
+  }
+
+  protected togglePassword(): void {
+    if (this.pwOpen()) {
+      this.pwOpen.set(false);
+      this.pwAttention.set(false);
+    } else {
+      this.openPassword();
+    }
+  }
+
+  /** Expand the password section and move focus into the field once it is rendered (no longer inert). */
+  private openPassword(): void {
+    this.pwOpen.set(true);
+    afterNextRender(
+      () => {
+        if (!this.pwOpen()) return;
+        this.host.nativeElement.querySelector<HTMLElement>('#unlock-password-panel:not([inert]) [data-testid=unlock-password]')?.focus();
+      },
+      { injector: this.injector },
+    );
   }
   protected readonly view = signal<View>('unlock');
   protected readonly password = signal('');

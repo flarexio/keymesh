@@ -63,34 +63,38 @@ let nextId = 0;
         </div>
       </div>
 
-      <fieldset class="check-group">
-        <legend class="field-label">{{ i18n.t('pwopt.include') }}</legend>
-        <div class="check-grid">
-          @for (c of classes; track c.flag) {
-            <label class="check"><input type="checkbox" [name]="'pw-' + c.flag" [checked]="o()[c.flag]" (change)="toggle(c.flag, $event)" />
-              {{ i18n.t(c.label) }}</label>
-          }
-        </div>
-      </fieldset>
-
-      @if (o().symbols) {
-        <div class="field">
-          <label class="field-label" [for]="uid + '-symbols'">{{ i18n.t('pwopt.symbolSet') }}</label>
-          <div class="input-group">
-            <input [id]="uid + '-symbols'" name="pwSymbolSet" class="mono" autocomplete="off" spellcheck="false" autocapitalize="off" [maxLength]="symbolTextMax"
-              [value]="o().symbolSet" (input)="setSymbols($event)" [attr.aria-describedby]="uid + '-symbols-hint'"
-              [attr.aria-invalid]="symbolProblem()" />
-            <button type="button" class="btn" [disabled]="o().symbolSet === defaultSymbols" (click)="settings.update({ symbolSet: defaultSymbols })">
-              {{ i18n.t('pwopt.symbolReset') }}
-            </button>
-          </div>
-          <p class="field-hint" [id]="uid + '-symbols-hint'">{{ i18n.t('pwopt.symbolSetHint') }}</p>
-        </div>
-      }
-
-      <details class="more-options" [open]="moreOpen()" (toggle)="moreOpen.set($any($event.target).open)">
-        <summary>{{ i18n.t('pwopt.more') }}</summary>
+      <!-- Preset and length stay in view; types, symbols and fine options are here. Symbols stay on by default. -->
+      <details class="more-options" data-testid="pw-more" [open]="moreOpen()" (toggle)="moreOpen.set($any($event.target).open)">
+        <summary>
+          <span>{{ i18n.t('pwopt.more') }}</span>
+          <span class="more-summary" data-testid="pw-more-summary">{{ includedSummary() }}</span>
+        </summary>
         <div class="more-options-body">
+          <fieldset class="check-group">
+            <legend class="field-label">{{ i18n.t('pwopt.include') }}</legend>
+            <div class="check-grid">
+              @for (c of classes; track c.flag) {
+                <label class="check"><input type="checkbox" [name]="'pw-' + c.flag" [checked]="o()[c.flag]" (change)="toggle(c.flag, $event)" />
+                  {{ i18n.t(c.label) }}</label>
+              }
+            </div>
+          </fieldset>
+
+          @if (o().symbols) {
+            <div class="field">
+              <label class="field-label" [for]="uid + '-symbols'">{{ i18n.t('pwopt.symbolSet') }}</label>
+              <div class="input-group">
+                <input [id]="uid + '-symbols'" name="pwSymbolSet" class="mono" autocomplete="off" spellcheck="false" autocapitalize="off" [maxLength]="symbolTextMax"
+                  [value]="o().symbolSet" (input)="setSymbols($event)" [attr.aria-describedby]="uid + '-symbols-hint'"
+                  [attr.aria-invalid]="symbolProblem()" />
+                <button type="button" class="btn" [disabled]="o().symbolSet === defaultSymbols" (click)="settings.update({ symbolSet: defaultSymbols })">
+                  {{ i18n.t('pwopt.symbolReset') }}
+                </button>
+              </div>
+              <p class="field-hint" [id]="uid + '-symbols-hint'">{{ i18n.t('pwopt.symbolSetHint') }}</p>
+            </div>
+          }
+
           @for (c of extras; track c.flag) {
             <label class="check"><input type="checkbox" [name]="'pw-' + c.flag" [checked]="o()[c.flag]" (change)="toggle(c.flag, $event)" />
               {{ i18n.t(c.label) }}</label>
@@ -126,6 +130,15 @@ export class PasswordOptionsPanel {
   protected readonly symbolProblem = computed(() => {
     const p = this.problem();
     return p === 'errors.pwSymbolsEmpty' || p === 'errors.pwSymbolChars' || p === 'errors.pwSymbolsLong';
+  });
+
+  /** Included types, shown on the collapsed summary so hidden settings stay visible. */
+  protected readonly includedSummary = computed(() => {
+    const o = this.o();
+    return this.classes
+      .filter((c) => o[c.flag])
+      .map((c) => this.i18n.t(`pwopt.short.${c.flag}` as MessageKey))
+      .join(' · ');
   });
 
   protected readonly presets: { value: PasswordPreset; label: MessageKey }[] = [

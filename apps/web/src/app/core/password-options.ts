@@ -42,11 +42,18 @@ const ALL_TYPES = {
   requireEachClass: true,
 };
 
-/** Equal to the core's built-in Default and Strong profiles. */
+/**
+ * The web app's presets: every character type, one of each required. The
+ * core validates and generates from these options; its own CLI profiles
+ * (`src/generate.rs`) are separate and unchanged.
+ */
 export const PASSWORD_PRESETS: Readonly<Record<Exclude<PasswordPreset, 'custom'>, Readonly<PasswordOptions>>> = {
-  default: Object.freeze({ length: 24, ...ALL_TYPES }),
-  strong: Object.freeze({ length: 32, ...ALL_TYPES }),
+  default: Object.freeze({ length: 32, ...ALL_TYPES }),
+  strong: Object.freeze({ length: 64, ...ALL_TYPES }),
 };
+
+/** Preset lengths before v0.6.2: a stored preset with them follows the preset to its new length. */
+const LEGACY_PRESET_LENGTHS: Readonly<Record<Exclude<PasswordPreset, 'custom'>, number>> = { default: 24, strong: 32 };
 
 /** Checks that need no core call; everything else is validated by the core. */
 export function clientProblem(o: PasswordOptions): MessageKey | null {
@@ -79,8 +86,10 @@ export interface StoredPasswordSettings {
 
 /**
  * Strict parse: exactly the known fields with well-formed values, else null
- * (the caller then uses the defaults). A preset whose settings no longer
- * match it is read as Custom. Policy validity is decided by the core, not
+ * (the caller then uses the defaults). A Default or Strong preset stored
+ * with the old preset length follows the preset (new length); any other
+ * preset whose settings no longer match it is read as Custom. Custom is
+ * kept exactly. Policy validity is decided by the core, not
  * here (see `PasswordSettings`).
  */
 export function parsePasswordSettings(raw: string | null): StoredPasswordSettings | null {
@@ -100,9 +109,11 @@ export function parsePasswordSettings(raw: string | null): StoredPasswordSetting
   if (!FLAGS.every((f) => typeof o[f] === 'boolean')) return null;
   const options = Object.fromEntries(OPTION_KEYS.map((k) => [k, o[k]])) as unknown as PasswordOptions;
   if (!wellFormed(options)) return null;
-  let preset = v['preset'] as PasswordPreset;
-  if (preset !== 'custom' && !sameOptions(options, PASSWORD_PRESETS[preset])) preset = 'custom';
-  return { preset, options };
+  const preset = v['preset'] as PasswordPreset;
+  if (preset === 'custom' || sameOptions(options, PASSWORD_PRESETS[preset])) return { preset, options };
+  const legacy = { ...PASSWORD_PRESETS[preset], length: LEGACY_PRESET_LENGTHS[preset] };
+  if (sameOptions(options, legacy)) return { preset, options: { ...PASSWORD_PRESETS[preset] } };
+  return { preset: 'custom', options };
 }
 
 /**
