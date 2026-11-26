@@ -16,6 +16,7 @@ import {
 } from '@angular/core';
 import { I18n, Message, MessageKey, Params } from '../core/i18n/i18n.service';
 import { Icon, IconName } from './icon';
+import { ClipboardStatus } from './clipboard-status';
 
 export interface ConfirmOptions {
   title: MessageKey;
@@ -123,9 +124,11 @@ const TOAST_ICONS: Record<ToastTone, IconName> = { success: 'check', info: 'info
 
 @Component({
   selector: 'km-toasts',
-  imports: [Icon],
+  imports: [Icon, ClipboardStatus],
   template: `
-    <div class="toasts" role="status" aria-live="polite" data-testid="toasts">
+    <div class="toasts">
+      <km-clipboard-status />
+      <div class="toast-list" role="status" aria-live="polite" data-testid="toasts">
       @for (t of toast.toasts(); track t.id) {
         <div class="toast" [attr.data-tone]="t.tone">
           <km-icon [name]="icon(t.tone)" />
@@ -135,6 +138,7 @@ const TOAST_ICONS: Record<ToastTone, IconName> = { success: 'check', info: 'info
           </button>
         </div>
       }
+      </div>
     </div>
   `,
 })

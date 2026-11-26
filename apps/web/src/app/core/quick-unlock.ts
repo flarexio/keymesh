@@ -3,7 +3,8 @@
  * browser glue: every security decision (slot binding, UV/rpIdHash checks,
  * KEK derivation, wrapping) is made by the Rust core. A WebAuthn assertion
  * is a signature, not a key; only the PRF output (32 bytes) is key material,
- * and it is zeroed right after the core used it.
+ * and it is zeroed right after the core used it (the browser's own result
+ * buffer is zeroed as soon as it was copied).
  *
  * Capability: `getClientCapabilities()` is a hint only (absent, rejected or
  * missing key = unknown). The real create()/get() results decide.
@@ -75,7 +76,11 @@ export function prfFirst(cred: PublicKeyCredential): Uint8Array | null {
   const first = ext.prf?.results?.first;
   if (!first) return null;
   const u = new Uint8Array(first.slice(0));
-  return u.length === 32 ? u : null;
+  // Only the copy (zeroed by the caller after the core used it) keeps the key material.
+  new Uint8Array(first).fill(0);
+  if (u.length === 32) return u;
+  u.fill(0);
+  return null;
 }
 
 export function prfEnabled(cred: PublicKeyCredential): boolean {

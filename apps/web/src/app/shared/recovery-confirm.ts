@@ -1,6 +1,7 @@
 import { Component, inject, input, output, signal } from '@angular/core';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
-import { ToastService } from './feedback';
+import { ConfirmService, ToastService } from './feedback';
+import { SecretClipboard } from '../core/clipboard';
 import { Icon } from './icon';
 import { SecretInput } from './secret-input';
 import { EmergencyKit } from './emergency-kit';
@@ -48,6 +49,8 @@ import { EmergencyKit } from './emergency-kit';
 export class RecoveryConfirm {
   protected readonly i18n = inject(I18n);
   private readonly toast = inject(ToastService);
+  private readonly confirm = inject(ConfirmService);
+  private readonly clip = inject(SecretClipboard);
   /** The code to show (14 groups of 4 separated by "-"). */
   readonly code = input.required<string>();
   readonly lead = input<MessageKey>('protected.recovery.lead');
@@ -64,9 +67,17 @@ export class RecoveryConfirm {
     return this.code().split('-');
   }
 
+  /** Warn first (clipboard history and sync), then copy; cleared after 30 s. */
   protected async copy(): Promise<void> {
+    const ok = await this.confirm.ask({
+      title: 'clipboard.warnTitle',
+      body: 'clipboard.warnBody',
+      confirm: 'clipboard.warnConfirm',
+    });
+    if (!ok) return;
     try {
-      await navigator.clipboard.writeText(this.code());
+      if (!this.clip.available()) throw new Error('no clipboard');
+      await this.clip.copySecret(this.code());
       this.toast.show('protected.recovery.copied');
     } catch {
       this.toast.show('errors.clipboard', 'error');

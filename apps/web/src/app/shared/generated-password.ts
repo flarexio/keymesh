@@ -1,7 +1,7 @@
 import { Component, OnDestroy, effect, inject, input, signal } from '@angular/core';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { Icon } from './icon';
-import { ToastService } from './feedback';
+import { SecretClipboard } from '../core/clipboard';
 
 let nextId = 0;
 
@@ -37,7 +37,7 @@ let nextId = 0;
 })
 export class GeneratedPassword implements OnDestroy {
   protected readonly i18n = inject(I18n);
-  private readonly toast = inject(ToastService);
+  private readonly clip = inject(SecretClipboard);
   readonly value = input.required<string>();
   readonly label = input.required<string>();
   protected readonly shown = signal(false);
@@ -62,13 +62,13 @@ export class GeneratedPassword implements OnDestroy {
   protected async copy(): Promise<void> {
     this.error.set(null);
     // Absent on non-secure origins (plain-HTTP LAN preview).
-    if (!navigator.clipboard) {
+    if (!this.clip.available()) {
       this.error.set('errors.clipboard');
       return;
     }
     try {
-      await navigator.clipboard.writeText(this.value());
-      this.toast.show('secret.copied');
+      // Cleared again after 30 s or on lock (core/clipboard.ts).
+      await this.clip.copySecret(this.value());
     } catch {
       this.error.set('errors.clipboard');
     }

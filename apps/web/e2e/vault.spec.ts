@@ -33,7 +33,8 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   // limit through the app's own auto-lock setting (M5 C2). The clock only
   // moves forward, so the backwards-clock rule stays active.
   await page.clock.setFixedTime(new Date(59_000));
-  await page.addInitScript(() => localStorage.setItem('keymesh.autolock.v1', '{"idleMinutes":0,"hideSeconds":30}'));
+  // The longest idle limit (there is no "never" any more): the flow below is quick.
+  await page.addInitScript(() => localStorage.setItem('keymesh.autolock.v1', '{"idleMinutes":60,"hideSeconds":30}'));
   const errors: string[] = [];
   page.on('pageerror', (e) => errors.push(e.message));
   const requests: string[] = [];
@@ -173,7 +174,13 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   // Last 5 s: text (not only colour) and the ring flag the coming change.
   await expect(page.getByTestId('totp-remaining')).toHaveText('1s left — new code soon');
   await expect(page.getByTestId('totp-ring')).toHaveAttribute('data-warn', 'true');
+  // Jumping the clock ~35 years ahead is past any idle limit: the vault locks
+  // (auto-lock), then reopens and shows the RFC 6238 code for that time.
   await page.clock.setFixedTime(new Date(1_111_111_109_000));
+  await expect(page.getByTestId('lock')).toHaveCount(0, { timeout: 10_000 });
+  await expect(page.getByTestId('autolock-reason')).toHaveAttribute('data-reason', 'idle');
+  await page.getByRole('button', { name: en['start.locked.unlock'], exact: true }).click();
+  await openItem(page, 'Synthetic TOTP');
   await expect(page.getByTestId('totp-code')).toHaveText('07081804', { timeout: 5000 });
 
   // Encrypted backup download.

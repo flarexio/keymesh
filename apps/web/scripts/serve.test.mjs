@@ -189,3 +189,49 @@ test('favicon responses are never stored by the browser (no-store), even errors'
   });
   assert.equal(r, 'no-store');
 });
+
+function headers(path) {
+  return new Promise((resolve, reject) => {
+    const q = request({ host: '127.0.0.1', port: PORT, path, method: 'GET' }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode, h: res.headers }));
+    });
+    q.on('error', reject);
+    q.end();
+  });
+}
+
+/** `feature=(allowlist)` pairs of a Permissions-Policy header. */
+function policy(value) {
+  return Object.fromEntries(
+    value.split(',').map((d) => {
+      const [k, v] = d.trim().split('=');
+      return [k, v];
+    }),
+  );
+}
+
+test('Permissions-Policy: camera (QR), clipboard and passkeys for this origin only; everything else off', async () => {
+  for (const path of ['/', '/main-TEST.js', '/no-such-file.js', '/api/favicon?host=icons.example.com']) {
+    const { h } = await headers(path);
+    assert.ok(h['permissions-policy'], `${path}: Permissions-Policy`);
+    const p = policy(h['permissions-policy']);
+    const self = ['camera', 'clipboard-read', 'clipboard-write', 'publickey-credentials-create', 'publickey-credentials-get'];
+    for (const f of self) assert.equal(p[f], '(self)', `${path}: ${f}`);
+    for (const f of ['microphone', 'geolocation', 'payment', 'usb', 'serial', 'hid', 'midi', 'display-capture', 'fullscreen']) {
+      assert.equal(p[f], '()', `${path}: ${f} off`);
+    }
+    // Nothing is granted beyond this origin.
+    for (const [f, v] of Object.entries(p)) assert.ok(v === '()' || v === '(self)', `${path}: ${f}=${v}`);
+  }
+});
+
+test('Cross-Origin-Resource-Policy: same-origin on every response, with the existing headers', async () => {
+  for (const path of ['/', '/main-TEST.js', '/manifest.webmanifest', '/icons/icon.png', '/no-such-file.js', '/api/favicon?host=icons.example.com']) {
+    const { h } = await headers(path);
+    assert.equal(h['cross-origin-resource-policy'], 'same-origin', path);
+    assert.equal(h['x-content-type-options'], 'nosniff', path);
+    assert.equal(h['cross-origin-opener-policy'], 'same-origin', path);
+    assert.match(h['content-security-policy'] ?? '', /default-src 'self'/, path);
+  }
+});

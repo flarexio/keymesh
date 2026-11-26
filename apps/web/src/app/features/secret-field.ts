@@ -2,7 +2,7 @@ import { Component, OnDestroy, inject, input, signal } from '@angular/core';
 import { errorKey } from '../core/errors';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { VaultService } from '../core/vault.service';
-import { ToastService } from '../shared/feedback';
+import { SecretClipboard } from '../core/clipboard';
 import { Icon } from '../shared/icon';
 
 let nextId = 0;
@@ -42,7 +42,7 @@ let nextId = 0;
 })
 export class SecretField implements OnDestroy {
   private readonly vault = inject(VaultService);
-  private readonly toast = inject(ToastService);
+  private readonly clip = inject(SecretClipboard);
   protected readonly i18n = inject(I18n);
   readonly itemId = input.required<string>();
   readonly slot = input.required<string>();
@@ -70,12 +70,12 @@ export class SecretField implements OnDestroy {
     this.error.set(null);
     try {
       // Absent on non-secure origins (plain-HTTP LAN preview): check before revealing.
-      if (!navigator.clipboard) {
+      if (!this.clip.available()) {
         this.error.set('errors.clipboard');
         return;
       }
-      await navigator.clipboard.writeText(this.vault.reveal(this.itemId(), this.slot()));
-      this.toast.show('secret.copied');
+      // Cleared again after 30 s or on lock (core/clipboard.ts); the status line says so.
+      await this.clip.copySecret(this.vault.reveal(this.itemId(), this.slot()));
     } catch (e) {
       this.error.set(e instanceof DOMException ? 'errors.clipboard' : errorKey(e));
     }

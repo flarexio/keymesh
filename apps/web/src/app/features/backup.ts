@@ -172,7 +172,7 @@ import { FaviconPref } from '../core/favicon-pref';
             <label class="field-label" for="autolock-idle">{{ i18n.t('autolock.idle') }}</label>
             <select id="autolock-idle" data-testid="autolock-idle" (change)="setIdle($event)">
               @for (m of idleChoices; track m) {
-                <option [value]="m" [selected]="m === autoLock.settings().idleMinutes">{{ m === 0 ? i18n.t('autolock.never') : i18n.t('autolock.minutes', { n: m }) }}</option>
+                <option [value]="m" [selected]="m === autoLock.settings().idleMinutes">{{ m === 60 ? i18n.t('autolock.hour') : i18n.t('autolock.minutes', { n: m }) }}</option>
               }
             </select>
           </div>
@@ -185,8 +185,8 @@ import { FaviconPref } from '../core/favicon-pref';
             </select>
           </div>
         </div>
-        @if (autoLock.settings().idleMinutes === 0) {
-          <p class="field-hint field-error" role="note" data-testid="autolock-never-warning">{{ i18n.t('autolock.neverWarning') }}</p>
+        @if (autoLock.neverMigrated()) {
+          <div class="callout callout-warn" role="note" data-testid="autolock-never-migrated"><km-icon name="info" /><p>{{ i18n.t('autolock.neverMigrated') }}</p></div>
         }
         <p class="field-hint">{{ i18n.t('autolock.limits') }}</p>
       </section>
