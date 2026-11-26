@@ -50,3 +50,19 @@ export async function qrY4m(text: string, path: string): Promise<void> {
   const frames = Array.from({ length: 10 }, () => frame);
   writeFileSync(path, Buffer.concat([Buffer.from(`YUV4MPEG2 W${W} H${H} F10:1 Ip A1:1 C420jpeg\n`), ...frames]));
 }
+
+/**
+ * A Y4M clip with no QR code (so the camera dialog stays open): mid grey with
+ * a dark square at the exact centre of the frame, W×H (e.g. 480×640 for a
+ * portrait phone track). Used to check that the preview is centred.
+ */
+export function centreMarkY4m(path: string, W: number, H: number): void {
+  const y = Buffer.alloc(W * H, 128);
+  const side = Math.floor(Math.min(W, H) / 5);
+  const x0 = Math.floor((W - side) / 2);
+  const y0 = Math.floor((H - side) / 2);
+  for (let r = y0; r < y0 + side; r++) y.fill(16, r * W + x0, r * W + x0 + side);
+  const chroma = Buffer.alloc((W / 2) * (H / 2), 128);
+  const frame = Buffer.concat([Buffer.from('FRAME\n'), y, chroma, chroma]);
+  writeFileSync(path, Buffer.concat([Buffer.from(`YUV4MPEG2 W${W} H${H} F10:1 Ip A1:1 C420jpeg\n`), ...Array.from({ length: 10 }, () => frame)]));
+}

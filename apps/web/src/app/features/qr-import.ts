@@ -89,6 +89,7 @@ interface CameraRun {
           <h2 id="qr-cam-title">{{ i18n.t('qr.cameraTitle') }}</h2>
           <div class="qr-video">
             <video #video playsinline muted aria-hidden="true"></video>
+            <span class="qr-frame" data-testid="qr-frame" aria-hidden="true"></span>
           </div>
           <p class="qr-status" [class.error]="!!cameraMsg()" role="status" data-testid="qr-camera-status">
             {{ i18n.t(cameraMsg() ?? 'qr.cameraHelp') }}
