@@ -11,6 +11,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { en } from '../src/app/core/i18n/en';
 import { zhTW } from '../src/app/core/i18n/zh-tw';
+import { pwMore } from './helpers';
 
 type Locale = 'zh-TW' | 'en';
 type Catalog = Record<keyof typeof en, string>;
@@ -62,6 +63,7 @@ async function setLength(page: Page, n: number | string) {
 }
 
 async function setChecks(page: Page, on: Partial<Record<'lowercase' | 'uppercase' | 'digits' | 'symbols', boolean>>) {
+  await moreOptions(page);
   for (const [flag, value] of Object.entries(on)) await opts(page).locator(`[name=pw-${flag}]`).setChecked(value);
 }
 
@@ -110,19 +112,25 @@ for (const locale of ['zh-TW', 'en'] as const) {
     const length = opts(page).locator('[name=pwLength]');
     const slider = opts(page).locator('[name=pwLengthRange]');
 
-    // Default preset: 24 characters, all four types; Strong fills 32.
+    // Preset and length are in view; the types and symbols wait under More options (all on).
+    await expect(preset).toBeVisible();
+    await expect(length).toBeVisible();
+    await expect(opts(page).locator('[name=pw-symbols]')).toBeHidden();
+    await expect(opts(page).getByTestId('pw-more-summary')).toHaveText(['pwopt.short.lowercase', 'pwopt.short.uppercase', 'pwopt.short.digits', 'pwopt.short.symbols'].map((k) => t[k as keyof Catalog]).join(' · '));
+    await moreOptions(page);
+    // Default preset: 32 characters, all four types; Strong fills 64.
     await expect(preset).toHaveValue('default');
-    await expect(length).toHaveValue('24');
-    await expect(slider).toHaveValue('24');
+    await expect(length).toHaveValue('32');
+    await expect(slider).toHaveValue('32');
     for (const f of ['lowercase', 'uppercase', 'digits', 'symbols']) await expect(opts(page).locator(`[name=pw-${f}]`)).toBeChecked();
     await expect(opts(page).locator('[name=pwSymbolSet]')).toHaveValue(DEFAULT_SYMBOLS);
     await expect(slider).toHaveAccessibleName(t['pwopt.lengthSlider']);
     await expect(length).toHaveAccessibleName(t['pwopt.length']);
     await preset.selectOption('strong');
-    await expect(length).toHaveValue('32');
-    await expect(slider).toHaveValue('32');
+    await expect(length).toHaveValue('64');
+    await expect(slider).toHaveValue('64');
     await page.getByTestId('generate-password').click();
-    expect(verdict(await revealGenerated(page, t), 32, [LOWER, UPPER, DIGITS, DEFAULT_SYMBOLS])).toEqual(ok(4));
+    expect(verdict(await revealGenerated(page, t), 64, [LOWER, UPPER, DIGITS, DEFAULT_SYMBOLS])).toEqual(ok(4));
 
     // Any change makes it Custom and keeps the other settings.
     await setLength(page, 40);
@@ -260,6 +268,7 @@ for (const locale of ['zh-TW', 'en'] as const) {
     await panel.locator('[name=pwLength]').fill('50');
     await panel.locator('[name=pwLength]').press('Enter');
     await expect(form).toBeVisible();
+    await pwMore(panel);
     await panel.locator('[name=pwSymbolSet]').fill('-_');
     await panel.getByTestId('form-generate').click();
     const first = await revealGenerated(page, t);

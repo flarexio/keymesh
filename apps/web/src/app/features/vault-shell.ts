@@ -99,7 +99,7 @@ const TABS: { id: Tab; label: MessageKey; icon: IconName }[] = [
                     <h2>{{ listTitle() }}</h2>
                     <span class="muted small" aria-live="polite" data-testid="item-count">{{ i18n.plural('list.countOne', 'list.countOther', vault.items().length) }}</span>
                   </div>
-                  <km-new-item-menu (picked)="create($event)" />
+                  <km-new-item-menu [kind]="vault.kindFilter()" (picked)="create($event)" />
                 </div>
                 <div class="search-field">
                   <km-icon name="search" />

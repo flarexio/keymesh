@@ -83,11 +83,12 @@ describe('PasswordSettings', () => {
     s = TestBed.inject(PasswordSettings);
   });
 
-  it('starts on the Default preset (24, all four types, required each)', () => {
+  it('starts on the Default preset (32, all four types, required each)', () => {
     expect(s.preset()).toBe('default');
     expect(s.options()).toEqual(PASSWORD_PRESETS.default);
-    expect(PASSWORD_PRESETS.default).toMatchObject({ length: 24, lowercase: true, uppercase: true, digits: true, symbols: true, requireEachClass: true, excludeAmbiguous: false });
-    expect(PASSWORD_PRESETS.strong.length).toBe(32);
+    expect(PASSWORD_PRESETS.default).toMatchObject({ length: 32, lowercase: true, uppercase: true, digits: true, symbols: true, requireEachClass: true, excludeAmbiguous: false });
+    expect(PASSWORD_PRESETS.strong).toMatchObject({ length: 64, lowercase: true, uppercase: true, digits: true, symbols: true, requireEachClass: true, excludeAmbiguous: false });
+    expect(PASSWORD_PRESETS.strong.symbolSet).toBe(PASSWORD_PRESETS.default.symbolSet);
   });
 
   it('a preset visibly fills every setting; any change makes it Custom without restoring preset rules', () => {
@@ -95,8 +96,8 @@ describe('PasswordSettings', () => {
     expect(s.options()).toEqual(PASSWORD_PRESETS.strong);
     s.update({ symbols: false });
     expect(s.preset()).toBe('custom');
-    expect(s.options()).toMatchObject({ length: 32, symbols: false, lowercase: true });
-    s.update({ length: 24, symbols: true });
+    expect(s.options()).toMatchObject({ length: 64, symbols: false, lowercase: true });
+    s.update({ length: 32, symbols: true });
     // Equal values again, but the user chose Custom: it stays Custom.
     expect(s.preset()).toBe('custom');
     s.setPreset('default');
@@ -112,7 +113,7 @@ describe('PasswordSettings', () => {
 
   it('presets are not mutated by updates', () => {
     s.update({ length: 40 });
-    expect(PASSWORD_PRESETS.default.length).toBe(24);
+    expect(PASSWORD_PRESETS.default.length).toBe(32);
   });
 });
 
@@ -163,6 +164,32 @@ describe('PasswordSettings persistence (non-secret settings only)', () => {
     lowercase: false,
     uppercase: false,
     symbols: false,
+  });
+
+  it('stored Default/Strong from the old lengths (24/32) pick up the new preset lengths (32/64)', () => {
+    const all = { ...PASSWORD_PRESETS.default };
+    storage.data.set(PASSWORD_SETTINGS_KEY, JSON.stringify({ preset: 'default', options: { ...all, length: 24 } }));
+    let s = make();
+    expect(s.preset()).toBe('default');
+    expect(s.options()).toEqual(PASSWORD_PRESETS.default);
+    storage.data.set(PASSWORD_SETTINGS_KEY, JSON.stringify({ preset: 'strong', options: { ...all, length: 32 } }));
+    s = make();
+    expect(s.preset()).toBe('strong');
+    expect(s.options()).toEqual(PASSWORD_PRESETS.strong);
+    expect(s.options().length).toBe(64);
+    // Already on the new lengths: unchanged.
+    expect(parsePasswordSettings(JSON.stringify({ preset: 'default', options: PASSWORD_PRESETS.default }))).toEqual({ preset: 'default', options: PASSWORD_PRESETS.default });
+  });
+
+  it('a stored Custom keeps its exact settings, even when they equal an old preset', () => {
+    const old = { ...PASSWORD_PRESETS.default, length: 24 };
+    storage.data.set(PASSWORD_SETTINGS_KEY, JSON.stringify({ preset: 'custom', options: old }));
+    const s = make();
+    expect(s.preset()).toBe('custom');
+    expect(s.options()).toEqual(old);
+    // A preset label whose settings match neither its old nor its new form is Custom.
+    expect(parsePasswordSettings(JSON.stringify({ preset: 'strong', options: { ...old, length: 40 } }))?.preset).toBe('custom');
+    expect(parsePasswordSettings(JSON.stringify({ preset: 'default', options: { ...old, symbols: false } }))?.preset).toBe('custom');
   });
 
   it('settings the core rejects stay in memory; the last accepted ones stay stored', () => {

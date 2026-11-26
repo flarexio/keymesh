@@ -71,8 +71,8 @@ test('full vault flow: create, generate, edit, search, lock, unlock, persist, ba
   await expect(page.locator('.detail')).toContainText(en['detail.originGenerated']);
   const genRow = page.locator('km-secret-field', { hasText: 'Secret' });
   await genRow.getByRole('button', { name: 'Reveal' }).click();
-  // Revealed: exactly 24 non-space characters (default profile).
-  await expect(genRow.getByTestId('secret-value')).toHaveText(/^\s*\S{24}\s*$/);
+  // Revealed: exactly 32 non-space characters (Default preset).
+  await expect(genRow.getByTestId('secret-value')).toHaveText(/^\s*\S{32}\s*$/);
   await page.getByRole('button', { name: 'Generators' }).click();
   await page.getByTestId('generate-secret').click();
   await page.getByTestId('save-secret').click();

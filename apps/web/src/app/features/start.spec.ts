@@ -17,6 +17,7 @@ interface Opts {
   passkey?: boolean;
   confirming?: boolean;
   demo?: 'empty' | 'locked' | 'stored';
+  passkeyFails?: boolean;
 }
 
 function stubVault(o: Opts) {
@@ -40,7 +41,9 @@ function stubVault(o: Opts) {
     restore: vi.fn(async () => undefined),
     openStored: vi.fn(async () => undefined),
     unlockWithPassword: vi.fn(async () => undefined),
-    unlockWithQuickUnlock: vi.fn(async () => undefined),
+    unlockWithQuickUnlock: vi.fn(async (): Promise<void> => {
+      if (o.passkeyFails) throw new Error('The passkey request was cancelled.');
+    }),
   };
 }
 
@@ -56,10 +59,11 @@ async function render(o: Opts): Promise<{ f: ComponentFixture<Start>; vault: Stu
 }
 
 const q = (el: HTMLElement, id: string) => el.querySelector<HTMLElement>(`[data-testid="${id}"]`);
-/** Rendered and not inside a closed <details> (what a user can see or reach). */
+/** Rendered and not inside a closed <details> or an inert (collapsed) panel. */
 function shown(el: HTMLElement, id: string): boolean {
   const n = q(el, id);
   if (!n) return false;
+  if (n.closest('[inert]')) return false;
   for (let p = n.parentElement; p; p = p.parentElement) {
     if (p instanceof HTMLDetailsElement && !p.open && !(n.closest('summary') && n.closest('details') === p)) return false;
   }
@@ -134,6 +138,77 @@ describe('Start: locked password vault', () => {
     expect(shown(el, 'reset-code')).toBe(true);
     expect(shown(el, 'demo-section')).toBe(false);
     expect(shown(el, 'more-options')).toBe(true);
+  });
+});
+
+describe('Start: passkey-first lock screen', () => {
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  it('the passkey is the hero; the master password is collapsed behind "Use master password"', async () => {
+    const { el } = await render({ protectedStored: true, passkey: true });
+    await tick();
+    const hero = q(el, 'passkey-hero')!;
+    expect(hero).not.toBeNull();
+    expect(hero.contains(q(el, 'unlock-passkey'))).toBe(true);
+    expect(hero.textContent).toContain(en['qu.unlockHint']);
+    expect(q(el, 'unlock-lead')?.textContent).toContain(en['protected.unlock.leadPasskey']);
+    expect(q(el, 'unlock-passkey')?.classList.contains('btn-primary')).toBe(true);
+    const toggle = q(el, 'use-password')!;
+    expect(toggle.tagName).toBe('BUTTON');
+    expect(toggle.textContent).toContain(en['protected.usePassword']);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    const panel = el.querySelector(`#${toggle.getAttribute('aria-controls')}`)!;
+    expect(panel).not.toBeNull();
+    expect(panel.contains(q(el, 'unlock-password'))).toBe(true);
+    expect(panel.contains(q(el, 'forgot-password'))).toBe(true);
+    for (const id of ['unlock-password', 'unlock-protected', 'forgot-password']) expect(shown(el, id), id).toBe(false);
+    expect(shown(el, 'more-options')).toBe(true);
+    expect((q(el, 'more-options') as HTMLDetailsElement).open).toBe(false);
+    expect(document.activeElement).toBe(q(el, 'unlock-passkey'));
+  });
+
+  it('expanding reveals the password and the forgot link and moves focus into the field; collapsing hides them again', async () => {
+    const { f, el } = await render({ protectedStored: true, passkey: true });
+    await tick();
+    q(el, 'use-password')!.click();
+    await f.whenStable();
+    await tick();
+    expect(q(el, 'use-password')!.getAttribute('aria-expanded')).toBe('true');
+    for (const id of ['unlock-password', 'unlock-protected', 'forgot-password']) expect(shown(el, id), id).toBe(true);
+    expect(document.activeElement).toBe(q(el, 'unlock-password'));
+    q(el, 'use-password')!.click();
+    await f.whenStable();
+    expect(q(el, 'use-password')!.getAttribute('aria-expanded')).toBe('false');
+    expect(shown(el, 'unlock-password')).toBe(false);
+  });
+
+  it('a failed or cancelled passkey shows the error and opens the master-password option (never stuck)', async () => {
+    const { f, vault, el } = await render({ protectedStored: true, passkey: true, passkeyFails: true });
+    await tick();
+    q(el, 'unlock-passkey')!.click();
+    await f.whenStable();
+    await tick();
+    expect(vault.unlockWithQuickUnlock).toHaveBeenCalledTimes(1);
+    expect(shown(el, 'protected-error')).toBe(true);
+    expect(q(el, 'use-password')!.getAttribute('aria-expanded')).toBe('true');
+    expect(q(el, 'use-password')!.classList.contains('attention')).toBe(true);
+    expect(shown(el, 'unlock-password')).toBe(true);
+    expect(document.activeElement).toBe(q(el, 'unlock-password'));
+  });
+
+  it('nothing starts WebAuthn without a click', async () => {
+    const { vault } = await render({ protectedStored: true, passkey: true });
+    await tick();
+    expect(vault.unlockWithQuickUnlock).not.toHaveBeenCalled();
+  });
+
+  it('without a passkey there is no toggle: the password form is shown as before', async () => {
+    const { el } = await render({ protectedStored: true });
+    await tick();
+    expect(q(el, 'use-password')).toBeNull();
+    expect(q(el, 'passkey-hero')).toBeNull();
+    expect(q(el, 'unlock-lead')?.textContent).toContain(en['protected.unlock.lead']);
+    for (const id of ['unlock-password', 'unlock-protected', 'forgot-password']) expect(shown(el, id), id).toBe(true);
   });
 });
 

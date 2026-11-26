@@ -1,4 +1,4 @@
-import { AfterRenderRef, Component, ElementRef, Injector, OnDestroy, afterNextRender, inject, output, signal, viewChildren } from '@angular/core';
+import { AfterRenderRef, Component, ElementRef, Injector, OnDestroy, afterNextRender, effect, inject, input, output, signal, viewChildren } from '@angular/core';
 import { I18n, MessageKey } from '../core/i18n/i18n.service';
 import { ItemKind, KINDS } from '../core/types';
 import { Icon, KIND_ICONS } from '../shared/icon';
@@ -18,6 +18,9 @@ const MIN_BELOW = 240;
 
 /**
  * "New item" menu button: arrow keys, Home/End, Escape, click-outside.
+ * Inside one category (`kind` set) it is a plain button that creates that
+ * kind directly ("New login"); the menu is offered only when no single kind
+ * is selected.
  *
  * The menu is `position: fixed` and placed from the button's viewport rect,
  * so scrolling/clipping panes (overflow: hidden/auto) can never cut it off.
@@ -40,11 +43,17 @@ const MIN_BELOW = 240;
   selector: 'km-new-item-menu',
   imports: [Icon],
   template: `
-    <button type="button" class="btn btn-primary" data-testid="new-item" aria-haspopup="menu"
-      [attr.aria-expanded]="open()" aria-controls="new-item-menu" (click)="toggle()" (keydown)="onButtonKey($event)">
-      <km-icon name="plus" /><span>{{ i18n.t('list.newItem') }}</span>
-    </button>
-    @if (open()) {
+    @if (kind(); as k) {
+      <button type="button" class="btn btn-primary" data-testid="new-item" [attr.data-kind]="k" (click)="picked.emit(k)">
+        <km-icon name="plus" /><span>{{ i18n.t(newKindKey(k)) }}</span>
+      </button>
+    } @else {
+      <button type="button" class="btn btn-primary" data-testid="new-item" aria-haspopup="menu"
+        [attr.aria-expanded]="open()" aria-controls="new-item-menu" (click)="toggle()" (keydown)="onButtonKey($event)">
+        <km-icon name="plus" /><span>{{ i18n.t('list.newItem') }}</span>
+      </button>
+    }
+    @if (open() && !kind()) {
       <div #menu class="menu" id="new-item-menu" role="menu" [attr.aria-label]="i18n.t('list.newItem')" (keydown)="onMenuKey($event)"
         [style.top.px]="pos().top" [style.bottom.px]="pos().bottom" [style.right.px]="pos().right" [style.max-height.px]="pos().maxHeight">
         @for (k of kinds; track k) {
@@ -66,6 +75,8 @@ export class NewItemMenu implements OnDestroy {
   protected readonly i18n = inject(I18n);
   private readonly host = inject<ElementRef<HTMLElement>>(ElementRef);
   readonly picked = output<ItemKind>();
+  /** The selected category, or '' for all items (menu). */
+  readonly kind = input<ItemKind | ''>('');
   protected readonly kinds = KINDS;
   protected readonly icons = KIND_ICONS;
   protected readonly open = signal(false);
@@ -141,6 +152,17 @@ export class NewItemMenu implements OnDestroy {
     const r = item.getBoundingClientRect();
     if (r.top < m.top) menu.scrollTop -= m.top - r.top;
     else if (r.bottom > m.bottom) menu.scrollTop += r.bottom - m.bottom;
+  }
+
+  constructor() {
+    // Choosing a category while the menu is open closes it.
+    effect(() => {
+      if (this.kind()) this.close();
+    });
+  }
+
+  protected newKindKey(k: ItemKind): MessageKey {
+    return `list.new.${k}`;
   }
 
   protected kindKey(k: ItemKind): MessageKey {
